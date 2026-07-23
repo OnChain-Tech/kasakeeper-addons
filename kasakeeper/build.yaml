@@ -1,0 +1,5 @@
+build_from:
+  # Pinned (not :latest): every Supervisor rebuild re-pulls the base, so a floating
+  # tag can shift Alpine/Python underneath identical source between two rebuilds.
+  aarch64: ghcr.io/home-assistant/aarch64-base:3.21
+  amd64: ghcr.io/home-assistant/amd64-base:3.21

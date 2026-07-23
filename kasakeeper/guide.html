@@ -1,0 +1,110 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>KasaKeeper · User guide</title>
+<style>
+  :root{ --bg:#101613; --surface:#1A211B; --surface2:#232D25; --line:#2B342C;
+    --text:#F4F1EA; --muted:#9AA79D; --faint:#8A968C; --accent:#1D9E75;
+    --red:#E57B61; --amber:#D9A43E; --green:#2FB88A;
+    --mono:ui-monospace,Menlo,Consolas,monospace; }
+  @media (prefers-color-scheme: light){ :root{ --bg:#F5F2EA; --surface:#FFFFFF; --surface2:#ECE8DD; --line:#D8D3C6;
+    --text:#22271F; --muted:#5C665C; --faint:#5E685F; --accent:#1E6B50;
+    --red:#B34A31; --amber:#8A6414; --green:#256C4C; } }
+  *{box-sizing:border-box;margin:0}
+  body{background:var(--bg);color:var(--text);font:15.5px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
+    -webkit-font-smoothing:antialiased;padding:0 18px 60px}
+  main{max-width:720px;margin:0 auto}
+  header{display:flex;align-items:center;gap:12px;padding:34px 0 6px}
+  header svg{flex:none}
+  h1{font-size:26px;font-weight:700;letter-spacing:-.02em}
+  .sub{color:var(--muted);font-size:14px;margin-top:2px}
+  h2{font:600 12.5px var(--mono);text-transform:uppercase;letter-spacing:.08em;color:var(--faint);margin:34px 0 10px;
+    padding-top:22px;border-top:1px solid var(--line)}
+  h3{font-size:16px;font-weight:600;margin:18px 0 4px}
+  p{margin:8px 0;color:var(--text)}
+  p.dim{color:var(--muted)}
+  ul{margin:8px 0 8px 2px;padding-left:20px;color:var(--text)}
+  li{margin:5px 0}
+  .chip{display:inline-block;font:500 12px var(--mono);background:var(--surface2);border:1px solid var(--line);
+    border-radius:99px;padding:2px 9px;color:var(--muted);white-space:nowrap}
+  .k{font:600 13px var(--mono);color:var(--accent)}
+  .card{background:var(--surface);border:1px solid var(--line);border-radius:14px;padding:14px 16px;margin:12px 0}
+  .g{color:var(--green)} .a{color:var(--amber)} .r{color:var(--red)}
+  a{color:var(--accent)}
+  footer{margin-top:44px;padding-top:18px;border-top:1px solid var(--line);color:var(--faint);font-size:13px}
+</style>
+</head>
+<body>
+<main>
+<header>
+  <svg viewBox="0 0 48 48" width="40" height="40" style="color:var(--text)">
+    <path d="M8 25 L24 11 L40 25" fill="none" stroke="currentColor" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/>
+    <path d="M12.5 28 Q24 38.5 35.5 28" fill="none" stroke="currentColor" stroke-width="4" stroke-linecap="round"/>
+    <circle cx="24" cy="24" r="4.6" fill="var(--accent)"/>
+  </svg>
+  <div><h1>KasaKeeper</h1><div class="sub">User guide · the maintenance brain for your house</div></div>
+</header>
+
+<p class="dim">KasaKeeper watches your home the way you'd want to: it knows every asset, when each one was last serviced, who services it, what it costs, and — where Home Assistant can measure it — how hard it's actually being used. It runs entirely on your own Home Assistant box. Your data never leaves the house.</p>
+
+<h2>Getting started</h2>
+<p>Open <span class="k">Settings → ＋ Add a home</span> and type your address. KasaKeeper researches the property (listings, photos, aerial imagery) and proposes the systems it detects — pool, aircon, solar, gutters. Tick what's real, and it builds each one's maintenance schedule from sensible defaults.</p>
+<p>If your services already have history, tap <span class="k">Start tracking</span> on the dashboard to mark everything serviced today — countdowns begin from there. Or set each task's <em>Last done</em> date by hand for accurate due dates from day one.</p>
+
+<h2>The dashboard</h2>
+<div class="card">
+<ul>
+  <li><b>Health gauge</b> — one score for the whole house, with a verdict line and a segmented bar showing the true proportions of <span class="r">overdue</span> · <span class="a">due soon</span> · <span class="g">on track</span>, plus your committed spend for the next 90 days.</li>
+  <li><b>Needs attention</b> — every job that wants action now. The <span class="k">✓</span> button logs it done (and its cost) in one tap; tapping the row opens the asset.</li>
+  <li><b>Quotes in flight</b> — chips for every open conversation with a trade. Tap through to manage them.</li>
+  <li><b>Coming up</b> — the next few weeks on a date rail, with who's doing each job.</li>
+  <li><b>Keeping watch</b> — weather-aware nudges (wind before gutter cleans, heat before pool care) from your own Home Assistant weather.</li>
+  <li><b>Something's wrong?</b> — describe any problem in plain words (add a photo if you like); KasaKeeper triages it, tells you what to do right now, and finds the right kind of tradesperson.</li>
+</ul>
+</div>
+
+<h2>Assets</h2>
+<h3>Adding one</h3>
+<p>The fastest way: <span class="k">＋ → 📷 Snap</span>. Photograph the appliance's nameplate — KasaKeeper reads the make, model and serial, then automatically researches that exact unit: real specs, the manufacturer's maintenance schedule, and the manual. One tap on <span class="k">✓ Apply schedule</span> and the asset is fully set up with the maker's own intervals.</p>
+<p>Or browse the catalog (<span class="k">＋</span>) and pick a system — each comes with a standard schedule you can tune. Add anything free-form — a limestone wall, a pond, a timber deck — and KasaKeeper researches what <em>that thing</em> actually needs and proposes the right services; one tap applies them.</p>
+<h3>The asset page</h3>
+<ul>
+  <li><b>Model intelligence</b> — for any asset with a make/model, <span class="k">🔎 Look up features</span> fetches specs, the maker's schedule and the manual. Nothing changes without your Apply.</li>
+  <li><b>The manual</b> — once found, tap <span class="k">⤓ keep a copy</span> and the PDF is stored on your own box: it opens on every device, forever, even if the manufacturer's site dies.</li>
+  <li><b>Maker's intervals</b> — tasks tuned from the manual are marked <span style="color:var(--accent)">maker's interval</span> so you know which numbers are the manufacturer's and which are defaults.</li>
+  <li><b>Usage tracking</b> — link a Home Assistant entity and jobs come due by <em>actual run-hours or kWh</em>, not just the calendar: "150 h since last service" beats "6 months". The readout shows <span class="chip">42 / 150 hrs · maker's</span>.</li>
+  <li><b>Warranties</b> — set the date once; the Warranties tab (in Assets) tracks every expiry, soonest first.</li>
+  <li><b>DIY</b> — jobs you do yourself: tap <span class="k">🛠 DIY</span> on any task. It stays on the schedule but stops suggesting suppliers and will never auto-email anyone.</li>
+</ul>
+
+<h2>Schedule</h2>
+<p>The triage view: every active job grouped by who's on the hook — <span class="chip">Needs a supplier</span> <span class="chip">Awaiting a quote</span> <span class="chip">Assigned</span> <span class="chip">DIY · yours to do</span> — each row carrying exactly one next action: find, manage the quote, book, or call. Editing, snoozing and deleting live on the asset page (tap the row, then the task).</p>
+
+<h2>Trades &amp; quotes</h2>
+<p><span class="k">🔎 Find a service</span> searches the best-reviewed local businesses for <em>that specific asset</em> — ratings, reviews, photos, websites. From a result you can:</p>
+<ul>
+  <li><b>Request quote</b> — KasaKeeper drafts the enquiry email; <em>you review and approve every send</em>. Replies are read automatically (read-only) and the quote card fills itself in: amounts, offered dates. Pick a date and the confirmation email is drafted for your approval.</li>
+  <li><b>Save</b> — keep them as your provider for that asset; every job logged against them builds their history and lifetime spend.</li>
+</ul>
+<p><b>Auto-book</b> (per task, optional): when a job with a linked provider comes due, KasaKeeper emails them for dates from its own mailbox and pings you to confirm. It only ever acts inside business hours, one enquiry at a time, and nothing is booked without you.</p>
+<p><b>Service packs</b>: bought 10 pool cleans up front? Record the pack on the asset and every ✓ Done draws one down.</p>
+
+<h2>Ask</h2>
+<p>The house assistant. Ask anything about your own home — "what needs doing this month?", "who services the aircon and what do they cost a year?", "log the gutter clean as done" — it answers from your real data and can make the edits for you.</p>
+
+<h2>Themes &amp; devices</h2>
+<p>Two looks, one brand: <b>Night</b> (dark, made for the wall tablet) and <b>Paper</b> (warm light, lovely on a desktop). Each device keeps its own choice in <span class="k">Settings → Appearance</span>; "Match system" follows the device's light/dark setting.</p>
+<p>KasaKeeper is a PWA sharing one live store: phone, wall tablet and desktop all see the same house, instantly. Add it to your phone's home screen from the browser share menu.</p>
+
+<h2>The morning brief</h2>
+<p>At 8am (your Home Assistant timezone), a push notification summarises what's overdue, what's due soon, and any weather nudges — via your Home Assistant companion app. Toggle it in <span class="k">Settings</span>.</p>
+
+<h2>Your data</h2>
+<p>Everything lives on your own Home Assistant box (<span class="chip">/data</span>, included in HA backups). API keys stay server-side and are set in the add-on's Configuration tab — never in the app. The email loop reads your dedicated mailbox read-only, and every outgoing email is approved by you first.</p>
+
+<footer>KasaKeeper · self-hosted home maintenance · this guide ships with the add-on (<a href="./">back to the app</a>)</footer>
+</main>
+</body>
+</html>
