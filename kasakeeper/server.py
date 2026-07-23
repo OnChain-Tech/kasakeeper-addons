@@ -1196,10 +1196,6 @@ def _quote_poller():
 # =============================================================================
 AUTOBOOK_POLL_SEC = int(os.getenv("KASA_AUTOBOOK_POLL_SEC", "1800"))
 
-def _uid(prefix):
-    import random, string
-    return prefix + "".join(random.choice(string.ascii_lowercase + string.digits) for _ in range(6))
-
 def _task_days_until(task):
     """Mirror of the client's scheduler: lastDone + cadenceDays - today (days)."""
     import datetime
@@ -2710,6 +2706,15 @@ class Handler(SimpleHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _serve_file(self, dirpath, fid, suffix, ctype, err, prefix=""):
+        # Shared guard for the vault-serving GETs: the RAW id is regex-validated
+        # (before any prefix) so path traversal can't reach the join, and misses
+        # return the same {"error": ...} 404 shape each route always had.
+        fp = os.path.join(dirpath, prefix + fid + suffix)
+        if re.fullmatch(r"[A-Za-z0-9_-]{1,40}", fid) and os.path.exists(fp):
+            return self._send_bytes(open(fp, "rb").read(), ctype)
+        return self._send_json({"error": err}, 404)
+
     def do_OPTIONS(self):
         self.send_response(204)
         self.end_headers()
@@ -3024,27 +3029,16 @@ class Handler(SimpleHTTPRequestHandler):
                 return self._send_raw(raw)
             except Exception as e:
                 return self._send_json({"error": str(e)}, 502)
+        # ---- vaulted-file serving: same id-regex guard + 404 shape for all three ----
+        # NOTE: no function-local `import re` in these branches — a local import would
+        # make `re` local to ALL of do_GET, and the place-photo branch below (which
+        # doesn't execute it) then dies with UnboundLocalError. Module-level import.
         if p.startswith("/api/doc/"):     # serve a vaulted manual PDF
-            aid = p.rsplit("/", 1)[-1]
-            fp = os.path.join(DOC_DIR, aid + "-manual.pdf")
-            if re.fullmatch(r"[A-Za-z0-9_-]{1,40}", aid) and os.path.exists(fp):
-                return self._send_bytes(open(fp, "rb").read(), "application/pdf")
-            return self._send_json({"error": "no document"}, 404)
+            return self._serve_file(DOC_DIR, p.rsplit("/", 1)[-1], "-manual.pdf", "application/pdf", "no document")
         if p.startswith("/api/photo/"):   # serve a stored asset photo
-            # NOTE: no function-local `import re` here — a local import would make `re`
-            # local to ALL of do_GET, and the place-photo branch below (which doesn't
-            # execute this line) then dies with UnboundLocalError. Module-level import.
-            aid = p.rsplit("/", 1)[-1]
-            fp = os.path.join(PHOTO_DIR, aid + ".jpg")
-            if re.fullmatch(r"[A-Za-z0-9_-]{1,40}", aid) and os.path.exists(fp):
-                return self._send_bytes(open(fp, "rb").read(), "image/jpeg")
-            return self._send_json({"error": "no photo"}, 404)
+            return self._serve_file(PHOTO_DIR, p.rsplit("/", 1)[-1], ".jpg", "image/jpeg", "no photo")
         if p.startswith("/api/home-photo/"):   # serve the chosen home image
-            hid = p.rsplit("/", 1)[-1]
-            fp = os.path.join(PHOTO_DIR, "home-" + hid + ".jpg")
-            if re.fullmatch(r"[A-Za-z0-9_-]{1,40}", hid) and os.path.exists(fp):
-                return self._send_bytes(open(fp, "rb").read(), "image/jpeg")
-            return self._send_json({"error": "no photo"}, 404)
+            return self._serve_file(PHOTO_DIR, p.rsplit("/", 1)[-1], ".jpg", "image/jpeg", "no photo", prefix="home-")
         if p == "/api/home-imagery":      # candidate photos for the test-home picker
             address = (params.get("address") or [""])[0]
             return self._send_json(home_imagery(address))

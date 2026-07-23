@@ -61,18 +61,13 @@ html,body{margin:0;padding:0;background:var(--bg);color:var(--text);
   display:grid;place-items:center;font-size:16px}
 .brand small{color:var(--muted);font-weight:500;font-size:12px;display:block;letter-spacing:0}
 .icon-btn{background:var(--surface);border:1px solid var(--line);color:var(--text);
-  width:40px;height:40px;border-radius:10px;font-size:18px;cursor:pointer}
+  width:40px;height:40px;border-radius:10px;font-size:18px;cursor:pointer;position:relative}
+/* 40x40 border-box, border eats 1px/side → -3px hits the full 44x44 target (see .btn::after above) */
+.icon-btn::after{content:'';position:absolute;inset:-3px}
 .topbar-right{display:flex;align-items:center;gap:8px}
 /* the chosen home photo, dashboard-only — small and premium, never a banner */
 .home-pic{width:30px;height:30px;border-radius:50%;object-fit:cover;border:1px solid var(--line);opacity:0;transition:opacity .2s}
 .home-pic.on{opacity:1}
-
-/* Summary strip */
-.summary{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin:6px 0 18px}
-.stat{background:var(--surface);border:1px solid var(--line);border-radius:var(--radius);padding:14px}
-.stat .n{font-size:26px;font-weight:700;line-height:1}
-.stat .l{font:600 11px var(--mono);color:var(--faint);text-transform:uppercase;letter-spacing:.08em;margin-top:7px}
-.stat.red .n{color:var(--red)} .stat.amber .n{color:var(--amber)} .stat.green .n{color:var(--green)}
 
 /* Sections — labels are "measured": mono, uppercase, +8% tracking (guidelines §05) */
 .section-title{display:flex;align-items:center;gap:8px;margin:22px 2px 10px;font:600 12px var(--mono);color:var(--faint);text-transform:uppercase;letter-spacing:.08em}
@@ -144,7 +139,6 @@ textarea{min-height:70px;resize:vertical}
 .banner.ok{border-left-color:var(--green)}
 .banner.urgent{border-left-color:var(--red)}
 .spinner{color:var(--muted);font-size:13px;padding:6px 0}
-.hide{display:none}
 
 /* Wizard feature chips */
 .feat{display:flex;align-items:center;gap:12px;background:var(--surface);border:1px solid var(--line);
@@ -154,8 +148,8 @@ textarea{min-height:70px;resize:vertical}
 .feat.on .feat-check{background:var(--accent);color:var(--accent-ink);border-color:var(--accent)}
 select.feat-var{margin-top:7px;width:auto;max-width:240px;padding:6px 9px;font-size:13px;
   background:var(--surface2);border:1px solid var(--line);color:var(--text);border-radius:8px}
-.setup-cta{display:block;width:100%;text-align:left;background:linear-gradient(90deg,var(--accent-d),var(--surface2));
-  border:1px solid var(--accent-d);color:var(--text);border-radius:var(--radius);padding:16px;margin:6px 0 16px;cursor:pointer}
+.setup-cta{display:block;width:100%;text-align:left;background:var(--surface2);
+  border:1px solid var(--line);border-left:3px solid var(--accent-d);color:var(--text);border-radius:var(--radius);padding:16px;margin:6px 0 16px;cursor:pointer}
 .setup-cta b{font-size:16px} .setup-cta div{color:var(--muted);font-size:13px;margin-top:3px}
 
 /* usage-based reminders — live telemetry progress */
@@ -181,23 +175,10 @@ select.feat-var{margin-top:7px;width:auto;max-width:240px;padding:6px 9px;font-s
 .t-sub.rate{color:var(--amber);font-weight:500}
 
 /* find-a-service: provider logo/photo, services, website */
-.prov-avatar{width:44px;height:44px;border-radius:10px;overflow:hidden;flex:0 0 44px;background:var(--surface2);border:1px solid var(--line);display:flex;align-items:center;justify-content:center}
-.prov-avatar img{width:100%;height:100%;object-fit:cover;display:block}
-.prov-avatar .prov-fallback{width:100%;height:100%;align-items:center;justify-content:center;font-size:22px}
 .prov-web{color:var(--blue);text-decoration:none;font-size:12px}
 .svc-chips{display:flex;flex-wrap:wrap;gap:6px;margin:2px 0 10px}
 .svc-chip{font-size:11px;color:var(--muted);background:var(--surface2);border:1px solid var(--line);border-radius:20px;padding:3px 9px}
 
-/* home-health score hero */
-.health{display:flex;align-items:center;gap:16px;background:var(--surface);border:1px solid var(--line);border-radius:16px;padding:14px 18px;margin:2px 0 14px}
-.health .ring{flex:0 0 80px}
-.health .ring-bg{fill:none;stroke:var(--surface2);stroke-width:7}
-.health .ring-fg{fill:none;stroke-width:7;stroke-linecap:round;transition:stroke-dashoffset .6s ease}
-.health .ring-num{font-size:24px;font-weight:700;fill:var(--text)}
-.health.green .ring-fg{stroke:var(--green)} .health.amber .ring-fg{stroke:var(--amber)} .health.red .ring-fg{stroke:var(--red)}
-.health-klabel{font:600 11px var(--mono);color:var(--faint);text-transform:uppercase;letter-spacing:.08em}
-.health-label{font-size:19px;font-weight:600;letter-spacing:-.01em;margin-top:3px}
-.health-sub{font-size:13px;color:var(--muted);margin-top:3px}
 .chip-row{display:flex;flex-wrap:wrap;gap:6px;margin-top:6px}
 .chip.expired{color:var(--red);border-color:var(--edge-red)}
 
@@ -261,7 +242,9 @@ select.feat-var{margin-top:7px;width:auto;max-width:240px;padding:6px 9px;font-s
 .kk-i,.kk-t{width:100%;background:var(--surface2);border:1px solid var(--line);border-radius:10px;
   color:var(--text);padding:10px 12px;font:inherit;font-size:14px}
 .kk-t{resize:vertical;min-height:120px;line-height:1.45}
-.kk-note{color:var(--faint);font-size:12px;margin:10px 2px 0;line-height:1.4}
+.kk-note,.hint{color:var(--faint);font-size:12px;margin:10px 2px 0;line-height:1.4}
+/* ad-hoc <b> pseudo-links (asset detail, etc.) — same affordance as a real link, no per-use inline style */
+.klink{color:var(--accent);cursor:pointer}
 .kk-modal-b{display:flex;justify-content:flex-end;gap:10px;margin-top:14px}
 
 /* ---- Find-a-service: scanning eye loader ---- */
@@ -286,6 +269,11 @@ select.feat-var{margin-top:7px;width:auto;max-width:240px;padding:6px 9px;font-s
 .section-title.dim{color:var(--faint)}
 .card.snoozed{opacity:.6}
 .card.snoozed .t-name{color:var(--muted)}
+.card.pending{opacity:.7;border-style:dashed}
+.k-row.snoozed{opacity:.6}
+.k-row.snoozed .k-title{color:var(--muted)}
+.k-row.pending{opacity:.7;border-top-style:dashed}
+.k-sub.dim{color:var(--faint)}
 .kk-zzz{width:30px;height:30px;flex:0 0 30px;color:var(--muted)}
 
 /* phase 3: snap-to-add, triage, asset photo */
@@ -297,10 +285,11 @@ select.feat-var{margin-top:7px;width:auto;max-width:240px;padding:6px 9px;font-s
 .tabs{display:flex;gap:6px;margin:2px 0 12px}
 .tab{flex:1;text-align:center;padding:9px 10px;border-radius:10px;border:1px solid var(--line);
   background:var(--surface);color:var(--muted);font-size:13px;text-decoration:none;
-  display:flex;align-items:center;justify-content:center;gap:6px}
+  display:flex;align-items:center;justify-content:center;gap:6px;position:relative}
+/* ~35px tall chrome → -6px, same as .btn.small, clears 44px */
+.tab::after{content:'';position:absolute;inset:-6px}
 .tab.on{background:var(--surface2);color:var(--text);border-color:var(--accent-d)}
 .tab .pill.warn{color:var(--amber)}
-.due.green{color:var(--green)}
 
 /* ---- Ask: the house assistant ---- */
 .chat-log{display:flex;flex-direction:column;gap:12px;padding:4px 0 96px}
@@ -323,7 +312,9 @@ select.feat-var{margin-top:7px;width:auto;max-width:240px;padding:6px 9px;font-s
 .chat-hero{width:52px;height:52px;color:var(--accent);margin-bottom:10px}
 .chat-intro .t-name{font-size:17px;color:var(--text);margin-bottom:4px}
 .chat-sugg{display:flex;flex-wrap:wrap;gap:7px;justify-content:center;margin-top:16px}
-.chip.sugg{cursor:pointer;font-size:12px;padding:7px 12px;text-align:left}
+.chip.sugg{cursor:pointer;font-size:12px;padding:7px 12px;text-align:left;position:relative}
+/* ~30px tall chrome → -8px clears 44px */
+.chip.sugg::after{content:'';position:absolute;inset:-8px}
 .chat-bar{position:fixed;left:0;right:0;bottom:calc(64px + env(safe-area-inset-bottom));
   display:flex;gap:8px;padding:10px 16px;background:rgba(var(--bg-rgb),.94);backdrop-filter:blur(12px);
   border-top:1px solid var(--line);max-width:900px;margin:0 auto}
@@ -337,15 +328,6 @@ select.feat-var{margin-top:7px;width:auto;max-width:240px;padding:6px 9px;font-s
 .kk-chips { display: flex; flex-wrap: wrap; gap: 6px; margin: 2px 0 10px; }
 .kk-chips .btn { white-space: nowrap; }
 
-/* Wall tablet (~1280px, viewed at 2m): status mode. The hero signal grows so the
-   one number that matters reads across the room; lists/touch targets unchanged. */
-@media (min-width: 1100px) {
-  .health .ring { flex-basis: 112px; width: 112px; height: 112px }
-  .health-label { font-size: 23px }
-  .health-sub { font-size: 15px }
-  .stat .n { font-size: 34px }
-  .stat .l { font-size: 12px }
-}
 
 /* ── Rebuild: instrument hero, rail rows, quote chips, date-rail timeline ── */
 .hero2{background:var(--surface);border:1px solid var(--line);border-radius:16px;box-shadow:var(--shadow);padding:16px;display:flex;gap:16px;align-items:center;margin-bottom:14px}
@@ -368,11 +350,13 @@ select.feat-var{margin-top:7px;width:auto;max-width:240px;padding:6px 9px;font-s
 .k-main{flex:1;min-width:0}
 .k-title{font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .k-sub{color:var(--muted);font-size:13px;margin-top:1px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.k-sub.rate{color:var(--amber);font-weight:500}
 .k-right{text-align:right;flex:none}
 .k-pill{font:600 12px var(--mono);padding:4px 9px;border-radius:999px;background:var(--surface2);white-space:nowrap}
 .k-pill.red{color:var(--red)} .k-pill.amber{color:var(--amber)} .k-pill.green{color:var(--green)} .k-pill.dim{color:var(--muted)}
 .k-cost{font:500 12px var(--mono);color:var(--faint);margin-top:4px}
-.k-done{width:40px;height:40px;border-radius:50%;border:1px solid var(--line);background:var(--surface2);color:var(--green);display:grid;place-items:center;flex:none;cursor:pointer;padding:0}
+.k-done{width:40px;height:40px;border-radius:50%;border:1px solid var(--line);background:var(--surface2);color:var(--green);display:grid;place-items:center;flex:none;cursor:pointer;padding:0;position:relative}
+.k-done::after{content:'';position:absolute;inset:-3px}
 .k-done svg{width:20px;height:20px}
 .qchips{display:flex;gap:9px;overflow-x:auto;padding:2px 2px 8px;-webkit-overflow-scrolling:touch}
 .qchip{flex:none;background:var(--surface);border:1px solid var(--line);border-radius:14px;box-shadow:var(--shadow);padding:10px 14px;cursor:pointer;min-width:150px}

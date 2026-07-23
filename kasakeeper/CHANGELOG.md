@@ -1,5 +1,12 @@
+# 0.2.3
+
+- Last of the punctuation pass: the start-tracking banner and the push-test result now use the house `·` instead of em-dashes, and the Cc-me helper text reads as a proper muted note.
+
 # 0.2.2
 
+- **One design language everywhere**: the full-UI consistency pass lands — Find-a-service, Add-a-service, the edit forms, Snap, Triage and every legacy sub-section (snoozed tasks, quote lists, correspondence, asset packs) now speak the same instrument row language as the rebuilt screens. Status is always colour *plus* text, every tap target clears 44px, helper notes read as notes, and the setup banners sit flat on the surface in both themes.
+- **Assets list tells you why**: the bare status dot is now a labelled pill ("3d overdue" · "ok"), and empty states offer the next tap instead of a dead end.
+- **Under the hood**: dead code removed across the stylesheet, app and server; the three vault-serving endpoints share one guarded helper; dev tools no longer ship inside the add-on image.
 - Hygiene for the public add-on repository: the owner's street address is scrubbed from source — the offline research stub, the address-field placeholder and prompt examples are now generic.
 
 # 0.2.1

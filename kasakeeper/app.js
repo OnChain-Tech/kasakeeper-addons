@@ -245,7 +245,7 @@ function viewSnap() {
       <div class="meta"><div class="k">Notes</div><div class="v">${esc(r.notes || '—')}</div></div>
     </div>
     <div class="btn-row">
-      <button class="btn primary" data-action="snap-accept">✓ Add it — with schedule</button>
+      <button class="btn primary" data-action="snap-accept">✓ Add it · with schedule</button>
       <button class="btn" data-action="snap">📷 Retake</button>
     </div>`;
 }
@@ -484,7 +484,7 @@ function viewTriage() {
     const team = Store.activeProviders().find(p => p.trade === r.category);
     return `<button class="back" data-action="back">‹ Back</button>
       <div class="hero"><div class="emoji">${(CATEGORIES[r.category] || {}).icon || '🛟'}</div>
-        <div><h1>${esc(r.summary || 'The problem')}</h1><div class="chip-row"><span class="due ${urg[0]}">${urg[1]}</span></div></div></div>
+        <div><h1>${esc(r.summary || 'The problem')}</h1><div class="chip-row"><span class="k-pill ${urg[0]}">${urg[1]}</span></div></div></div>
       <div class="banner ${r.urgency === 'emergency' ? '' : 'ok'}">${esc(r.advice || '')}</div>
       <div class="section-title">Tell the tradie</div>
       <div class="card"><div class="t-sub" style="white-space:normal;color:var(--text)">${esc(r.forTradie || '')}</div></div>
@@ -657,18 +657,17 @@ const railDate = iso => { const d = iso ? new Date(iso) : null;
 function taskCard(t, { showAsset = true } = {}) {
   const a = Store.asset(t.assetId); if (!a) return '';
   const st = Store.status(t), prov = taskProv(t, a);
-  const sub = (showAsset ? `${esc(a.name)} · ${esc(a.location||'')}` : esc(a.location||'')) + (isDiy(t, a) && !t.snoozed ? ' · 🛠 DIY' : '');
+  const sub = [showAsset ? esc(a.name) : '', esc(a.location || ''), isDiy(t, a) && !t.snoozed ? '🛠 DIY' : ''].filter(Boolean).join(' · ');
   if (t.snoozed) {  // disabled/ignored — sleeping eye, restore or delete
-    return `<div class="card snoozed" data-action="open-asset" data-id="${a.id}">
-      <div class="row">
-        ${assetTile(a, 'emoji')}
-        <div class="grow"><div class="t-name">${esc(t.title)}</div><div class="t-sub">${sub} · snoozed</div></div>
-        <svg class="kk-zzz" viewBox="0 0 48 48" aria-label="snoozed"><use href="#kk-sleep"/></svg>
-      </div>
-      <div class="btn-row">
-        <button class="btn small primary" data-action="unsnooze-task" data-id="${t.id}">↩︎ Restore</button>
-        <button class="btn small" data-action="del-task-inline" data-id="${t.id}" style="color:var(--red)">Delete</button>
-      </div></div>`;
+    return `<div class="k-row snoozed" data-action="open-asset" data-id="${a.id}">
+      ${assetTile(a, 'k-tile')}
+      <div class="k-main"><div class="k-title">${esc(t.title)}</div><div class="k-sub">${[sub, 'snoozed'].filter(Boolean).join(' · ')}</div>
+        <div class="btn-row" style="margin-top:8px">
+          <button class="btn small primary" data-action="unsnooze-task" data-id="${t.id}">↩︎ Restore</button>
+          <button class="btn small" data-action="del-task-inline" data-id="${t.id}" style="color:var(--red)">Delete</button>
+        </div></div>
+      <div class="k-right"><svg class="kk-zzz" viewBox="0 0 48 48" aria-label="snoozed"><use href="#kk-sleep"/></svg></div>
+    </div>`;
   }
   // Three ways a job gets done: a linked provider, DIY (you), or still unassigned.
   // A provider with an email gets "Book service" (drafts the quoting email); an open
@@ -775,22 +774,6 @@ function recallBanner(a) {
 }
 
 // An asset that hit its usage threshold but has no overdue/soon task to carry it.
-function usageDueCard(a) {
-  const prov = Store.provider(a.providerId);
-  return `<div class="card" data-action="open-asset" data-id="${a.id}">
-    <div class="row">
-      ${assetTile(a, 'emoji')}
-      <div class="grow"><div class="t-name">${esc(a.name)}</div><div class="t-sub">${esc(a.location || a.category)}</div></div>
-      <div class="due red">by usage</div>
-    </div>
-    ${usageBar(a, true)}
-    <div class="btn-row">
-      <button class="btn small primary" data-action="reset-usage" data-id="${a.id}">↺ Serviced</button>
-      ${prov ? `<button class="btn small" data-action="call" data-id="${a.id}">📞 ${esc(prov.name)}</button>`
-             : `<button class="btn small" data-action="find" data-id="${a.id}">🔎 Find a service</button>`}
-    </div></div>`;
-}
-
 /* ---------- views ---------- */
 function viewDashboard() {
   const tasks = Store.homeTasks().slice().sort((a,b) => (Store.daysUntil(a)??1e9) - (Store.daysUntil(b)??1e9));
@@ -870,7 +853,7 @@ function viewDashboard() {
              ${next90 ? `<span><b>${money(next90)}</b> next 90d</span>` : ''}`}</div>
       </div>
     </div>
-    ${notSetUp ? `<div class="setup-cta" data-action="start-tracking"><b>Start tracking — mark everything serviced today ↦</b><div>Your ${unsched.length} services will begin counting down to their next due dates.</div></div>` : ''}
+    ${notSetUp ? `<div class="setup-cta" data-action="start-tracking"><b>Start tracking · mark everything serviced today ↦</b><div>Your ${unsched.length} services will begin counting down to their next due dates.</div></div>` : ''}
     <div data-nudges></div>
     <div class="card triage-cta" data-action="triage-open"><div class="row"><div class="emoji">🛟</div>
       <div class="grow"><div class="t-name">Something's wrong?</div><div class="t-sub">Describe it · I'll triage and find who you need</div></div><span class="chip">›</span></div></div>
@@ -980,7 +963,9 @@ function viewAssets(sub) {
           <div class="k-sub">${esc(mm || a.location || a.category)}${a.warrantyUntil ? ' · until ' + esc(a.warrantyUntil) : ''}</div></div>
         <div class="k-right"><span class="k-pill ${cls}">${d < 0 ? `expired ${-d}d ago` : d === 0 ? 'ends today' : `${d}d left`}</span></div>
       </div>`;
-    }).join('')}</div>` : `<div class="empty">No warranty dates yet — add one when you edit an asset.</div>`;
+    }).join('')}</div>` : `<div class="empty">No warranty dates yet — add one when you edit an asset. ${Store.homeAssets().length
+      ? `<a href="#/assets" style="color:var(--accent)">→ Open an asset to add one</a>`
+      : `<b data-action="catalog" style="color:var(--accent);cursor:pointer">＋ Add your first asset →</b>`}</div>`;
   } else {
     const byCat = {};
     Store.homeAssets().forEach(a => (byCat[a.category] = byCat[a.category] || []).push(a));
@@ -989,16 +974,18 @@ function viewAssets(sub) {
       <div class="k-list">${byCat[cat].map(a => {
         const ts = Store.tasksFor(a.id).filter(t => !t.snoozed);
         // A never-serviced task has no due date: that is "not tracked", not "healthy" —
-        // it must not wear the same green dot as an asset that's genuinely on schedule.
-        const sts = ts.map(t => Store.daysUntil(t) === null ? 'unsched' : Store.status(t));
+        // it must not wear the same green pill as an asset that's genuinely on schedule.
+        const withStat = ts.map(t => ({ t, d: Store.daysUntil(t), s: Store.daysUntil(t) === null ? 'unsched' : Store.status(t) }));
         const rank = { overdue:0, soon:1, unsched:2, ok:3 };
-        const worst = sts.sort((x,y)=>rank[x]-rank[y])[0] || 'unsched';
+        withStat.sort((x,y) => rank[x.s]-rank[y.s] || (x.d??1e9)-(y.d??1e9));
+        const worst = withStat.length ? withStat[0].s : 'unsched';
+        const label = worst === 'unsched' ? 'not tracked' : worst === 'ok' ? 'ok' : Store.dueLabel(withStat[0].t);
         return `<div class="k-row ${worst==='unsched' ? '' : COLOR[worst]}" data-action="open-asset" data-id="${a.id}">
           ${assetTile(a, 'k-tile')}
           <div class="k-main"><div class="k-title">${esc(a.name)}</div><div class="k-sub">${esc(a.location||'')}${a.location?' · ':''}${worst==='unsched' ? 'not tracked yet' : ts.length + ' task' + (ts.length!==1?'s':'')}${a.lookupPending ? ' · <b style="color:var(--accent)">✦ research ready</b>' : ''}</div></div>
-          <span class="dot ${worst==='unsched' ? 'dim' : COLOR[worst]}" style="margin-right:4px"></span>
+          <div class="k-right"><span class="k-pill ${worst==='unsched' ? 'dim' : COLOR[worst]}">${esc(label)}</span></div>
         </div>`;
-      }).join('')}</div>`).join('') || `<div class="empty">No assets yet.</div>`;
+      }).join('')}</div>`).join('') || `<div class="empty">No assets yet. <b data-action="catalog" style="color:var(--accent);cursor:pointer">＋ Add your first asset →</b></div>`;
   }
   return topbar('Assets','＋','catalog') + tabs + (onWarranty ? '' : `<div data-ha-banner></div>`) + body +
     `<button class="fab" data-action="catalog">＋</button>` + nav('assets');
@@ -1013,24 +1000,25 @@ function packCard(a) {
   const per = Store.packPerVisit(a);
   const unit = p.unit || 'visit';
   const label = `${left} of ${p.bought} ${unit}${p.bought !== 1 ? 's' : ''} left`;
+  const cls = left === 0 ? 'red' : left <= 1 ? 'amber' : 'green';
   return `<div class="section-title">Prepaid maintenance</div>
-    <div class="card">
-      <div class="row"><div class="emoji">🎟️</div>
-        <div class="grow"><div class="t-name">${esc(label)}</div>
-          <div class="t-sub">${p.used || 0} used${p.cost ? ` · ${money(p.cost)} paid${per ? ` · ${money(per)} per ${esc(unit)}` : ''}` : ''}${p.purchasedOn ? ` · bought ${esc(p.purchasedOn)}` : ''}${p.ref ? ` · ${esc(p.ref)}` : ''}</div>
-          ${p.note ? `<div class="t-sub dim">${esc(p.note)}</div>` : ''}</div>
-        <div class="due ${left === 0 ? 'overdue' : left <= 1 ? 'soon' : 'ok'}">${left}</div></div>
-      <div class="usagebar ${left === 0 ? 'due' : left <= 1 ? 'warn' : ''}">
-        <div class="u-track"><div class="u-fill" style="width:${pct}%"></div></div>
-        <div class="u-lbl"><b>${p.used || 0}</b> used of ${p.bought}</div></div>
-      <div class="btn-row">
-        ${left ? `<button class="btn small primary" data-action="book-pack" data-id="${a.id}">📅 Book a visit</button>` : ''}
-        <button class="btn small" data-action="use-pack" data-id="${a.id}" ${left ? '' : 'disabled'}>− Use one</button>
-        <button class="btn small" data-action="unuse-pack" data-id="${a.id}" ${p.used ? '' : 'disabled'}>↩ Undo</button>
-        <button class="btn small" data-action="edit-pack" data-id="${a.id}">✎ Edit</button>
-      </div>
-      ${left === 0 ? `<div class="banner">All used up — time to rebook or buy another block.</div>` : ''}
-    </div>`;
+    <div class="k-list"><div class="k-row ${cls}">
+      <div class="k-tile"><span class="em">🎟️</span></div>
+      <div class="k-main"><div class="k-title">${esc(label)}</div>
+        <div class="k-sub">${p.used || 0} used${p.cost ? ` · ${money(p.cost)} paid${per ? ` · ${money(per)} per ${esc(unit)}` : ''}` : ''}${p.purchasedOn ? ` · bought ${esc(p.purchasedOn)}` : ''}${p.ref ? ` · ${esc(p.ref)}` : ''}</div>
+        ${p.note ? `<div class="k-sub dim">${esc(p.note)}</div>` : ''}
+        <div class="usagebar ${left === 0 ? 'due' : left <= 1 ? 'warn' : ''}" style="margin-top:8px">
+          <div class="u-track"><div class="u-fill" style="width:${pct}%"></div></div>
+          <div class="u-lbl"><b>${p.used || 0}</b> used of ${p.bought}</div></div>
+        <div class="btn-row" style="margin-top:8px">
+          ${left ? `<button class="btn small primary" data-action="book-pack" data-id="${a.id}">📅 Book a visit</button>` : ''}
+          <button class="btn small" data-action="use-pack" data-id="${a.id}" ${left ? '' : 'disabled'}>− Use one</button>
+          <button class="btn small" data-action="unuse-pack" data-id="${a.id}" ${p.used ? '' : 'disabled'}>↩ Undo</button>
+          <button class="btn small" data-action="edit-pack" data-id="${a.id}">✎ Edit</button>
+        </div></div>
+      <div class="k-right"><span class="k-pill ${cls}">${left}</span></div>
+    </div></div>
+    ${left === 0 ? `<div class="banner">All used up — time to rebook or buy another block.</div>` : ''}`;
 }
 function viewAsset(id) {
   const a = Store.asset(id); if (!a) return viewDashboard();
@@ -1046,8 +1034,8 @@ function viewAsset(id) {
       ${prov.phone?`<a class="btn small" data-ext href="tel:${esc(prov.phone.replace(/\s/g,''))}">📞</a>`:''}</div></div>`
     : (() => { const active = Store.tasksFor(a.id).filter(t => !t.snoozed);   // all-DIY asset: don't nag for a supplier nobody needs
         return a.diy || (active.length && active.every(t => t.diy))
-          ? `<div class="banner ok">🛠 You handle this one yourself — no supplier needed.${a.diy ? ` <b data-action="toggle-asset-diy" data-id="${a.id}" style="color:var(--accent);cursor:pointer">Use a pro instead →</b>` : ''}</div>`
-          : `<div class="banner">No service provider linked. <b data-action="find" data-id="${a.id}" style="color:var(--accent);cursor:pointer">Find one →</b> · or <b data-action="toggle-asset-diy" data-id="${a.id}" style="color:var(--accent);cursor:pointer">🛠 mark it DIY</b></div>`; })();
+          ? `<div class="banner ok">🛠 You handle this one yourself — no supplier needed.${a.diy ? ` <b class="klink" data-action="toggle-asset-diy" data-id="${a.id}">Use a pro instead →</b>` : ''}</div>`
+          : `<div class="banner">No service provider linked. <b class="klink" data-action="find" data-id="${a.id}">Find one →</b> · or <b class="klink" data-action="toggle-asset-diy" data-id="${a.id}">🛠 mark it DIY</b></div>`; })();
   // The manual chip is the document-vault seed: real link when we have one, an
   // honest "find it" affordance when we could, nothing when we couldn't.
   const manualChip = a.manualDoc
@@ -1100,13 +1088,13 @@ function viewAsset(id) {
         <button class="btn small" data-action="track-usage" data-id="${a.id}">✎ Edit</button>
         <button class="btn small" data-action="stop-usage" data-id="${a.id}" style="color:var(--red)">Stop</button>
       </div>`
-    : `<div class="banner">Remind me by real usage, not just the calendar — pull run-hours or energy from Home Assistant. <b data-action="track-usage" data-id="${a.id}" style="color:var(--accent);cursor:pointer">📊 Track usage →</b></div>`}
+    : `<div class="banner">Remind me by real usage, not just the calendar — pull run-hours or energy from Home Assistant. <b class="klink" data-action="track-usage" data-id="${a.id}">📊 Track usage →</b></div>`}
     ${(() => { const act = ts.filter(t => !t.snoozed), snz = ts.filter(t => t.snoozed);
       return `<div class="section-title">Maintenance <span class="pill">${act.length}</span></div>
         ${act.length ? `<div class="k-list">${act.map(mRow).join('')}</div>` : `<div class="empty">No active tasks.</div>`}
-        ${snz.length ? `<div class="section-title">Snoozed <span class="pill">${snz.length}</span></div>${snz.map(t => taskCard(t, { showAsset:false })).join('')}` : ''}`; })()}
+        ${snz.length ? `<div class="section-title">Snoozed <span class="pill">${snz.length}</span></div><div class="k-list">${snz.map(t => taskCard(t, { showAsset:false })).join('')}</div>` : ''}`; })()}
     ${(() => { const q = Store.quoteForAsset(a.id);   // what's in flight for THIS asset belongs on its page, not just in Trades
-      return q ? `<div class="section-title">Quote request</div>` + qCard(q) : ''; })()}
+      return q ? `<div class="section-title">Quote request</div><div class="k-list">${qCard(q)}</div>` : ''; })()}
     <div class="btn-row">
       <button class="btn primary small" data-action="suggest" data-id="${a.id}">✨ Suggest schedule</button>
       <button class="btn small" data-action="new-task" data-id="${a.id}">＋ Add task</button>
@@ -1119,7 +1107,7 @@ function viewAsset(id) {
       const pending = jobs.filter(l => l.pending), done = jobs.filter(l => !l.pending);
       const spent = done.reduce((s, l) => s + (l.cost || 0), 0);
       return `<div class="section-title">History <span class="pill">${done.length}</span>${spent ? `<span class="pill">${money(spent)} total</span>` : ''}</div>
-        ${pending.map(jobRow).join('')}
+        ${pending.length ? `<div class="k-list">${pending.map(jobRow).join('')}</div>` : ''}
         ${done.length ? `<div class="k-list" style="padding:2px 12px">${done.map(histRow).join('')}</div>` : `<div class="empty">No jobs logged yet — every ✓ Done lands here.</div>`}
         <div class="btn-row"><button class="btn small" data-action="new-job" data-id="${a.id}">＋ Log a past job</button></div>`; })()}
     ${provCard}
@@ -1167,7 +1155,7 @@ function viewSchedule() {
     ${assigned.length ? group(assigned) : `<div class="empty">Nothing assigned yet — tap "Find a supplier" above.</div>`}
     ${diy.length ? `<div class="section-title">DIY · yours to do <span class="pill">${diy.length}</span></div>${group(diy)}` : ''}
     ${snoozed.length ? `<div class="section-title">Snoozed <span class="pill">${snoozed.length}</span></div>
-      ${snoozed.map(t => taskCard(t, { showAsset: true })).join('')}` : ''}
+      <div class="k-list">${snoozed.map(t => taskCard(t, { showAsset: true })).join('')}</div>` : ''}
     ` + nav('schedule');
 }
 
@@ -1219,17 +1207,15 @@ function viewProvider(id) {
         </div>`;
       }).join('')}</div>` : `<div class="empty">No jobs recorded yet.</div>`}
     ${quotes.length ? `<div class="section-title">Open quotes <span class="pill">${quotes.length}</span></div>
-      ${quotes.map(q => { const qa = Store.asset(q.assetId);
-        return `<div class="card" data-action="open-quote" data-id="${q.id}"><div class="row"><div class="emoji">🧾</div>
-        <div class="grow"><div class="t-name">${esc(qa && q.trade === qa.category ? qa.name : (q.trade || 'Quote'))}${q.amount ? ' · ' + money(q.amount) : ''}</div>
-        <div class="t-sub">${esc(QSTATUS[q.status] || q.status)}</div></div></div></div>`; }).join('')}` : ''}
+      <div class="k-list">${quotes.map(qCard).join('')}</div>` : ''}
     ${(() => { const mail = Store.mailFor(id); if (!mail.length) return '';
       return `<div class="section-title">Correspondence <span class="pill">${mail.length}</span></div>
-        ${mail.map(m => `<div class="card"><div class="row">
-          <div class="emoji">${m.direction === 'out' ? '📤' : '📥'}</div>
-          <div class="grow"><div class="t-name">${esc(m.subject || '(no subject)')}</div>
-            <div class="t-sub">${esc([jobDate(m.date), m.direction === 'out' ? 'sent' : (mailAddr(m.from) || String(m.from || '').trim())].filter(Boolean).join(' · '))}</div>
-            ${m.snippet ? `<div class="t-sub dim">${esc(m.snippet)}</div>` : ''}</div></div></div>`).join('')}`; })()}`;
+        <div class="k-list">${mail.map(m => `<div class="k-row" style="cursor:default">
+          <div class="k-tile"><span class="em">${m.direction === 'out' ? '📤' : '📥'}</span></div>
+          <div class="k-main"><div class="k-title">${esc(m.subject || '(no subject)')}</div>
+            <div class="k-sub">${esc([jobDate(m.date), m.direction === 'out' ? 'sent' : (mailAddr(m.from) || String(m.from || '').trim())].filter(Boolean).join(' · '))}</div>
+            ${m.snippet ? `<div class="k-sub dim">${esc(m.snippet)}</div>` : ''}</div>
+        </div>`).join('')}</div>`; })()}`;
 }
 // One quote request, with its next action inline — shared by Trades and the dashboard.
 function qCard(q) {
@@ -1247,14 +1233,17 @@ function qCard(q) {
       q.bookedDate ? `📌 booked — ${esc(q.bookedDate)}` : (q.availability ? `📅 ${esc(q.availability)}` : ''),
       q.replyNote ? esc(q.replyNote) : (waiting && q.enquiryTo ? `enquiry sent to ${esc(q.enquiryTo)}` : ''),
     ].filter(Boolean).join(' · ');
-    return `<div class="card"><div class="row"><div class="emoji">🧾</div>
-      <div class="grow"><div class="t-name">${esc((a && (!q.trade || q.trade === a.category)) ? a.name : (q.trade || 'Quote'))}${q.amount ? ' · ' + money(q.amount) : ''}${q.auto ? ' <span class="chip auto">🤖 auto</span>' : q.autoParsed ? ' <span class="chip auto">auto</span>' : ''}</div>
-      <div class="t-sub">${a && q.trade && q.trade !== a.name && q.trade !== a.category ? esc(a.name) + ' · ' : ''}${esc(QSTATUS[q.status] || q.status)}${q.provider ? ' · ' + esc(q.provider) : ''}</div>
-      ${meta ? `<div class="t-sub dim">${meta}</div>` : ''}</div>
-      <span class="chip ${q.status === 'booked' ? 'live' : 'cost'}">${esc(QSTATUS[q.status] || q.status)}</span></div>
-      <div class="btn-row">${nextBtns}
+    const cls = q.status === 'booked' ? 'green' : 'amber';
+    return `<div class="k-row ${cls}">
+      <div class="k-tile"><span class="em">🧾</span></div>
+      <div class="k-main"><div class="k-title">${esc((a && (!q.trade || q.trade === a.category)) ? a.name : (q.trade || 'Quote'))}${q.amount ? ' · ' + money(q.amount) : ''}${q.auto ? ' <span class="chip auto">🤖 auto</span>' : q.autoParsed ? ' <span class="chip auto">auto</span>' : ''}</div>
+      <div class="k-sub">${a && q.trade && q.trade !== a.name && q.trade !== a.category ? esc(a.name) + ' · ' : ''}${esc(QSTATUS[q.status] || q.status)}${q.provider ? ' · ' + esc(q.provider) : ''}</div>
+      ${meta ? `<div class="k-sub dim">${meta}</div>` : ''}
+      <div class="btn-row" style="margin-top:8px">${nextBtns}
         ${a ? `<button class="btn small" data-action="find" data-id="${a.id}">🔎 Suppliers</button>` : ''}
-        <button class="btn small" data-action="del-quote" data-id="${q.id}" style="color:var(--red)">Remove</button></div></div>`;
+        <button class="btn small" data-action="del-quote" data-id="${q.id}" style="color:var(--red)">Remove</button></div></div>
+      <div class="k-right"><span class="k-pill ${cls}">${esc(QSTATUS[q.status] || q.status)}</span></div>
+    </div>`;
 }
 function viewProviders() {
   const quotes = Store.homeQuotes();
@@ -1280,7 +1269,7 @@ function viewProviders() {
     .sort((x, y) => Store.lastJobDate(y.id).localeCompare(Store.lastJobDate(x.id)));
   return topbar('Trades', '＋', 'new-provider') +
     `<div class="section-title">Quote requests <span class="pill">${quotes.length}</span></div>` +
-    (quotes.length ? quotes.map(qCard).join('') : `<div class="banner">No open quotes. On the Schedule, tap "Find a supplier" on any job to request one.</div>`) +
+    (quotes.length ? `<div class="k-list">${quotes.map(qCard).join('')}</div>` : `<div class="banner">No open quotes. On the Schedule, tap "Find a supplier" on any job to request one.</div>`) +
     `<div class="section-title">Your technicians <span class="pill">${active.length}</span>${(() => { const t = Store.homeLogs().reduce((s2, l) => s2 + (l.cost || 0), 0); return t ? `<span class="pill">${money(t)} all-time</span>` : ''; })()}</div>` +
     (active.length ? `<div class="k-list">${active.map(pRow).join('')}</div>` : `<div class="empty">No active technicians yet.</div>`) +
     (past.length ? `<div class="section-title dim">Past providers <span class="pill">${past.length}</span></div>`
@@ -1390,7 +1379,7 @@ function viewSettings() {
       <label>Suburb (for finding services · this home)</label><input id="suburb" value="${esc(homeSuburb())}">
       <label>Your name (email sign-off)</label><input id="ownerName" value="${esc(s.ownerName || '')}" placeholder="how outgoing emails sign off">
       <label>Cc me on outgoing mail</label><input id="emailCc" type="email" value="${esc(s.emailCc || '')}" placeholder="you@example.com">
-      <p class="hint">Every enquiry, booking and quote request KasaKeeper sends is copied here, so the thread also lands in your own inbox and the trade sees an address they recognise.</p>
+      <p class="kk-note">Every enquiry, booking and quote request KasaKeeper sends is copied here, so the thread also lands in your own inbox and the trade sees an address they recognise.</p>
       <label>“Due soon” window (days)</label><input id="soonDays" type="number" value="${s.soonDays||30}">
       <div class="btn-row"><button class="btn primary small" data-action="save-settings">Save</button></div>
     </div>
@@ -1443,21 +1432,23 @@ function jobRow(l) {
   if (l.pending) {
     const days = Math.round((new Date(l.date) - Store.today()) / 86400000);
     const when = isNaN(days) ? '' : (days > 0 ? `in ${days}d` : days === 0 ? 'today' : `${-days}d ago`);
-    return `<div class="card pending"><div class="row"><div class="emoji">📅</div>
-      <div class="grow"><div class="t-name">${esc(l.note || 'Booked job')} <span class="chip watching">booked</span></div>
-      <div class="t-sub">${esc(meta)}${when ? ' · ' + when : ''}</div></div>
-      ${l.cost ? `<div class="due soon">${money(l.cost)}</div>` : ''}</div>
-      <div class="btn-row">
-        <button class="btn small primary" data-action="job-done" data-id="${l.id}" data-asset="${l.assetId}">✓ It's done</button>
-        <button class="btn small" data-action="edit-job" data-id="${l.id}" data-asset="${l.assetId}">✎ Edit</button>
-      </div></div>`;
+    return `<div class="k-row pending" data-action="edit-job" data-id="${l.id}" data-asset="${l.assetId}">
+      <div class="k-tile"><span class="em">📅</span></div>
+      <div class="k-main"><div class="k-title">${esc(l.note || 'Booked job')} <span class="chip watching">booked</span></div>
+        <div class="k-sub">${esc(meta)}${when ? ' · ' + when : ''}</div>
+        <div class="btn-row" style="margin-top:8px">
+          <button class="btn small primary" data-action="job-done" data-id="${l.id}" data-asset="${l.assetId}">✓ It's done</button>
+          <button class="btn small" data-action="edit-job" data-id="${l.id}" data-asset="${l.assetId}">✎ Edit</button>
+        </div></div>
+      <div class="k-right">${l.cost ? `<span class="k-pill amber">${money(l.cost)}</span>` : ''}</div>
+    </div>`;
   }
-  return `<div class="card" data-action="edit-job" data-id="${l.id}" data-asset="${l.assetId}">
-    <div class="row"><div class="emoji">🧾</div>
-      <div class="grow"><div class="t-name">${esc(l.note || 'Service')}</div>
-      <div class="t-sub">${esc(meta)}</div></div>
-      ${l.cost ? `<div class="due ok">${money(l.cost)}</div>` : ''}
-    </div></div>`;
+  return `<div class="k-row" data-action="edit-job" data-id="${l.id}" data-asset="${l.assetId}">
+    <div class="k-tile"><span class="em">🧾</span></div>
+    <div class="k-main"><div class="k-title">${esc(l.note || 'Service')}</div>
+      <div class="k-sub">${esc(meta)}</div></div>
+    <div class="k-right">${l.cost ? `<span class="k-pill green">${money(l.cost)}</span>` : ''}</div>
+  </div>`;
 }
 // Booking a quote: capture WHEN, record it as a scheduled job, and (if we can
 // email) draft a confirmation to the trade for approval. Nothing sends itself.
@@ -1550,7 +1541,7 @@ function editUsage(id) {
       ${field('u_unit','Unit', u.unit, 'text', 'hrs or kWh')}
       <div class="btn-row"><button class="btn primary" data-action="save-usage" data-id="${id}">Save & start tracking</button></div>
     </div>
-    <p class="hint">Run-hours reads how long the entity has been on since the last service (Home Assistant history). Energy snapshots a total-increasing kWh meter now and counts up from there — best for pumps on an Emporia circuit. Marking the asset serviced resets the counter.</p>`;
+    <p class="kk-note">Run-hours reads how long the entity has been on since the last service (Home Assistant history). Energy snapshots a total-increasing kWh meter now and counts up from there · best for pumps on an Emporia circuit. Marking the asset serviced resets the counter.</p>`;
 }
 // Track-usage entity picker — nobody should have to TYPE an entity id. Fills the
 // datalist from the same registry scan the HA import uses (server-cached), and
@@ -1606,7 +1597,7 @@ function editTask(assetId, taskId) {
       </label>
       <label style="display:flex;gap:10px;align-items:flex-start;margin-top:12px;cursor:pointer">
         <input type="checkbox" id="f_diy" style="width:auto;margin-top:3px" ${t.diy ? 'checked' : ''}>
-        <span><b>🛠 DIY — I do this myself</b><br>
+        <span><b>🛠 DIY · I do this myself</b><br>
         <span class="t-sub" style="white-space:normal">No tradie needed. The job stays on the schedule and still comes due as normal, but KasaKeeper stops suggesting suppliers for it and will never auto-email anyone about it (turns auto-book off).</span></span>
       </label>
       <div class="btn-row"><button class="btn primary" data-action="save-task" data-asset="${assetId}" data-id="${taskId||''}">Save task</button>
@@ -1701,10 +1692,10 @@ function viewSetup() {
       const varSel = (m && m.s.variants)
         ? `<select id="var_${f.key}" class="feat-var">${m.s.variants.map(v => `<option value="${esc(v.name)}">${esc(v.name)}</option>`).join('')}</select>`
         : '';
-      return `<div class="feat ${on ? 'on' : ''}" data-action="toggle-feat" data-key="${f.key}">
-        <div class="emoji">${Store.icon(f.category)}</div>
-        <div class="grow"><div class="t-name">${esc(f.label)}</div><div class="t-sub">${esc(f.source || f.category)}${tracked ? ' · already tracked' : ''}</div>${varSel}</div>
-        <div class="feat-check">${on ? '✓' : '+'}</div></div>`;
+      return `<div class="k-row ${on ? 'green' : ''}" data-action="toggle-feat" data-key="${f.key}">
+        <div class="k-tile"><span class="em">${Store.icon(f.category)}</span></div>
+        <div class="k-main"><div class="k-title">${esc(f.label)}</div><div class="k-sub">${esc(f.source || f.category)}${tracked ? ' · already tracked' : ''}</div>${varSel}</div>
+        <div class="k-right"><span class="k-pill ${on ? 'green' : 'dim'}">${on ? '✓ included' : '+ add'}</span></div></div>`;
     };
     const extras = s.extras || [];
     const onCount = d.features.filter(f => s.selected.has(f.key)).length;
@@ -1714,13 +1705,13 @@ function viewSetup() {
       <div class="t-sub">${[d.levels && d.levels + ' level' + (d.levels > 1 ? 's' : ''), d.beds && d.beds + ' bed', d.baths && d.baths + ' bath'].filter(Boolean).join(' · ')}</div></div></div>
       <div class="banner ok">Detected ${d.features.length} things to maintain — from listings, photos & your Home Assistant. These are switched on; add anything else below, then create your home.</div>
       <div class="section-title">Detected — included <span class="pill">${onCount}/${d.features.length}</span></div>
-      ${d.features.map(featChip).join('')}
+      <div class="k-list">${d.features.map(featChip).join('')}</div>
       ${extras.length ? `<div class="section-title">Add more services <span class="pill">${extraOn} on</span></div>
         <div class="t-sub" style="margin:0 2px 10px;color:var(--faint)">Not detected at your place — tap any you also want KasaKeeper to track.</div>
-        ${extras.map(featChip).join('')}` : ''}
+        <div class="k-list">${extras.map(featChip).join('')}</div>` : ''}
       <div class="section-title">Quick add <span class="pill">optional</span></div>
       <div class="t-sub" style="margin:0 2px 10px;color:var(--faint)">Anything else · one per line. KasaKeeper will research each one.</div>
-      <div class="card"><textarea id="wz_quick" placeholder="Fujitsu ducted aircon\nBambu Lab X1C 3D printer\nLimestone retaining wall"></textarea></div>
+      <textarea class="kk-t" id="wz_quick" placeholder="Fujitsu ducted aircon\nBambu Lab X1C 3D printer\nLimestone retaining wall"></textarea>
       <div class="section-title">Home photo <span class="pill">optional</span></div>
       <div class="t-sub" style="margin:0 2px 10px;color:var(--faint)">Pick an image to represent this home — street view or aerial.</div>
       <div class="imagery-strip" data-imagery="setup" data-address="${esc(d.address)}"></div>
@@ -1823,27 +1814,25 @@ function providerCard(a, p, i) {
   const rate = p.rating != null ? `${stars(p.rating)} ${p.rating}${p.reviews ? ` · ${p.reviews} reviews` : ''}` : (p.reviews ? `${p.reviews} reviews` : '');
   const loc = p.suburb ? ` · ${esc(p.suburb)}` : '';
   const tel = p.phone ? p.phone.replace(/\s/g, '') : '';
-  const img = p.photo || p.logo;
-  const avatar = img
-    ? `<div class="prov-avatar"><img src="${esc(img)}" alt="" onerror="this.style.display='none';this.nextElementSibling.style.display='flex'"><div class="emoji prov-fallback" style="display:none">👷</div></div>`
-    : `<div class="emoji">👷</div>`;
   const services = (p.services && p.services.length)
     ? `<div class="svc-chips">${p.services.slice(0, 4).map(s => `<span class="svc-chip">${esc(s)}</span>`).join('')}</div>` : '';
-  return `<div class="card">
-    <div class="row">${avatar}<div class="grow">
-      <div class="t-name">${esc(p.name)}</div>
-      <div class="t-sub rate">${rate}${loc}</div>
-      ${p.blurb ? `<div class="t-sub">“${esc(p.blurb)}”</div>` : ''}
-      ${p.website ? `<div class="t-sub"><a href="https://${esc(p.website)}" target="_blank" class="prov-web">${esc(p.website)}</a></div>` : ''}
-    </div></div>
-    ${services}
-    <div class="btn-row">
-      <button class="btn small primary" data-action="quote-provider" data-id="${a.id}" data-i="${i}">✉︎ Request quote</button>
-      ${p.email ? `<button class="btn small" data-action="email-provider" data-id="${a.id}" data-i="${i}">✉︎ Email</button>` : ''}
-      ${tel ? `<a class="btn small" data-ext href="tel:${esc(tel)}">📞 Call</a>` : ''}
-      <button class="btn small" data-action="save-found" data-id="${a.id}" data-i="${i}">＋ Save</button>
-      ${p.website ? `<a class="btn small" data-ext href="${esc(webUrl(p.website))}" target="_blank" rel="noopener">Website</a>` : ''}
-    </div></div>`;
+  return `<div class="k-list"><div class="k-row" style="cursor:default">
+    ${providerTile(p, 'k-tile')}
+    <div class="k-main">
+      <div class="k-title">${esc(p.name)}</div>
+      <div class="k-sub rate">${rate}${loc}</div>
+      ${p.blurb ? `<div class="k-sub">“${esc(p.blurb)}”</div>` : ''}
+      ${p.website ? `<div class="k-sub"><a href="${esc(webUrl(p.website))}" target="_blank" class="prov-web">${esc(p.website)}</a></div>` : ''}
+      ${services}
+      <div class="btn-row">
+        <button class="btn small primary" data-action="quote-provider" data-id="${a.id}" data-i="${i}">✉︎ Request quote</button>
+        ${p.email ? `<button class="btn small" data-action="email-provider" data-id="${a.id}" data-i="${i}">✉︎ Email</button>` : ''}
+        ${tel ? `<a class="btn small" data-ext href="tel:${esc(tel)}">📞 Call</a>` : ''}
+        <button class="btn small" data-action="save-found" data-id="${a.id}" data-i="${i}">＋ Save</button>
+        ${p.website ? `<a class="btn small" data-ext href="${esc(webUrl(p.website))}" target="_blank" rel="noopener">Website</a>` : ''}
+      </div>
+    </div>
+  </div></div>`;
 }
 function viewFind(id) {
   const a = Store.asset(id); if (!a) return viewDashboard();
@@ -1870,10 +1859,13 @@ function viewFind(id) {
   } else {
     const sugg = Research.suggestProviders(a.category);
     body = `${queryLine(ranQuery)}<div class="banner">Couldn't fetch live listings right now — here are known locals${sugg.length ? '' : ' (try Google)'}.</div>
-      ${sugg.map((p, i) => `<div class="card"><div class="row"><div class="emoji">👷</div>
-        <div class="grow"><div class="t-name">${esc(p.name)}</div><div class="t-sub">${esc(p.blurb || '')}</div></div></div>
-        <div class="btn-row"><button class="btn small primary" data-action="add-suggested" data-id="${a.id}" data-i="${i}">＋ Add & link</button>
-          ${p.url ? `<a class="btn small" href="https://${esc(p.url)}" target="_blank">Website</a>` : ''}</div></div>`).join('')}
+      ${sugg.map((p, i) => `<div class="k-list"><div class="k-row" style="cursor:default">
+        ${providerTile({ ...p, website: p.url }, 'k-tile')}
+        <div class="k-main"><div class="k-title">${esc(p.name)}</div>
+          ${p.blurb ? `<div class="k-sub">${esc(p.blurb)}</div>` : ''}
+          <div class="btn-row"><button class="btn small primary" data-action="add-suggested" data-id="${a.id}" data-i="${i}">＋ Add & link</button>
+            ${p.url ? `<a class="btn small" data-ext href="${esc(webUrl(p.url))}" target="_blank" rel="noopener">Website</a>` : ''}</div>
+        </div></div></div>`).join('')}
       <div class="btn-row"><button class="btn small" data-action="refind" data-id="${a.id}">↻ Try live search again</button>
         <button class="btn small" data-action="google" data-id="${a.id}">🔎 Search Google</button></div>`;
   }
@@ -1889,13 +1881,16 @@ function viewCatalog(i) {
       <div class="setup-cta" data-action="snap"><b>📷 Snap it</b><div>Point the camera at the appliance or its nameplate — make, model and serial fill themselves in.</div></div>
       <div class="setup-cta" data-action="inspect-import"><b>📄 Import inspection report</b><div>Upload a building or pest inspection PDF — Claude reads the defects and proposes tasks.</div></div>
       <div class="banner ok">Or pick anything to track — you'll choose the specific type (e.g. gas vs electric) next where it matters.</div>
-      ${cats.map((c, idx) => { const n = Catalog.inCat(c).length;
-        return `<div class="card" data-action="cat-open" data-i="${idx}"><div class="row">
-          <div class="emoji">${Store.icon(c)}</div>
-          <div class="grow"><div class="t-name">${esc(c)}</div><div class="t-sub">${n} service${n !== 1 ? 's' : ''}</div></div>
-          <span class="chip">›</span></div></div>`; }).join('')}
-      <div class="card" data-action="new-asset"><div class="row"><div class="emoji">✎</div>
-        <div class="grow"><div class="t-name">Something else</div><div class="t-sub">add a custom item by hand</div></div><span class="chip">›</span></div></div>`;
+      <div class="k-list">${cats.map((c, idx) => { const n = Catalog.inCat(c).length;
+        return `<div class="k-row" data-action="cat-open" data-i="${idx}">
+          <div class="k-tile"><span class="em">${Store.icon(c)}</span></div>
+          <div class="k-main"><div class="k-title">${esc(c)}</div><div class="k-sub">${n} service${n !== 1 ? 's' : ''}</div></div>
+        </div>`; }).join('')}
+        <div class="k-row" data-action="new-asset">
+          <div class="k-tile"><span class="em">✎</span></div>
+          <div class="k-main"><div class="k-title">Something else</div><div class="k-sub">add a custom item by hand</div></div>
+        </div>
+      </div>`;
   }
   const cat = cats[+i]; if (!cat) return viewCatalog();
   return `<button class="back" data-action="back">‹ Services</button>
@@ -3216,7 +3211,7 @@ document.addEventListener('click', async e => {
       fetch('api/ha/notify', { method:'POST', headers:{'Content-Type':'application/json'},
         body: JSON.stringify({ title:'KasaKeeper', message:'Test — push notifications are working. Keeping watch.' }) })
         .then(r => r.json()).then(j => { if (pr) pr.innerHTML = j.ok
-          ? '<span style="color:var(--green)">✓ Sent — check your phone</span>'
+          ? '<span style="color:var(--green)">✓ Sent · check your phone</span>'
           : `<span style="color:var(--red)">✗ ${esc(j.error || 'notify service unavailable')}</span>`; })
         .catch(e => { if (pr) pr.innerHTML = `<span style="color:var(--red)">✗ ${esc(e.message)}</span>`; });
       return;
