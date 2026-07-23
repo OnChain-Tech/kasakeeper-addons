@@ -1735,7 +1735,7 @@ function viewSetup() {
     <div class="card su-addr-card">
       <label>Address</label>
       <div class="su-addr-wrap">
-        <input id="wz_addr" value="${esc(s.address)}" placeholder="e.g. 77 Wyuna Ave, Freshwater NSW" autocomplete="off">
+        <input id="wz_addr" value="${esc(s.address)}" placeholder="e.g. 1 Beach Rd, Bondi NSW" autocomplete="off">
         <div class="su-suggest" id="wz_suggest" hidden></div>
       </div>
       <label style="display:flex;align-items:center;gap:10px;cursor:pointer;margin-top:10px">

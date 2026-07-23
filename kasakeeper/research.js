@@ -66,7 +66,6 @@ const Research = {
   },
   // Offline stub — sensible detection when the backend isn't running.
   _stub(address) {
-    const isKnown = /wyuna/i.test(address || '');
     const features = [
       { key:'aircon',    label:'Ducted air-conditioning', category:'HVAC',          source:'Home Assistant (6 zones)' },
       { key:'gas',       label:'Gas heaters',             category:'Heating',       source:'listing' },
@@ -85,8 +84,8 @@ const Research = {
     ];
     return {
       address: address || 'Your home',
-      levels: isKnown ? 2 : 1, beds: isKnown ? 5 : null, baths: isKnown ? 3 : null,
-      suburb: /freshwater/i.test(address) || isKnown ? 'Freshwater NSW' : (Store.state.settings.suburb || ''),
+      levels: 1, beds: null, baths: null,
+      suburb: Store.state.settings.suburb || '',
       features,
     };
   },

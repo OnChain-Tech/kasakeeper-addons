@@ -2,7 +2,7 @@
 """
 KasaKeeper backend — serves the PWA and does live property research.
 
-  POST /api/research  { "address": "77 Wyuna Ave, Freshwater NSW" }
+  POST /api/research  { "address": "1 Beach Rd, Bondi NSW" }
       -> DetectedHome JSON (beds/baths/levels + maintenance features)
 
 It asks Claude (with the web_search server tool) to research the address on
@@ -705,7 +705,7 @@ def research(address):
 FIND_SYSTEM = (
     "You find REAL local trade/service businesses near an Australian address and rank them by Google reviews. "
     "Do 3-4 web searches. IMPORTANTLY, run a search that surfaces the GOOGLE MAPS / local-pack results for the "
-    "trade in the suburb (e.g. 'gutter cleaning Freshwater NSW') — Google's local listings show each business's "
+    "trade in the suburb (e.g. 'gutter cleaning Bondi NSW') — Google's local listings show each business's "
     "STAR RATING, REVIEW COUNT and PHONE NUMBER directly, and you MUST capture those. Also check a directory "
     "(Oneflare/hipages/TrueLocal) for phone numbers. Work from these listing/result pages — do not open each "
     "business's own website hunting for an email. Rank by a mix of star rating and number of reviews (a 4.8 with "
@@ -817,7 +817,7 @@ def find_services_places(trade, suburb, address):
         if not name:
             continue
         parts = [x.strip() for x in (p.get("formattedAddress") or "").split(",")]
-        sub = parts[-2] if len(parts) >= 2 else (parts[0] if parts else None)  # "12 Smith St, Freshwater NSW 2096, Australia" → the suburb part, not the street
+        sub = parts[-2] if len(parts) >= 2 else (parts[0] if parts else None)  # "12 Smith St, Bondi NSW 2026, Australia" → the suburb part, not the street
         web = _domain(p.get("websiteUri"))
         # services from Google's place types (title-cased, drop generic ones)
         drop = {"point_of_interest", "establishment", "store"}

@@ -1,3 +1,7 @@
+# 0.2.2
+
+- Hygiene for the public add-on repository: the owner's street address is scrubbed from source — the offline research stub, the address-field placeholder and prompt examples are now generic.
+
 # 0.2.1
 
 Five roadmap items land at once — built in parallel by the big-feature fan-out, each reviewed and verified in its own thread.
