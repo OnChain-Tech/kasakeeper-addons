@@ -1,4 +1,4 @@
-const CACHE = 'kasakeeper-v81';
+const CACHE = 'kasakeeper-v82';
 const ASSETS = [
   './', './index.html', './styles.css',
   './data.js', './store.js', './ha.js', './research.js', './catalog.js', './eye-scene.js', './app.js',

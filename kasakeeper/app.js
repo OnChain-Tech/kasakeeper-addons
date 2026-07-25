@@ -45,6 +45,38 @@ const homeSuburb = () => { const h = Store.home(); return (h && h.suburb) || Sto
 let FIND = { assetId: null, loading: false, providers: null, msg: '' };  // live find-a-service state
 let LOOKUP = { assetId: null, status: 'idle', result: null };            // feature-lookup state (per asset)
 let RECALL = { assetId: null, status: 'idle', result: null };            // recall-check state (per asset)
+
+// ---- first-run key wizard — which server-side keys are live (booleans only,
+// never the values), and the guided setup content for each. checked=false
+// means "not asked yet" — UI hides key-missing warnings until it knows for sure,
+// so a slow /api/health never flashes a false "not connected".
+let KEYS = { anthropic: false, places: false, email: false, checked: false };
+async function refreshKeys() {
+  try {
+    const j = await (await fetch('api/health')).json();
+    KEYS = { anthropic: !!j.key, places: !!j.places, email: !!j.email, checked: true };
+  } catch { KEYS = { ...KEYS, checked: true }; }
+  return KEYS;
+}
+const keyFlag = id => id === 'gmail' ? !!KEYS.email : !!KEYS[id];  // gmail's health flag is named "email"
+const KEY_STEPS = [
+  { id: 'anthropic', title: 'Anthropic', required: true, emoji: '🔑',
+    unlock: 'research · snap a nameplate · ask · recall checks',
+    blurb: 'Claude reads listings and photos to build the maintenance schedule, answers questions about your own data, and checks product recalls. Needs a paid or credited Anthropic console account.',
+    steps: ['Sign in (or create an account) at console.anthropic.com.', 'Add billing · API keys need a paid/credited account.', 'API keys → Create key → copy it.'],
+    link: 'https://console.anthropic.com/settings/keys', linkLabel: 'Open console.anthropic.com →' },
+  { id: 'places', title: 'Google Places', required: false, emoji: '📍',
+    unlock: 'better find-a-service results · ratings, hours, photos',
+    blurb: 'Without this, find-a-service still works, but it falls back to a plain Google search link instead of live local results.',
+    steps: ['Open the Google Cloud console and pick (or create) a project.', 'APIs & Services → Library → enable "Places API".', 'APIs & Services → Credentials → Create credentials → API key.'],
+    link: 'https://console.cloud.google.com/google/maps-apis/credentials', linkLabel: 'Open Google Cloud console →' },
+  { id: 'gmail', title: 'Gmail', required: false, emoji: '✉️',
+    unlock: 'quote request emails · trades import from your inbox',
+    blurb: 'Without this, KasaKeeper drafts every email for you to send yourself instead, quote requests and inbox import stay off.',
+    steps: ['On the Google account to use, turn on 2-Step Verification.', 'Go to App passwords, name it “KasaKeeper”, and generate.', 'Copy the 16-character password (spaces don’t matter).'],
+    link: 'https://myaccount.google.com/apppasswords', linkLabel: 'Open App passwords →' },
+];
+let WIZARD = { step: 'anthropic' };
 // Developer drawer — the data behind the actions. Device-local (never synced),
 // off by default; toggled in Settings. Lives OUTSIDE #app so render() can't eat it.
 const DBG = {
@@ -111,6 +143,7 @@ function goBack() {
     'provider': '/providers', 'edit-provider': r[1] && r[1] !== 'new' ? '/provider/' + r[1] : '/providers',
     'book': '/providers', 'catalog': r[1] !== undefined && r[1] !== '' ? '/catalog' : '/assets',
     'snap': '/assets', 'gmail-import': '/settings', 'triage': '/',
+    'wizard': Store.state.currentHomeId ? '/settings' : '/setup',
   }[r[0]];
   go(parent || '/');
 }
@@ -1313,10 +1346,63 @@ function viewSettings() {
         <button class="btn small" data-action="toggle-imagery" data-id="${h.id}">📷 ${h.photo ? 'Change' : 'Choose'} photo</button>
       </div>
     </div>`; })();
+  // Per-home prefs that used to be global (suburb was always per-home; soonDays and
+  // notifyTarget moved here — see Store.homeSetting()). Read via homeSetting() so an
+  // old client's global value keeps working as the fallback until this is saved once.
+  const curHomePrefsCard = (() => { const h = homes.find(x => x.id === cur); if (!h) return '';
+    return `<div class="card">
+      <label>Suburb (for finding services)</label><input id="hp_suburb" value="${esc(homeSuburb())}">
+      <label>“Due soon” window (days)</label><input id="hp_soonDays" type="number" value="${Store.homeSetting('soonDays')}">
+      <label>Notify target <span class="chip dim">optional</span></label>
+      <input id="hp_notify" value="${esc(Store.homeSetting('notifyTarget'))}" placeholder="e.g. notify.mobile_app_yourphone · leave blank for HA's default">
+      <div class="btn-row"><button class="btn primary small" data-action="save-home-prefs" data-id="${h.id}">Save</button></div>
+    </div>`; })();
+  // Per-home HA source (Store.homeHA()) — local (this add-on, the default), a
+  // friend's own remote HA (url+token, token stored server-side only — see
+  // /api/ha/token), or none (no live device data for this home). Save-only: the
+  // token field never carries a saved value back, matching the API-key wizard.
+  const curHomeHACard = (() => { const h = homes.find(x => x.id === cur); if (!h) return '';
+    const ha = Store.homeHA();
+    const modes = [['local', 'This add-on'], ['remote', 'A different Home Assistant'], ['none', 'Not connected']];
+    return `<div class="card">
+      <label>Connection</label>
+      <div class="btn-row">
+        ${modes.map(([m, l]) => `<button class="btn small ${ha.mode === m ? 'primary' : ''}" data-action="set-ha-mode" data-mode="${m}">${l}</button>`).join('')}
+      </div>
+      <div class="kk-note">${ha.mode === 'local' ? "Uses this add-on's own Home Assistant automatically, no setup needed."
+        : ha.mode === 'remote' ? "A separate Home Assistant (e.g. a friend's own instance); the token lives on the server only, never synced to any device."
+        : 'No live device data for this home, schedules stay calendar-only.'}</div>
+      ${ha.mode === 'remote' ? `
+      <label>Home Assistant URL</label><input id="haR_url" value="${esc(ha.url || '')}" placeholder="https://your-ha.example.com:8123">
+      <label>Long-lived access token</label><input id="haR_token" type="password" placeholder="${ha.url ? 'paste to update · never shown once saved' : 'paste token'}" autocomplete="off">
+      <div class="btn-row">
+        <button class="btn primary small" data-action="save-ha-remote" data-id="${h.id}">Save</button>
+        <button class="btn small" data-action="test-ha-remote">Test connection</button>
+        ${ha.url ? `<button class="btn small" data-action="clear-ha-remote" data-id="${h.id}" style="color:var(--red)">Disconnect</button>` : ''}
+      </div>
+      <div id="haRemoteResult" class="spinner"></div>` : ''}
+    </div>`; })();
   return topbar('Settings','','') + `
+    <div class="section-title">API keys</div>
+    <div class="card">
+      <div class="t-sub" style="white-space:normal">Stored on the server only · never synced to your devices, never shown again once saved.</div>
+      <div class="k-list" style="margin-top:10px">
+        ${KEY_STEPS.map(k => `<div class="k-row" style="cursor:default">
+          <div class="k-tile"><span class="em">${k.emoji}</span></div>
+          <div class="k-main"><div class="k-title">${esc(k.title)}${k.required ? '' : ' <span class="chip dim">optional</span>'}</div>
+            <div class="k-sub">${KEYS.checked ? (keyFlag(k.id) ? '✓ Connected · ' : 'Not set up · ') : 'Checking · '}${esc(k.unlock)}</div></div>
+          <div class="k-right"><span class="dot ${KEYS.checked ? (keyFlag(k.id) ? 'green' : (k.required ? 'red' : 'dim')) : 'dim'}"></span></div>
+        </div>`).join('')}
+      </div>
+      <div class="btn-row"><button class="btn primary small" data-action="wizard">🔑 Manage API keys</button></div>
+    </div>
     <div class="section-title">Homes <span class="pill">${homes.length}</span></div>
     ${homes.length ? `<div class="k-list">${homes.map(homeRow).join('')}</div>` : '<div class="empty">No homes yet.</div>'}
     ${curHomeCard}
+    <div class="section-title">This home's preferences</div>
+    ${curHomePrefsCard}
+    <div class="section-title">This home's Home Assistant</div>
+    ${curHomeHACard}
     <div class="btn-row"><button class="btn primary" data-action="setup">＋ Add a home</button></div>
     <div class="section-title">Appearance</div>
     <div class="card">
@@ -1327,7 +1413,7 @@ function viewSettings() {
       </div>
       <div class="kk-note">Night suits the wall tablet · Paper suits a daytime desktop. Each device keeps its own choice.</div>
     </div>
-    <div class="section-title">Home Assistant</div>
+    <div class="section-title">Home Assistant · direct connection (advanced)</div>
     ${HA.proxy ? `<div class="banner ok">✓ Connected automatically via the Home Assistant add-on — live device data and usage tracking work with no setup. (Manual URL + token below are optional, for running outside the add-on.)</div>
     <div class="btn-row"><button class="btn primary small" data-action="ha-import-scan">↯ Import from Home Assistant</button></div>
     <div data-ha-drift></div>` : ''}
@@ -1365,7 +1451,7 @@ function viewSettings() {
       <div class="btn-row">
         <button class="btn primary small" data-action="gmail-scan">🔎 Scan for my trades</button>
       </div>
-      <p class="t-sub" style="white-space:normal;margin-top:10px">Setup: ${s.gmailMode === 'onetime' ? 'use your existing Gmail —' : 'create the dedicated Gmail, then in your main account add a filter forwarding tradie mail (from servicem8.com, invoices, quotes) to it. On the dedicated account —'} turn on 2-Step Verification, create an <b>App Password</b> (myaccount.google.com → Security → App passwords), and paste the address + app password into the add-on <b>Configuration</b> tab, then restart the add-on. ${s.gmailMode === 'onetime' ? 'Read-only: KasaKeeper never sends, deletes or moves mail in this mode.' : 'KasaKeeper sends enquiries and booking confirmations from this mailbox (each one approved by you, or via 🤖 Auto-book) and reads the replies. It never deletes or moves mail.'}</p>
+      <p class="t-sub" style="white-space:normal;margin-top:10px">Setup: ${s.gmailMode === 'onetime' ? 'use your existing Gmail:' : 'create the dedicated Gmail, then in your main account add a filter forwarding tradie mail (from servicem8.com, invoices, quotes) to it. On the dedicated account:'} turn on 2-Step Verification, create an <b>App Password</b> (myaccount.google.com → Security → App passwords), then paste the address + app password below via <b data-action="wizard" style="color:var(--accent);cursor:pointer">🔑 API key setup</b> · active immediately, no restart needed. ${s.gmailMode === 'onetime' ? 'Read-only: KasaKeeper never sends, deletes or moves mail in this mode.' : 'KasaKeeper sends enquiries and booking confirmations from this mailbox (each one approved by you, or via 🤖 Auto-book) and reads the replies. It never deletes or moves mail.'}</p>
     </div>
     <div class="section-title">Auto-book</div>
     <div class="card">
@@ -1376,11 +1462,9 @@ function viewSettings() {
     </div>
     <div class="section-title">Preferences</div>
     <div class="card">
-      <label>Suburb (for finding services · this home)</label><input id="suburb" value="${esc(homeSuburb())}">
       <label>Your name (email sign-off)</label><input id="ownerName" value="${esc(s.ownerName || '')}" placeholder="how outgoing emails sign off">
       <label>Cc me on outgoing mail</label><input id="emailCc" type="email" value="${esc(s.emailCc || '')}" placeholder="you@example.com">
       <p class="kk-note">Every enquiry, booking and quote request KasaKeeper sends is copied here, so the thread also lands in your own inbox and the trade sees an address they recognise.</p>
-      <label>“Due soon” window (days)</label><input id="soonDays" type="number" value="${s.soonDays||30}">
       <div class="btn-row"><button class="btn primary small" data-action="save-settings">Save</button></div>
     </div>
     <div class="section-title">Data</div>
@@ -1413,6 +1497,45 @@ function viewSettings() {
       <div class="kk-note">Triggers the scheduled monthly recall check on demand — the same job that normally runs once a month, capped at 12 assets a run.</div>
     </div>
     <div class="kk-note" style="text-align:center;margin-top:20px"><a href="guide.html" target="_blank" rel="noopener" style="color:var(--accent);text-decoration:none"><svg class="ci" style="width:13px;height:13px;vertical-align:-2px"><use href="#i-doc"/></svg> User guide</a></div>` + nav('settings');
+}
+
+// ---- first-run key wizard — walks Anthropic (required) then Places/Gmail
+// (optional), each with concrete console steps, a save-only paste field, a
+// real server-validated test, and what it unlocks. Reachable from the setup
+// landing and from Settings' "API keys" card; re-enterable any time.
+function viewWizard() {
+  const idx = Math.max(0, KEY_STEPS.findIndex(k => k.id === WIZARD.step));
+  const step = KEY_STEPS[idx];
+  const connected = KEYS.checked && keyFlag(step.id);
+  return `<button class="back" data-action="back">‹ ${Store.state.currentHomeId ? 'Back to Settings' : 'Back'}</button>
+    <div class="hero"><div class="emoji">${step.emoji}</div><div><h1>${esc(step.title)} key</h1>
+    <div class="t-sub" style="white-space:normal">${step.required ? 'Required' : 'Optional'} · unlocks ${esc(step.unlock)}</div></div></div>
+    <div class="btn-row">${KEY_STEPS.map(k => `<button class="btn small ${k.id === step.id ? 'primary' : ''}" data-action="wizard-step" data-step="${k.id}">${KEYS.checked && keyFlag(k.id) ? '✓ ' : ''}${esc(k.title)}</button>`).join('')}</div>
+    <div class="banner ${connected ? 'ok' : ''}">${connected ? '✓ Already connected on this add-on.'
+      : step.required ? 'Not set up yet · research, snap and ask stay on a basic baseline without it.'
+      : 'Not set up yet · optional, KasaKeeper works without it, just with less.'}</div>
+    <div class="card">
+      <div class="t-sub" style="white-space:normal">${esc(step.blurb)}</div>
+      <ol class="wz-steps">${step.steps.map(x => `<li>${esc(x)}</li>`).join('')}</ol>
+      <div class="btn-row"><a class="btn primary small" data-ext href="${esc(step.link)}" target="_blank" rel="noopener">${esc(step.linkLabel)}</a></div>
+    </div>
+    <div class="card">
+      ${step.id === 'gmail'
+        ? `<label>Gmail address</label><input id="wzUser" type="email" placeholder="you@gmail.com" autocomplete="off">
+           <label>App password</label><input id="wzPass" type="password" placeholder="16-character app password" autocomplete="off">`
+        : `<label>API key</label><input id="wzKey" type="password" placeholder="paste your ${esc(step.title)} key" autocomplete="off">`}
+      <div class="btn-row">
+        <button class="btn small" data-action="wizard-test" data-which="${step.id}">Test</button>
+        <button class="btn primary small" data-action="wizard-save" data-which="${step.id}">Save</button>
+      </div>
+      <div id="wzResult" class="spinner"></div>
+    </div>
+    <div class="btn-row">
+      ${idx > 0 ? `<button class="btn small" data-action="wizard-step" data-step="${KEY_STEPS[idx - 1].id}">‹ Back</button>` : ''}
+      ${idx < KEY_STEPS.length - 1
+        ? `<button class="btn small" data-action="wizard-step" data-step="${KEY_STEPS[idx + 1].id}">${step.required ? 'Next' : 'Skip'} ›</button>`
+        : `<button class="btn primary small" data-action="back">Done</button>`}
+    </div>`;
 }
 
 /* ---------- forms ---------- */
@@ -1700,10 +1823,17 @@ function viewSetup() {
     const extras = s.extras || [];
     const onCount = d.features.filter(f => s.selected.has(f.key)).length;
     const extraOn = extras.filter(f => s.selected.has(f.key)).length;
+    // No Anthropic key (or SDK) → the server hands back a generic baseline profile, not a
+    // real research pass. Say so plainly here instead of the normal "detected" banner —
+    // silently presenting a guess as a finding is exactly the failure mode we don't want.
+    const noKey = /api_key|anthropic sdk/i.test(d.summary || '');
+    const banner = noKey
+      ? `<div class="banner">No Anthropic key is set, so this is a generic starter profile, not real research on your home. Add a key in the add-on <b>Configuration</b> tab, then start again for full detection. These items are switched on; add or remove anything below, then create your home.</div>`
+      : `<div class="banner ok">Detected ${d.features.length} things to maintain — from listings, photos & your Home Assistant. These are switched on; add anything else below, then create your home.</div>`;
     return `<button class="back" data-action="back">‹ Back</button>
       <div class="hero"><div class="emoji">🏠</div><div><h1>${esc(d.address)}</h1>
       <div class="t-sub">${[d.levels && d.levels + ' level' + (d.levels > 1 ? 's' : ''), d.beds && d.beds + ' bed', d.baths && d.baths + ' bath'].filter(Boolean).join(' · ')}</div></div></div>
-      <div class="banner ok">Detected ${d.features.length} things to maintain — from listings, photos & your Home Assistant. These are switched on; add anything else below, then create your home.</div>
+      ${banner}
       <div class="section-title">Detected — included <span class="pill">${onCount}/${d.features.length}</span></div>
       <div class="k-list">${d.features.map(featChip).join('')}</div>
       ${extras.length ? `<div class="section-title">Add more services <span class="pill">${extraOn} on</span></div>
@@ -1723,6 +1853,8 @@ function viewSetup() {
       <div class="su-word">KasaKeeper</div>
       <div class="su-tag">The maintenance brain for your house</div>
     </div>
+    ${KEYS.checked && !KEYS.anthropic ? `<div class="banner">🔑 No Anthropic key yet · research, snap and ask stay on a basic baseline until you add one.
+      <div class="btn-row"><button class="btn primary small" data-action="wizard">Set up API keys (2 min) →</button></div></div>` : ''}
     <div class="card su-addr-card">
       <label>Address</label>
       <div class="su-addr-wrap">
@@ -1774,7 +1906,8 @@ function viewSetup() {
         <div class="t-sub">About your own house · it answers from your real data.</div></div></div></div>
     </div>
 
-    <div class="su-trust">🔒 Self-hosted · your data never leaves your Home Assistant box</div>`;
+    <div class="su-trust">🔒 Self-hosted · your data never leaves your Home Assistant box</div>
+    <div class="btn-row" style="justify-content:center;margin-top:2px"><button class="btn small" data-action="wizard">🔑 API key setup</button></div>`;
 }
 
 /* ---------- Find a service ---------- */
@@ -1858,7 +1991,9 @@ function viewFind(id) {
         <button class="btn small" data-action="google" data-id="${a.id}">🔎 More on Google</button></div>`;
   } else {
     const sugg = Research.suggestProviders(a.category);
-    body = `${queryLine(ranQuery)}<div class="banner">Couldn't fetch live listings right now — here are known locals${sugg.length ? '' : ' (try Google)'}.</div>
+    body = `${queryLine(ranQuery)}<div class="banner">${sugg.length
+      ? 'Couldn\'t fetch live listings right now · here are providers you\'ve already saved for this.'
+      : 'Couldn\'t fetch live listings right now · try Google instead.'}</div>
       ${sugg.map((p, i) => `<div class="k-list"><div class="k-row" style="cursor:default">
         ${providerTile({ ...p, website: p.url }, 'k-tile')}
         <div class="k-main"><div class="k-title">${esc(p.name)}</div>
@@ -1906,7 +2041,7 @@ function viewCatalog(i) {
 /* ---------- render + live HA ---------- */
 function render() {
   const r = route();
-  if (!Store.state.currentHomeId && r[0] !== 'setup') { location.hash = '#/setup'; return; }
+  if (!Store.state.currentHomeId && r[0] !== 'setup' && r[0] !== 'wizard') { location.hash = '#/setup'; return; }
   let html;
   if (r[0] === 'assets') html = viewAssets(r[1]);
   else if (r[0] === 'chat') html = viewChat();
@@ -1929,6 +2064,7 @@ function render() {
   else if (r[0] === 'ha-import') html = viewHaImport();
   else if (r[0] === 'triage') html = viewTriage();
   else if (r[0] === 'find') html = viewFind(r[1]);
+  else if (r[0] === 'wizard') html = viewWizard();
   else html = viewDashboard();
   $app.innerHTML = html;
   window.scrollTo(0, 0);
@@ -2553,10 +2689,15 @@ document.addEventListener('click', async e => {
       return render();
     }
     case 'add-suggested': {
-      const a = Store.asset(id), p = Research.suggestProviders(a.category)[Number(node.getAttribute('data-i'))];
-      const prov = Store.upsertProvider({ name: p.name, trade: a.category, notes: p.url || '' });
-      a.providerId = prov.id; Store.upsertAsset(a);
-      const q = Store.quoteForAsset(a.id); if (q) { q.provider = p.name; Store.upsertQuote(q); }
+      const a = Store.asset(id); if (!a) return render();
+      const p = Research.suggestProviders(a.category)[Number(node.getAttribute('data-i'))];
+      if (!p) return render();
+      // suggestions are already-saved providers (see Research.suggestProviders) — link
+      // the existing one rather than creating a duplicate.
+      const prov = p.id ? Store.provider(p.id) : null;
+      const linked = prov || Store.upsertProvider({ name: p.name, trade: a.category, notes: p.url || '' });
+      a.providerId = linked.id; Store.upsertAsset(a);
+      const q = Store.quoteForAsset(a.id); if (q) { q.provider = linked.name; Store.upsertQuote(q); }
       return go('/asset/' + a.id);
     }
     case 'book-service': {   // task card → drafted quoting email listing this provider's assets, services and parts
@@ -3198,13 +3339,118 @@ document.addEventListener('click', async e => {
       const cc = val('emailCc');
       if (cc && !mailAddr(cc)) { toast("That Cc doesn't look like an email — fix it or clear it"); return; }
       Object.assign(Store.state.settings, { haUrl:val('haUrl')||Store.state.settings.haUrl, haToken:val('haToken'),
-        soonDays:Number(val('soonDays'))||30, emailCc:cc, ownerName:val('ownerName'),
+        emailCc:cc, ownerName:val('ownerName'),
         ...(lead ? { autoLeadDays: Math.max(1, Number(lead.value) || 14) } : {}),
         ...(pd ? { pushDaily: pd.checked } : {}) });
-      { const h = Store.home();   // suburb is per-home — the field edits the CURRENT home
-        if (h) h.suburb = val('suburb'); else Store.state.settings.suburb = val('suburb'); }
       Store.save(); postDigest(NUDGES.list); const r = document.getElementById('haResult'); if (r) r.textContent = 'Saved ✓';
       const pr = document.getElementById('pushResult'); if (pr) pr.textContent = 'Saved ✓'; return;
+    }
+    case 'save-home-prefs': {   // suburb, "due soon" window and notify target — per home (Store.homeSetting)
+      const h = Store.state.homes.find(x => x.id === id); if (!h) return render();
+      h.suburb = val('hp_suburb');
+      h.settings = h.settings || {};
+      h.settings.soonDays = Math.max(1, Number(val('hp_soonDays')) || 30);
+      h.settings.notifyTarget = val('hp_notify');
+      Store.save(); toast('Saved'); return render();
+    }
+    case 'set-ha-mode': {   // per-home HA source — local (this add-on), remote (a friend's own HA), or none
+      const h = Store.home(); if (!h) return;
+      const mode = node.getAttribute('data-mode');
+      h.ha = h.ha || {}; h.ha.mode = mode;
+      if (mode !== 'remote') delete h.ha.url;   // url is meaningless outside remote mode
+      Store.save(); return render();
+    }
+    case 'save-ha-remote': {
+      const homeId = id;
+      if (!Store.state.homes.find(x => x.id === homeId)) return render();
+      const url = val('haR_url'), token = val('haR_token');
+      const r = document.getElementById('haRemoteResult');
+      if (!url || !token) { if (r) r.innerHTML = '<span style="color:var(--red)">✗ Enter both the URL and the token</span>'; return; }
+      if (r) r.textContent = 'Saving…';
+      fetch('api/ha/token', { method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({ homeId, url, token }) })
+        .then(res => res.json()).then(j => {
+          // Re-find the home rather than close over the one captured above — a
+          // Store.syncRemote() adopt while this request was in flight (e.g. the
+          // tab regained focus) can swap Store.state.homes out from under a
+          // stale reference, silently dropping the write. See finding: T4 review.
+          const hh = Store.state.homes.find(x => x.id === homeId);
+          if (j.ok && j.flags && j.flags.configured && hh) {
+            hh.ha = hh.ha || {}; hh.ha.mode = 'remote'; hh.ha.url = url; Store.save();
+            toast('Home Assistant connected'); render();
+          } else if (r) r.innerHTML = `<span style="color:var(--red)">✗ ${esc((j && j.error) || 'save failed')}</span>`;
+        }).catch(e => { if (r) r.innerHTML = `<span style="color:var(--red)">✗ ${esc(e.message)}</span>`; });
+      return;
+    }
+    case 'test-ha-remote': {
+      const url = val('haR_url'), token = val('haR_token');
+      const r = document.getElementById('haRemoteResult'); if (!r) return;
+      if (!url || !token) { r.innerHTML = '<span style="color:var(--red)">✗ Enter both the URL and the token first</span>'; return; }
+      r.textContent = 'Testing…';
+      fetch('api/ha/token/validate', { method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({ url, token }) })
+        .then(res => res.json()).then(j => { r.innerHTML = j.ok
+          ? '<span style="color:var(--green)">✓ Connected</span>'
+          : `<span style="color:var(--red)">✗ ${esc((j && j.error) || 'failed')}</span>`; })
+        .catch(e => { r.innerHTML = `<span style="color:var(--red)">✗ ${esc(e.message)}</span>`; });
+      return;
+    }
+    case 'clear-ha-remote': {
+      const homeId = id;
+      if (!Store.state.homes.find(x => x.id === homeId)) return;
+      if (!confirm("Disconnect this remote Home Assistant? The saved token is deleted from the server.")) return;
+      fetch('api/ha/token', { method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({ homeId, url:'', token:'' }) })
+        .then(res => res.json()).then(j => {
+          const hh = Store.state.homes.find(x => x.id === homeId);   // re-find — see save-ha-remote
+          if (j.ok && hh) { if (hh.ha) delete hh.ha.url; Store.save(); toast('Disconnected'); render(); }
+        });
+      return;
+    }
+    case 'wizard': WIZARD = { step: KEY_STEPS[0].id }; go('/wizard'); refreshKeys().then(render); return;
+    case 'wizard-step': WIZARD.step = node.getAttribute('data-step'); return render();
+    case 'wizard-test': {
+      const which = node.getAttribute('data-which');
+      const r = document.getElementById('wzResult'); if (!r) return;
+      let body;
+      if (which === 'gmail') {
+        const user = val('wzUser'), pass = val('wzPass');
+        if (!user || !pass) { r.innerHTML = '<span style="color:var(--red)">✗ Enter the address and app password first</span>'; return; }
+        body = { which, user, password: pass };
+      } else {
+        const key = val('wzKey');
+        if (!key) { r.innerHTML = '<span style="color:var(--red)">✗ Paste a key first</span>'; return; }
+        body = { which, value: key };
+      }
+      r.textContent = 'Testing…';
+      fetch('api/keys/validate', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body) })
+        .then(res => res.json()).then(j => { r.innerHTML = j.ok
+          ? '<span style="color:var(--green)">✓ Works</span>'
+          : `<span style="color:var(--red)">✗ ${esc((j && j.error) || 'invalid')}</span>`; })
+        .catch(e => { r.innerHTML = `<span style="color:var(--red)">✗ ${esc(e.message)}</span>`; });
+      return;
+    }
+    case 'wizard-save': {
+      const which = node.getAttribute('data-which');
+      const r = document.getElementById('wzResult'); if (!r) return;
+      let body;
+      if (which === 'gmail') {
+        const user = val('wzUser'), pass = val('wzPass');
+        if (!user || !pass) { r.innerHTML = '<span style="color:var(--red)">✗ Enter the address and app password first</span>'; return; }
+        body = { gmailUser: user, gmailPassword: pass };
+      } else {
+        const key = val('wzKey');
+        if (!key) { r.innerHTML = '<span style="color:var(--red)">✗ Paste a key first</span>'; return; }
+        body = { [which]: key };
+      }
+      r.textContent = 'Saving…';
+      fetch('api/keys', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body) })
+        .then(res => res.json()).then(j => {
+          if (j.ok) { KEYS = { anthropic: !!j.flags.anthropic, places: !!j.flags.places, email: !!j.flags.email, checked: true };
+            toast('Saved · active now, no restart needed'); render(); }
+          else r.innerHTML = `<span style="color:var(--red)">✗ ${esc((j && j.error) || 'save failed')}</span>`;
+        }).catch(e => { r.innerHTML = `<span style="color:var(--red)">✗ ${esc(e.message)}</span>`; });
+      return;
     }
     case 'push-test': {
       const pr = document.getElementById('pushResult'); if (pr) pr.textContent = 'Sending…';
@@ -3279,6 +3525,9 @@ render();
 DBG.paint();   // the developer drawer lives outside #app, so render() never eats it
 // Detect the add-on's tokenless HA proxy, then re-render so live data hydrates.
 HA.init().then(ok => { if (ok) render(); });
+// Which server-side keys are live — booleans only, checked once at boot so the
+// wizard/setup/Settings can show honest state without hammering /api/health.
+refreshKeys().then(render);
 Research.emailAvailable();   // probe the backend mailbox once so enquiry taps are instant
 // Multi-device shared store: reconcile with the Green on boot and whenever the app
 // regains focus (wall tablet / phone pick up each other's changes).

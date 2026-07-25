@@ -19,11 +19,12 @@ Run:
 With no key / no SDK it still serves the app and returns a sensible baseline
 home, so the UI always works.
 """
-import json, os, re, time, functools, threading, base64, urllib.request, urllib.parse
+import json, os, re, time, functools, threading, base64, urllib.request, urllib.parse, urllib.error, socket, ipaddress, http.client
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 import pdfkit  # tiny stdlib PDF writer (repo-root module) — the home logbook export
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
+DATA_DIR = "/data" if os.path.isdir("/data") else ROOT       # /data = add-on persistent volume
 
 def _load_env(root):
     """Load KEY=VALUE lines from a local .env (never overrides real env vars)."""
@@ -37,6 +38,100 @@ def _load_env(root):
         k, v = line.split("=", 1)
         os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
 _load_env(ROOT)
+
+# ---- server-side secret stores (never in the shared store, never echoed/logged) ----
+# /data/kk-secrets.json holds the general API keys (Anthropic/Places/Gmail), written
+# by the first-run setup wizard / Settings when the add-on has no Configuration option
+# set for them. /data/kk-ha-secrets.json holds per-home REMOTE Home Assistant tokens
+# (a friend's own HA — see Store.homeHA() in store.js), keyed by homeId; local mode
+# keeps using the Supervisor-injected SUPERVISOR_TOKEN as today. Both are plain files
+# on the add-on's persistent volume, same trust boundary as kk-state.json — never sent
+# to the client, never logged. Precedence is env / add-on option FIRST, file SECOND:
+# run.sh always exports the option env vars (blank when unset), so "present" means
+# non-empty and not bashio's literal "null" — see _env_present().
+SECRETS_FILE = os.path.join(DATA_DIR, "kk-secrets.json")
+HA_SECRETS_FILE = os.path.join(DATA_DIR, "kk-ha-secrets.json")
+_SECRETS_LOCK = threading.Lock()
+_HA_SECRETS_LOCK = threading.Lock()
+
+_SECRET_ENV_MAP = {                 # kk-secrets.json key -> env var it seeds
+    "anthropic": "ANTHROPIC_API_KEY",
+    "places": "KASA_GOOGLE_API_KEY",
+    "gmailUser": "GMAIL_USER",
+    "gmailPassword": "GMAIL_APP_PASSWORD",
+}
+
+def _env_present(envk):
+    v = os.getenv(envk)
+    return bool(v) and bool(v.strip()) and v.strip().lower() != "null"
+
+def _atomic_write_json(path, obj):
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(obj, f)
+    os.replace(tmp, path)   # a crash never leaves a half-written secrets file
+
+def _secrets_read():
+    try:
+        with open(SECRETS_FILE) as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+def _secrets_update(mutate):
+    """Read-modify-write kk-secrets.json as ONE critical section — the read and
+    the write must share a lock acquisition, not just the write, or two saves
+    landing close together (e.g. the wizard's Anthropic step and Places step)
+    each read the pre-update file and the second write silently clobbers the
+    first's change. mutate(dict) edits in place; returns the saved dict."""
+    with _SECRETS_LOCK:
+        d = _secrets_read()
+        mutate(d)
+        _atomic_write_json(SECRETS_FILE, d)
+        return d
+
+def _ha_secrets_read():
+    try:
+        with open(HA_SECRETS_FILE) as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+def _ha_secrets_update(mutate):
+    """Same lock-spans-the-read-and-write fix as _secrets_update(), for the
+    per-home HA token file (two homes' Settings saves can race too)."""
+    with _HA_SECRETS_LOCK:
+        d = _ha_secrets_read()
+        mutate(d)
+        _atomic_write_json(HA_SECRETS_FILE, d)
+        return d
+
+def ha_secret_for(home_id):
+    """{'url','token'} for a home's remote HA, or None. Server-side only — never
+    sent to the client, never logged. Consumed by the (per-home-aware) HA proxy."""
+    if not home_id:
+        return None
+    v = _ha_secrets_read().get(home_id)
+    return v if isinstance(v, dict) and v.get("url") and v.get("token") else None
+
+# Snapshot BEFORE the file is loaded — a key already live via a real env var or
+# add-on option must keep winning even after a later /api/keys save writes the
+# file (the file is only ever the second-tier source).
+_ENV_PRESET = {k for k, envk in _SECRET_ENV_MAP.items() if _env_present(envk)}
+
+def _load_secrets_file():
+    """Fill process env from kk-secrets.json for whichever keys aren't already
+    live from a real env var / add-on option. Never overwrites, never logs values."""
+    d = _secrets_read()
+    for k, envk in _SECRET_ENV_MAP.items():
+        if k in _ENV_PRESET:
+            continue
+        v = d.get(k)
+        if v:
+            os.environ[envk] = str(v)
+_load_secrets_file()
 
 PORT = int(os.getenv("KASA_PORT", "8777"))
 MODEL = os.getenv("KASA_MODEL", "claude-opus-4-8")
@@ -157,11 +252,78 @@ def _http_get(url, headers=None, timeout=25):
 # With homeassistant_api:true the Supervisor injects SUPERVISOR_TOKEN and exposes
 # the core API at http://supervisor/core/api/. Proxying through it means the app
 # reads live HA state WITHOUT the user pasting a URL or long-lived token.
-def ha_available():
+#
+# Multi-home: every home has a Store.homeHA() source — 'local' (this add-on's
+# own Supervisor-proxied HA, today's only mode and the default for a home that
+# predates this field), 'remote' (a friend's own HA elsewhere — see
+# ha_secret_for()), or 'none' (not connected). ha_api_get/post resolve which one
+# to use per call via home_id; every existing call site that doesn't pass one
+# keeps behaving exactly as before (home_id=None -> 'local').
+def _home_ha_config(home_id):
+    """(mode, url_or_None) for a home's HA source. No home_id, no matching home,
+    or a home predating this field all resolve to ('local', None) — mirrors
+    Store.homeHA()'s default in store.js. Never returns a token — that's
+    ha_secret_for()'s job, kept out of the shared state file entirely."""
+    if not home_id:
+        return "local", None
+    try:
+        homes = (state_read().get("state") or {}).get("homes") or []
+    except Exception:
+        homes = []
+    h = next((x for x in homes if isinstance(x, dict) and x.get("id") == home_id), None)
+    ha = h.get("ha") if isinstance(h, dict) else None
+    if isinstance(ha, dict) and ha.get("mode") in ("remote", "none"):
+        return ha["mode"], (ha.get("url") or None)
+    return "local", None
+
+def _ha_remote_request(home_id, url, path, method="GET", body=None, timeout=20):
+    """Fetch <path> from a home's remote HA (a friend's own instance elsewhere).
+    Re-validates the stored url on EVERY call, not just at save time — a host
+    can answer a public record now and a private one a moment later (DNS
+    rebinding), so trusting a URL because it passed _valid_ha_url() once at save
+    isn't enough (see _pinned_opener). Returns None when the home has no saved
+    remote credentials or the url now fails re-validation (both treated as
+    'not connected', same as local mode's missing-token case) — never raises
+    for those; a genuine request failure (timeout, HTTP error) DOES raise, same
+    as the local branch's urlopen, so callers' existing except/degrade paths
+    keep working unchanged."""
+    sec = ha_secret_for(home_id)
+    if not sec:
+        return None
+    ok, err, ip = _valid_ha_url(sec["url"])
+    if not ok:
+        print(f"[ha] remote url for home={home_id} failed re-validation: {err}")
+        return None
+    req_url = sec["url"].rstrip("/") + "/api/" + path
+    headers = {"Authorization": "Bearer " + sec["token"]}
+    data = None
+    if body is not None:
+        data = json.dumps(body).encode()
+        headers["Content-Type"] = "application/json"
+    req = urllib.request.Request(req_url, data=data, method=method, headers=headers)
+    with _pinned_opener(ip).open(req, timeout=timeout) as r:
+        return r.read()
+
+def ha_available(home_id=None):
+    """Whether the given home's HA source (or, called bare, the legacy local-only
+    check) is usable right now. 'none' is always unavailable; 'remote' needs a
+    saved url+token; 'local' needs the Supervisor-injected token."""
+    mode, _ = _home_ha_config(home_id)
+    if mode == "none":
+        return False
+    if mode == "remote":
+        return bool(ha_secret_for(home_id))
     return bool(os.getenv("SUPERVISOR_TOKEN"))
 
-def ha_api_get(path):
-    """GET <path> from the HA core API via the Supervisor proxy. Raw bytes, or None."""
+def ha_api_get(path, home_id=None):
+    """GET <path> from the home's HA source. Raw bytes, or None ('none' mode, no
+    saved remote creds, or a remote url that failed re-validation — the UI reads
+    all three as 'not connected')."""
+    mode, url = _home_ha_config(home_id)
+    if mode == "none":
+        return None
+    if mode == "remote":
+        return _ha_remote_request(home_id, url, path)
     token = os.getenv("SUPERVISOR_TOKEN")
     if not token:
         return None
@@ -170,8 +332,17 @@ def ha_api_get(path):
     with urllib.request.urlopen(req, timeout=20) as r:  # internal http, no TLS
         return r.read()
 
-def ha_api_post(path, body):
-    """POST to the HA core API via the Supervisor proxy. Parsed JSON, or None."""
+def ha_api_post(path, body, home_id=None):
+    """POST to the home's HA source. Parsed JSON, or None (same 'not connected'
+    cases as ha_api_get)."""
+    mode, url = _home_ha_config(home_id)
+    if mode == "none":
+        return None
+    if mode == "remote":
+        raw = _ha_remote_request(home_id, url, path, method="POST", body=body)
+        if raw is None:
+            return None
+        return json.loads(raw) if raw else {}
     token = os.getenv("SUPERVISOR_TOKEN")
     if not token:
         return None
@@ -183,34 +354,140 @@ def ha_api_post(path, body):
         raw = r.read()
     return json.loads(raw) if raw else {}
 
-# ---- weather (for seasonal/weather nudges) ------------------------------------
-_WEATHER_CACHE = {"t": 0, "data": None, "entity": None}
+# ---- remote HA (a friend's own instance, per home — see Store.homeHA()) -------
+# The url is USER-SUPPLIED and this server fetches it — both here (save-time
+# validate) and on every proxied call (_ha_remote_request, above) — guard
+# against SSRF into the add-on's own network (the Supervisor, loopback, RFC1918
+# ranges) same as any other server that fetches an address a user typed in.
+def _valid_ha_url(url):
+    """(ok, error, ip) — plausible PUBLIC http(s) endpoint, not a private/loopback/
+    link-local address and not the Supervisor's own hostname, plus the single IP
+    that host resolved to. Defence-in-depth: this doesn't need to be exhaustive
+    (a determined user already has shell access to their own add-on), just
+    enough that pasting a URL here can't be used to reach internal services the
+    ingress boundary is supposed to hide.
 
-def ha_weather():
+    The caller MUST pass `ip` on to _validate_ha_remote (which pins the real
+    connection to it) rather than re-resolving the hostname — otherwise a host
+    that answers a public record now and a private one a moment later (DNS
+    rebinding, or just a flaky resolver) would pass this check and still reach
+    an internal address at connect time."""
+    try:
+        p = urllib.parse.urlparse(url)
+    except Exception:
+        return False, "not a valid URL", None
+    if p.scheme not in ("http", "https"):
+        return False, "url must start with http:// or https://", None
+    host = (p.hostname or "").strip().lower()
+    if not host:
+        return False, "url must include a host", None
+    if host in ("localhost", "supervisor", "0.0.0.0") or host.endswith(".local"):
+        return False, "that host isn't reachable from the add-on", None
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except Exception:
+        return False, "couldn't resolve that host", None
+    pinned_ip = None
+    for info in infos:
+        try:
+            ip = ipaddress.ip_address(info[4][0])
+        except Exception:
+            continue
+        if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_multicast or ip.is_reserved or ip.is_unspecified:
+            return False, "that address isn't reachable from here", None
+        if pinned_ip is None:
+            pinned_ip = str(ip)
+    if pinned_ip is None:
+        return False, "couldn't resolve that host", None
+    return True, None, pinned_ip
+
+def _safe_err(e):
+    """A validate-endpoint error safe to hand back to the client — never the raw
+    exception (some urllib/smtplib errors can echo back request details)."""
+    if isinstance(e, urllib.error.HTTPError):
+        return f"HTTP {e.code}"
+    if isinstance(e, smtplib.SMTPAuthenticationError):
+        return "authentication failed"
+    if isinstance(e, (TimeoutError, socket.timeout)):
+        return "timed out"
+    return e.__class__.__name__
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """_valid_ha_url() only vets the host the USER typed — silently following a
+    3xx would let that host redirect the request (bearer token included) to an
+    internal address after the check already passed. Returning None here makes
+    urlopen raise the original response instead of following it."""
+    def redirect_request(self, *a, **kw):
+        return None
+
+def _pinned_opener(ip):
+    """Build a one-shot opener whose connections go to the given pre-vetted IP
+    instead of letting http.client re-resolve the request's hostname — the TLS
+    handshake (SNI + cert check) still uses the original hostname via
+    server_hostname, so a real cert still validates normally."""
+    class _PinnedHTTPConnection(http.client.HTTPConnection):
+        def connect(self):
+            self.sock = self._create_connection((ip, self.port), self.timeout, self.source_address)
+
+    class _PinnedHTTPSConnection(http.client.HTTPSConnection):
+        def connect(self):
+            sock = self._create_connection((ip, self.port), self.timeout, self.source_address)
+            self.sock = self._context.wrap_socket(sock, server_hostname=self.host)
+
+    class _PinnedHTTPHandler(urllib.request.HTTPHandler):
+        def http_open(self, req):
+            return self.do_open(_PinnedHTTPConnection, req)
+
+    class _PinnedHTTPSHandler(urllib.request.HTTPSHandler):
+        def https_open(self, req):
+            return self.do_open(_PinnedHTTPSConnection, req, context=_SSL_CTX)
+
+    return urllib.request.build_opener(_NoRedirect, _PinnedHTTPHandler, _PinnedHTTPSHandler)
+
+def _validate_ha_remote(url, token, ip):
+    """Real test call: GET {url}/api/ with the given bearer token, connecting to
+    the pre-vetted `ip` from _valid_ha_url rather than re-resolving the hostname
+    (see _pinned_opener — closes the DNS-rebinding/TOCTOU gap). HA's base /api/
+    endpoint returns a small 'API running.' payload for any valid token — cheap
+    and side-effect-free. No redirects followed — see _NoRedirect."""
+    try:
+        req = urllib.request.Request(url.rstrip("/") + "/api/",
+                                     headers={"Authorization": "Bearer " + token})
+        with _pinned_opener(ip).open(req, timeout=10) as r:
+            r.read()
+        return True, None
+    except Exception as e:
+        return False, _safe_err(e)
+
+# ---- weather (for seasonal/weather nudges) ------------------------------------
+_WEATHER_CACHE = {}   # home_id (or "" for the legacy bare call) -> {t, data, entity}
+
+def ha_weather(home_id=None):
     """Current conditions + daily forecast from the home's weather entity (auto-found).
-    Cached 30 min. Returns dict or None."""
+    Cached 30 min per home. Returns dict or None."""
+    key = home_id or ""
     now = time.time()
-    if _WEATHER_CACHE["data"] and now - _WEATHER_CACHE["t"] < 1800:
-        return _WEATHER_CACHE["data"]
-    if not ha_available():
+    cached = _WEATHER_CACHE.get(key)
+    if cached and cached.get("data") and now - cached["t"] < 1800:
+        return cached["data"]
+    if not ha_available(home_id):
         return None
     try:
-        if not _WEATHER_CACHE["entity"]:
-            states = json.loads(ha_api_get("states"))
+        ent = (cached or {}).get("entity")
+        if not ent:
+            states = json.loads(ha_api_get("states", home_id))
             ent = next((s["entity_id"] for s in states if s["entity_id"].startswith("weather.")), None)
-            _WEATHER_CACHE["entity"] = ent
-        ent = _WEATHER_CACHE["entity"]
         if not ent:
             return None
-        cur = json.loads(ha_api_get("states/" + urllib.parse.quote(ent, safe="")))
+        cur = json.loads(ha_api_get("states/" + urllib.parse.quote(ent, safe=""), home_id))
         # modern HA: forecast comes from the weather.get_forecasts service, not attributes
         fc = ha_api_post("services/weather/get_forecasts?return_response",
-                         {"entity_id": ent, "type": "daily"})
+                         {"entity_id": ent, "type": "daily"}, home_id)
         forecast = (((fc or {}).get("service_response") or {}).get(ent) or {}).get("forecast") or []
         data = {"entity": ent, "state": cur.get("state"),
                 "temperature": (cur.get("attributes") or {}).get("temperature"),
                 "forecast": forecast[:5]}
-        _WEATHER_CACHE.update(t=now, data=data)
+        _WEATHER_CACHE[key] = {"t": now, "data": data, "entity": ent}
         return data
     except Exception as e:
         print(f"[weather] failed: {e}")
@@ -387,20 +664,22 @@ def _ha_live_entities(dev):
             picked = [prim]
     return [{'id': e['id'], 'dc': e.get('device_class'), 'unit': e.get('unit')} for e in picked[:4]]
 
-_DEV_CACHE = {"t": 0, "data": None}
+_DEV_CACHE = {}   # home_id (or "" for the legacy bare call) -> {t, data}
 
-def ha_devices(force=False):
-    """Maintenance-relevant HA devices, synchronous + cached 300s (mirrors
+def ha_devices(force=False, home_id=None):
+    """Maintenance-relevant HA devices, synchronous + cached 300s per home (mirrors
     _WEATHER_CACHE — the wall tablet must not re-scan the registry on every
     open). Never raises: any failure degrades to an empty, still-well-shaped
     response so the client always has something to render."""
-    if not ha_available():
+    if not ha_available(home_id):
         return {"available": False, "devices": []}
+    key = home_id or ""
     now = time.time()
-    if not force and _DEV_CACHE["data"] and now - _DEV_CACHE["t"] < 300:
-        return _DEV_CACHE["data"]
+    cached = _DEV_CACHE.get(key)
+    if not force and cached and now - cached["t"] < 300:
+        return cached["data"]
     try:
-        raw = ha_api_post("template", {"template": HA_DEVICES_TEMPLATE})
+        raw = ha_api_post("template", {"template": HA_DEVICES_TEMPLATE}, home_id)
         devs = raw if isinstance(raw, list) else []
     except Exception as e:
         print(f"[ha] device registry read failed: {e}")
@@ -424,7 +703,7 @@ def ha_devices(force=False):
             print(f"[ha] device row skipped: {e}")
             continue
     data = {"available": True, "devices": devices, "everythingElse": everything_else}
-    _DEV_CACHE.update(t=now, data=data)
+    _DEV_CACHE[key] = {"t": now, "data": data}
     return data
 
 # ---- drift detection (the correction loop — slice 3) --------------------------
@@ -468,8 +747,7 @@ def _ha_compute_drift(assets, devices, everything_else=None):
     return drift, vanished, new_devices
 
 # ---- push notifications (HA notify) + daily digest ----------------------------
-DATA_DIR = "/data" if os.path.isdir("/data") else ROOT       # /data = add-on persistent volume
-DIGEST_FILE = os.path.join(DATA_DIR, "kk-digest.json")
+DIGEST_FILE = os.path.join(DATA_DIR, "kk-digest.json")   # DATA_DIR is defined near the top, by the secret stores
 
 # ---- multi-device shared state (single household: rev-guarded last-write-wins) --
 STATE_FILE = os.path.join(DATA_DIR, "kk-state.json")
@@ -494,20 +772,20 @@ def state_write(base_rev, new_state):
         os.replace(tmp, STATE_FILE)  # atomic — a crash never corrupts the store
         return True, doc
 
-def ha_drift():
-    """GET /api/ha/drift — read-only findings for the current home: field drift,
-    vanished devices, unimported new devices. Writes NOTHING (per the PRD's
-    approval-first principle — corrections still go through ha-import-apply).
-    Reuses ha_devices()'s cached registry read, so this costs nothing extra on
-    top of a recent import scan. Never raises: any failure degrades to an empty,
-    well-shaped response."""
+def ha_drift(home_id=None):
+    """GET /api/ha/drift — read-only findings for a home (defaults to the shared
+    store's currentHomeId): field drift, vanished devices, unimported new
+    devices. Writes NOTHING (per the PRD's approval-first principle —
+    corrections still go through ha-import-apply). Reuses ha_devices()'s cached
+    registry read, so this costs nothing extra on top of a recent import scan.
+    Never raises: any failure degrades to an empty, well-shaped response."""
     now_iso = time.strftime("%Y-%m-%dT%H:%M:%S")
-    if not ha_available():
+    state = state_read().get("state") or {}
+    hid = home_id or state.get("currentHomeId")
+    if not ha_available(hid):
         return {"available": False, "drift": [], "vanished": [], "newDevices": [], "checkedAt": now_iso}
     try:
-        reg = ha_devices()
-        state = state_read().get("state") or {}
-        hid = state.get("currentHomeId")
+        reg = ha_devices(home_id=hid)
         assets = [a for a in (state.get("assets") or []) if a.get("homeId") == hid]
         drift, vanished, new_devices = _ha_compute_drift(assets, reg.get("devices"), reg.get("everythingElse"))
         return {"available": True, "drift": drift, "vanished": vanished, "newDevices": new_devices, "checkedAt": now_iso}
@@ -517,13 +795,18 @@ def ha_drift():
 
 NOTIFY_HOUR = int(os.getenv("KASA_NOTIFY_HOUR", "8"))
 
-def ha_notify(title, message):
-    """Send a push via HA's default notify service (mobile apps). Returns (ok, err)."""
+def ha_notify(title, message, home_id=None):
+    """Send a push via a home's HA notify service (mobile apps; defaults to the
+    legacy local-only source when no home_id is given). Returns (ok, err) — err
+    is sanitised (_safe_err), since /api/ha/notify hands it straight to the
+    client and a remote home's HA can now be a url the user typed in."""
     try:
-        ha_api_post("services/notify/notify", {"title": title, "message": message})
+        res = ha_api_post("services/notify/notify", {"title": title, "message": message}, home_id)
+        if res is None:   # 'none' mode / no local token / unconfigured or unreachable remote
+            return False, "ha not connected"
         return True, None
     except Exception as e:
-        return False, str(e)
+        return False, _safe_err(e)
 
 def _ha_timezone():
     try:
@@ -548,9 +831,11 @@ def _digest_pusher():
             if now.hour == NOTIFY_HOUR and last_sent != today and os.path.exists(DIGEST_FILE):
                 d = json.load(open(DIGEST_FILE))
                 if d.get("pushDaily", True):
-                    parts = _digest_push_parts(d, state_read().get("state"))
+                    state = state_read().get("state") or {}
+                    home_id = d.get("homeId") or state.get("currentHomeId")
+                    parts = _digest_push_parts(d, state, home_id)
                     if parts:
-                        ok, err = ha_notify("KasaKeeper — morning brief", " · ".join(parts)[:250])
+                        ok, err = ha_notify("KasaKeeper — morning brief", " · ".join(parts)[:250], home_id)
                         print(f"[push] daily digest sent={ok} err={err}")
                 last_sent = today
         except Exception as e:
@@ -790,6 +1075,29 @@ def _google_key():
     k = (os.getenv("KASA_GOOGLE_API_KEY") or "").strip()
     return k if k and k.lower() != "null" else None
 
+def _validate_anthropic_key(key):
+    """Real cheap test call for the setup wizard: models.list costs no tokens
+    and fails fast on a bad key. Never persists — the caller decides that."""
+    try:
+        import anthropic
+    except ImportError:
+        return False, "anthropic SDK not installed"
+    try:
+        anthropic.Anthropic(api_key=key, max_retries=0, timeout=15.0).models.list(limit=1)
+        return True, None
+    except Exception as e:
+        return False, _safe_err(e)
+
+def _validate_places_key(key):
+    """Real cheap test call: a minimal Autocomplete (New) request — billed at
+    its own (tiny) rate, fails fast with a clear error on a bad/unenabled key."""
+    try:
+        _http_post_json("https://places.googleapis.com/v1/places:autocomplete",
+                        {"X-Goog-Api-Key": key}, {"input": "cafe", "regionCodes": ["au"]}, timeout=10)
+        return True, None
+    except Exception as e:
+        return False, _safe_err(e)
+
 def find_services_places(trade, suburb, address):
     """Google Places API (New) Text Search — real ratings, review counts & phone.
     Returns {trade,suburb,providers:[...]} or None when no key / on failure (so we fall back)."""
@@ -966,6 +1274,16 @@ def _email_addr(s):
     m = _re.search(r"[\w.\-+]+@[\w.\-]+", s or "")
     return m.group(0).lower() if m else ""
 
+def _validate_gmail_creds(user, app_password):
+    """Real cheap test call for the setup wizard: an SMTP login, no message sent."""
+    try:
+        with smtplib.SMTP(GMAIL_SMTP, 587, timeout=15) as s:
+            s.starttls(context=_tls_ctx())
+            s.login(user, app_password)
+        return True, None
+    except Exception as e:
+        return False, _safe_err(e)
+
 def send_email(to_addr, subject, body_text, reply_to=None, cc=None):
     """SMTP-send a plaintext email from the KasaKeeper Gmail. Returns the Message-ID.
     Raises on failure so the caller can surface it."""
@@ -1116,7 +1434,7 @@ def poll_quote_replies():
         return
     # Claude parse happens OUTSIDE the state lock (slow); apply results in one mutate
     parsed = {qid: (info, parse_quote_reply(info["body"])) for qid, info in newest.items()}
-    notify = []  # (title, message) collected in the mutator, pushed after the write
+    notify = []  # (title, message, homeId) collected in the mutator, pushed after the write
 
     def mutator(state):
         changed = False
@@ -1151,18 +1469,18 @@ def poll_quote_replies():
                 notify.append(("KasaKeeper — dates offered",
                                f"{who} offered: {' / '.join(dates[:3])}"
                                + (f" · {money_str(q.get('amount'))}" if q.get("amount") else "")
-                               + " — open KasaKeeper to confirm one."))
+                               + " — open KasaKeeper to confirm one.", q.get("homeId")))
             elif q.get("auto"):
                 notify.append(("KasaKeeper — reply received",
-                               f"{who}: " + (q.get("replyNote") or "replied to the booking enquiry.")))
+                               f"{who}: " + (q.get("replyNote") or "replied to the booking enquiry."), q.get("homeId")))
             changed = True
         return changed
 
     res = state_mutate(mutator)
     if res:
         print(f"[quote] processed {len(parsed)} repl(y/ies); rev now {res.get('rev')}")
-        for title, msg in notify:
-            ha_notify(title, msg[:250])
+        for title, msg, home_id in notify:
+            ha_notify(title, msg[:250], home_id)
 
 def money_str(v):
     try:
@@ -1283,7 +1601,8 @@ def autobook_scan():
             continue
         open_tasks.add(t.get("id")); open_assets.add(t.get("assetId"))
         ha_notify("KasaKeeper — auto-book",
-                  f"Emailed {p.get('name')} to book “{t.get('title')}” — I'll ping you when dates come back.")
+                  f"Emailed {p.get('name')} to book “{t.get('title')}” — I'll ping you when dates come back.",
+                  a.get("homeId"))
         print(f"[autobook] enquiry sent for {t.get('title')!r} -> {to} token={token}")
 
 def _autobook_loop():
@@ -1608,11 +1927,12 @@ def _recall_alert_line(state):
     more = f" +{len(names) - 4} more" if len(names) > 4 else ""
     return f"⚠ Recall: {shown}{more}"
 
-def _digest_push_parts(d, state=None):
+def _digest_push_parts(d, state=None, home_id=None):
     """Builds the ordered line list for the morning-brief push from the saved
     digest dict (client-posted overdue/soon/nudges) plus a recall alert line
     sourced from live shared state. Pulled out of _digest_pusher so it's
-    independently testable."""
+    independently testable. home_id (falls back to d['homeId'], then
+    state['currentHomeId']) picks which home's HA source the drift nudge reads."""
     parts = []
     if d.get("overdue"):
         parts.append(f"{len(d['overdue'])} overdue: " + ", ".join(d["overdue"][:3]))
@@ -1622,9 +1942,10 @@ def _digest_push_parts(d, state=None):
     if recall_line:
         parts.append(recall_line)
     parts += (d.get("nudges") or [])[:2]
-    if ha_available():   # one-sentence registry-drift nudge — findings only, never a write
+    hid = home_id or d.get("homeId") or (state or {}).get("currentHomeId")
+    if ha_available(hid):   # one-sentence registry-drift nudge — findings only, never a write
         try:
-            drift = ha_drift()
+            drift = ha_drift(hid)
             nc = len(drift.get("drift") or []) + len(drift.get("vanished") or [])
             nn = len(drift.get("newDevices") or [])
             if nc or nn:
@@ -2090,7 +2411,7 @@ def _match(items, name, field="name"):
     part = [x for x in items if n in (x.get(field) or "").lower()]
     return part[0] if len(part) == 1 else None
 
-def _usage_grounding_block(a):
+def _usage_grounding_block(a, home_id=None):
     """Compact grounding block for one usage-tracked asset: config + (if reachable) the
     entity's CURRENT state. Never raises — a dead/unreachable entity just skips the state."""
     u = a.get("usage")
@@ -2102,9 +2423,9 @@ def _usage_grounding_block(a):
     if mode == "runtime":
         g["note"] = ("run-hours are derived from HA history, not computed here — "
                       "currentState is only a live snapshot of the entity, not accumulated hours")
-    if ha_available():
+    if ha_available(home_id):
         try:
-            raw = ha_api_get("states/" + u["entity"])
+            raw = ha_api_get("states/" + u["entity"], home_id)
             if raw:
                 g["currentState"] = json.loads(raw).get("state")
         except Exception:
@@ -2130,7 +2451,7 @@ def _chat_context(state):
                        "lastDone": t.get("lastDone"), "estCost": t.get("estCost")}
                       for t in tasks if t.get("assetId") == a["id"]],
         }.items() if v not in (None, [], "")}
-        g = _usage_grounding_block(a)
+        g = _usage_grounding_block(a, hid)
         if g:
             entry["usage"] = g
         out_assets.append(entry)
@@ -2679,6 +3000,13 @@ def _start_sweep(home_id):
     threading.Thread(target=_run_sweep_job, args=(job_id, home_id), daemon=True).start()
     return job_id
 
+def _secret_flags():
+    """Which keys are live right now — same booleans /api/health reports, so the
+    setup wizard / Settings can show honest state right after a save with no
+    restart. Never the values themselves."""
+    return {"anthropic": bool(os.getenv("ANTHROPIC_API_KEY") or os.getenv("ANTHROPIC_AUTH_TOKEN")),
+            "places": bool(_google_key()), "email": gmail_available()}
+
 
 class Handler(SimpleHTTPRequestHandler):
     def end_headers(self):
@@ -2907,12 +3235,16 @@ class Handler(SimpleHTTPRequestHandler):
             message = (payload.get("message") or "").strip()[:250]
             if not message:
                 return self._send_json({"error": "message required"}, 400)
-            ok, err = ha_notify(title, message)
+            home_id = str(payload.get("homeId") or "").strip() \
+                      or (state_read().get("state") or {}).get("currentHomeId")
+            ok, err = ha_notify(title, message, home_id)
             return self._send_json({"ok": ok, "error": err}, 200 if ok else 502)
         if route == "/api/digest":
             # the app posts its current schedule digest; the daily pusher reads it at NOTIFY_HOUR
             try:
-                keep = {k: payload.get(k) for k in ("home", "overdue", "soon", "next", "nudges", "pushDaily")}
+                # homeId is optional (older/current clients don't send it yet) — the
+                # pusher falls back to the shared store's currentHomeId when absent.
+                keep = {k: payload.get(k) for k in ("home", "homeId", "overdue", "soon", "next", "nudges", "pushDaily")}
                 keep["saved_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
                 json.dump(keep, open(DIGEST_FILE, "w"))
                 return self._send_json({"ok": True})
@@ -2944,6 +3276,90 @@ class Handler(SimpleHTTPRequestHandler):
             except Exception as e:
                 print(f"[enquiry] send failed: {e}")
                 return self._send_json({"error": str(e)}, 502)
+        # ---- first-run setup wizard / Settings: server-side secret stores ----
+        # Write-only — no GET anywhere returns a key or token, and none of these
+        # ever land in a print()/log line. Values pass through request bodies
+        # only, same as every other /api/* route.
+        if route == "/api/keys":       # save one or more general API keys
+            if not isinstance(payload, dict):
+                return self._send_json({"error": "invalid body"}, 400)
+            updates = {}
+            for k in _SECRET_ENV_MAP:
+                v = payload.get(k)
+                if v is None:
+                    continue
+                if not isinstance(v, str) or not (0 < len(v.strip()) <= 300):
+                    return self._send_json({"error": f"invalid {k}"}, 400)
+                updates[k] = v.strip()
+            if not updates:
+                return self._send_json({"error": "no keys provided"}, 400)
+            _secrets_update(lambda d: d.update(updates))
+            for k, v in updates.items():           # take effect immediately, no restart needed
+                if k not in _ENV_PRESET:            # a real env var / add-on option always wins
+                    os.environ[_SECRET_ENV_MAP[k]] = v
+            print(f"[keys] saved: {', '.join(sorted(updates.keys()))}")   # key NAMES only, never values
+            return self._send_json({"ok": True, "flags": _secret_flags()})
+        if route == "/api/keys/validate":   # real test call — never persists
+            if not isinstance(payload, dict):
+                return self._send_json({"error": "invalid body"}, 400)
+            which = str(payload.get("which") or "")
+            if which == "anthropic":
+                key = str(payload.get("value") or "").strip()
+                if not key or len(key) > 300:
+                    return self._send_json({"ok": False, "error": "key required"}, 400)
+                ok, err = _validate_anthropic_key(key)
+            elif which == "places":
+                key = str(payload.get("value") or "").strip()
+                if not key or len(key) > 300:
+                    return self._send_json({"ok": False, "error": "key required"}, 400)
+                ok, err = _validate_places_key(key)
+            elif which == "gmail":
+                user = str(payload.get("user") or "").strip()
+                pwd = str(payload.get("password") or "").replace(" ", "").strip()
+                if not user or not pwd or len(user) > 300 or len(pwd) > 300:
+                    return self._send_json({"ok": False, "error": "user and app password required"}, 400)
+                ok, err = _validate_gmail_creds(user, pwd)
+            else:
+                return self._send_json({"error": "unknown 'which'"}, 400)
+            print(f"[keys] validate which={which} ok={ok}")   # outcome only, never the value tested
+            return self._send_json({"ok": ok, "error": err})
+        if route == "/api/ha/token":   # save a per-home REMOTE HA url+token (local mode needs none)
+            if not isinstance(payload, dict):
+                return self._send_json({"error": "invalid body"}, 400)
+            home_id = str(payload.get("homeId") or "").strip()
+            if not re.fullmatch(r"[A-Za-z0-9_-]{1,40}", home_id):
+                return self._send_json({"error": "invalid homeId"}, 400)
+            url = str(payload.get("url") or "").strip()
+            token = str(payload.get("token") or "").strip()
+            if not url and not token:      # both blank -> disconnect/clear this home's saved token
+                _ha_secrets_update(lambda d: d.pop(home_id, None))
+                print(f"[ha] token cleared for home={home_id}")
+                return self._send_json({"ok": True, "flags": {"homeId": home_id, "configured": False}})
+            if not url or not token:
+                return self._send_json({"error": "url and token are both required"}, 400)
+            if len(url) > 500 or len(token) > 4000:
+                return self._send_json({"error": "url or token too long"}, 400)
+            ok, err, _ip = _valid_ha_url(url)
+            if not ok:
+                return self._send_json({"error": err}, 400)
+            _ha_secrets_update(lambda d: d.__setitem__(home_id, {"url": url.rstrip("/"), "token": token}))
+            print(f"[ha] token saved for home={home_id}")
+            return self._send_json({"ok": True, "flags": {"homeId": home_id, "configured": True}})
+        if route == "/api/ha/token/validate":   # real test call — never persists
+            if not isinstance(payload, dict):
+                return self._send_json({"ok": False, "error": "invalid body"}, 400)
+            url = str(payload.get("url") or "").strip()
+            token = str(payload.get("token") or "").strip()
+            if not url or not token:
+                return self._send_json({"ok": False, "error": "url and token required"}, 400)
+            if len(url) > 500 or len(token) > 4000:
+                return self._send_json({"ok": False, "error": "url or token too long"}, 400)
+            ok, err, ip = _valid_ha_url(url)
+            if not ok:
+                return self._send_json({"ok": False, "error": err}, 400)
+            ok, err = _validate_ha_remote(url, token, ip)
+            print(f"[ha] validate home url ok={ok}")   # outcome only, never the token
+            return self._send_json({"ok": ok, "error": err})
         return self._send_json({"error": "not found"}, 404)
 
     def do_GET(self):
@@ -2986,17 +3402,23 @@ class Handler(SimpleHTTPRequestHandler):
                 print(f"[logbook] error: {e}")
                 return self._send_json({"error": "couldn't generate the logbook"}, 500)
         # ---- HA proxy (tokenless live data inside the add-on) ----
+        # homeId is an optional query param on every route below — a home not
+        # named explicitly falls back to the shared store's currentHomeId, so
+        # today's app.js (which doesn't send it yet) keeps working unchanged.
+        if p.startswith("/api/ha/"):
+            home_id = (params.get("homeId") or [""])[0].strip() \
+                      or (state_read().get("state") or {}).get("currentHomeId")
         if p == "/api/ha/available":
-            return self._send_json({"available": ha_available()})
+            return self._send_json({"available": ha_available(home_id)})
         if p == "/api/ha/devices":
             try:
-                return self._send_json(ha_devices(force=(params.get("force") or [""])[0] == "1"))
+                return self._send_json(ha_devices(force=(params.get("force") or [""])[0] == "1", home_id=home_id))
             except Exception as e:
                 print(f"[ha] devices route failed: {e}")
                 return self._send_json({"available": False, "devices": []})
         if p == "/api/ha/drift":
             try:
-                return self._send_json(ha_drift())
+                return self._send_json(ha_drift(home_id))
             except Exception as e:
                 print(f"[ha] drift route failed: {e}")
                 return self._send_json({"available": False, "drift": [], "vanished": [], "newDevices": []})
@@ -3007,28 +3429,28 @@ class Handler(SimpleHTTPRequestHandler):
             q = (params.get("q") or [""])[0].strip()[:120]
             return self._send_json({"suggestions": address_suggest(q)})
         if p == "/api/ha/weather":
-            w = ha_weather()
+            w = ha_weather(home_id)
             return self._send_json(w or {"error": "no weather entity"}, 200 if w else 404)
         if p == "/api/ha/state":
             ent = (params.get("entity") or [""])[0]
             try:
-                raw = ha_api_get("states/" + urllib.parse.quote(ent, safe=""))
+                raw = ha_api_get("states/" + urllib.parse.quote(ent, safe=""), home_id)
                 if raw is None:
                     return self._send_json({"error": "ha proxy unavailable"}, 503)
                 return self._send_raw(raw)
             except Exception as e:
-                return self._send_json({"error": str(e)}, 502)
+                return self._send_json({"error": _safe_err(e)}, 502)
         if p == "/api/ha/history":
             ent = (params.get("entity") or [""])[0]
             since = (params.get("since") or [""])[0]
             try:
                 path = f"history/period/{urllib.parse.quote(since, safe='')}?filter_entity_id={urllib.parse.quote(ent, safe='')}&minimal_response"
-                raw = ha_api_get(path)
+                raw = ha_api_get(path, home_id)
                 if raw is None:
                     return self._send_json({"error": "ha proxy unavailable"}, 503)
                 return self._send_raw(raw)
             except Exception as e:
-                return self._send_json({"error": str(e)}, 502)
+                return self._send_json({"error": _safe_err(e)}, 502)
         # ---- vaulted-file serving: same id-regex guard + 404 shape for all three ----
         # NOTE: no function-local `import re` in these branches — a local import would
         # make `re` local to ALL of do_GET, and the place-photo branch below (which
@@ -3096,9 +3518,11 @@ if __name__ == "__main__":
     # credits and can send mail. run.sh exports KASA_HOST=0.0.0.0 inside the add-on,
     # where ingress (and no ports: mapping) is the auth boundary.
     host = os.getenv("KASA_HOST", "127.0.0.1")
-    if ha_available():  # daily morning-brief push (only inside the add-on)
-        threading.Thread(target=_digest_pusher, daemon=True).start()
-        print(f"[push] daily digest armed for {NOTIFY_HOUR:02d}:00 (home timezone)")
+    # Always armed, not gated on local HA: _digest_push_parts/ha_notify resolve
+    # per-home now (a home can be 'remote'-only with no local Supervisor token
+    # at all), and the loop already no-ops cheaply when nothing's connected.
+    threading.Thread(target=_digest_pusher, daemon=True).start()
+    print(f"[push] daily digest armed for {NOTIFY_HOUR:02d}:00 (home timezone)")
     if gmail_available():  # watch for trade quote replies
         threading.Thread(target=_quote_poller, daemon=True).start()
         print(f"[quote] reply poller armed ({QUOTE_POLL_SEC}s) from {_gmail_creds()[0]}")

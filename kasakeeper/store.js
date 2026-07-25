@@ -4,6 +4,12 @@ const DAY = 86400000;
 // The id-keyed collections in shared state — kept in one place because server.py's
 // /api/state shape-check validates exactly this list (each must be a list).
 const ID_KEYED = ['homes', 'assets', 'tasks', 'providers', 'quotes', 'logs', 'mail'];
+// Per-home overrides for prefs that used to be global-only. Store.homeSetting()
+// resolves home.settings[key] -> the legacy global state.settings[key] -> this
+// documented default, so an old client (which only ever wrote the global key)
+// keeps working unchanged and a new client can override per home. Nothing here
+// is written eagerly — see the note on Store.homeSetting() for why that matters.
+const HOME_SETTING_DEFAULTS = { soonDays: 30, notifyTarget: '' };
 
 const Store = {
   state: null,
@@ -35,13 +41,25 @@ const Store = {
   // every push, re-applied from this device's copy whenever a server state is adopted.
   _shareable() {
     const { haUrl, haToken, ...settings } = this.state.settings || {};
-    return { ...this.state, settings };
+    // Per-home HA source (home.ha, see homeHA()) is meant to carry only
+    // {mode,url} — url is just an address, fine to sync. A token must never
+    // land here even if something upstream mistakenly set one, same rule as
+    // the legacy global haToken above.
+    const homes = (this.state.homes || []).map(h => {
+      if (!h || !h.ha) return h;
+      const { haToken, token, ...ha } = h.ha;
+      return { ...h, ha };
+    });
+    return { ...this.state, settings, homes };
   },
   _adopt(state) {
     const keep = this.state.settings || {};
     this.state = state;
     this.state.settings = { ...(state.settings || {}), haUrl: keep.haUrl, haToken: keep.haToken };
     if (!this.state.tombstones) this.state.tombstones = [];   // legacy server copy predating tombstones
+    // Defensive strip on the way in too — an adopted server/merged copy must
+    // never seed a per-home token into localStorage.
+    (this.state.homes || []).forEach(h => { if (h && h.ha) { delete h.ha.haToken; delete h.ha.token; } });
     localStorage.setItem(KEY, JSON.stringify(this.state));
   },
   // Record a delete so a stale device's later push can't resurrect it — see the
@@ -200,6 +218,35 @@ const Store = {
     } catch {}
   },
 
+  // ---- per-home settings (soonDays override, notification target, …) ----
+  // Per-home-first, falling back to the legacy global setting, then the
+  // documented default (HOME_SETTING_DEFAULTS). Read-only — nothing is written
+  // here. Deliberately lazy: a sync conflict's ID_KEYED merge (_mergeState)
+  // takes the SERVER's whole home row whenever the id exists on both sides, so
+  // eagerly stamping home.settings={} on load() would just get clobbered away
+  // again on the next 409 — worse, it'd make load() non-idempotent against the
+  // very state it's meant to tolerate. Home-settings writes only ever happen
+  // from an explicit user save (Settings UI), same as the pre-existing
+  // per-home `suburb` field.
+  homeSetting(key) {
+    const h = Store.home();
+    if (h && h.settings && h.settings[key] !== undefined) return h.settings[key];
+    if (Store.state.settings && Store.state.settings[key] !== undefined) return Store.state.settings[key];
+    return HOME_SETTING_DEFAULTS[key];
+  },
+  // Per-home Home Assistant source: 'local' (SUPERVISOR_TOKEN — today's only
+  // mode, and the default for a home that predates this field), 'remote' (a
+  // friend's own HA — url lives here), or 'none' (not connected; the server
+  // 503s cleanly and the UI treats that as disconnected). The long-lived
+  // remote token is NEVER part of this object or the store — see
+  // /data/kk-ha-secrets.json server-side, keyed by homeId.
+  homeHA() {
+    const h = Store.home();
+    const ha = h && h.ha;
+    if (ha && ha.mode) return { mode: ha.mode, ...(ha.url ? { url: ha.url } : {}) };
+    return { mode: 'local' };
+  },
+
   // ---- current-home scoped collections ----
   homeAssets: () => Store.state.assets.filter(a => a.homeId === Store.state.currentHomeId),
   homeProviders: () => Store.state.providers.filter(p => p.homeId === Store.state.currentHomeId),
@@ -266,7 +313,7 @@ const Store = {
   // any task whose cadence <= soonDays (a 30-day alarm test with a 30-day window)
   // is "soon" the instant you tick it done and can never leave Needs attention.
   soonWindow(t) {
-    const pref = Store.state.settings.soonDays || 30;
+    const pref = Store.homeSetting('soonDays') || 30;
     return Math.max(1, Math.min(pref, Math.ceil((t.cadenceDays || 365) / 2)));
   },
   status(t) {

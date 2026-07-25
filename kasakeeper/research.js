@@ -13,20 +13,6 @@
 //   POST /api/find-services { trade, suburb, address } -> job -> { providers: [...] }
 
 const Research = {
-  // Local providers already gathered for the Northern Beaches (seed suggestions).
-  LOCAL: {
-    HVAC:     [{ name: 'PenAir (Peninsula Air Conditioning)', url: 'penair.com.au', blurb: 'Daikin specialist, Warriewood, since 1999' },
-               { name: 'Northern Beaches Air Conditioning', url: 'northernbeachesair.com.au', blurb: 'Ducted service since 1987' }],
-    Heating:  [{ name: 'Northern Beaches Gas', url: 'northernbeachesgas.com.au', blurb: 'Gas heater service + safety checks' },
-               { name: 'Northern Beaches Hot Water', url: 'northernbeacheshotwater.com.au', blurb: 'Licensed gas fitter' }],
-    Garden:   [{ name: 'Northern Beaches Garden Care', url: 'northernbeachesgardencare.com.au', blurb: 'Lawn mowing & garden tidy · Freshwater 2096' },
-               { name: 'Ethereal Gardens', url: 'etherealgardens.com.au', blurb: 'From $150/visit, 2 gardeners' },
-               { name: 'Jim’s Mowing (Northern Beaches)', url: 'jimsmowing.com.au', blurb: 'Lawn mowing & edging, per-visit' }],
-    'Pool/Spa': [{ name: 'Northern Beaches Pool Service', url: '', blurb: 'Weekly pool/spa clean & chemistry' },
-               { name: 'Freshwater Pool Care', url: '', blurb: 'Local mobile pool technician' }],
-    Cleaning: [{ name: 'Local home cleaning', url: '', blurb: 'Search for twice-weekly cleaners' }],
-  },
-
   // Detect the home — live via the backend, else a local stub.
   // Async job flow: POST /api/research returns a job_id instantly (so HA's
   // ingress proxy never times out the ~90s research), then we poll
@@ -62,7 +48,7 @@ const Research = {
       category: CATEGORIES[f.category] ? f.category : 'Appliance',
       source: [f.source, f.confidence].filter(Boolean).join(' · '),
     }));
-    return { address: d.address || address, suburb: d.suburb || '', levels: d.levels, beds: d.beds, baths: d.baths, features: feats };
+    return { address: d.address || address, suburb: d.suburb || '', levels: d.levels, beds: d.beds, baths: d.baths, features: feats, summary: d.summary || '' };
   },
   // Offline stub — sensible detection when the backend isn't running.
   _stub(address) {
@@ -90,7 +76,20 @@ const Research = {
     };
   },
 
-  suggestProviders(category) { return Research.LOCAL[category] || []; },
+  // Regionless fallback when live search fails: no hardcoded business data (this
+  // repo is public), just the user's OWN providers already saved for this category —
+  // either tagged with it directly, or already linked to one of the category's assets.
+  // Empty for a fresh install/category, which is fine: the caller always keeps a
+  // "search Google" escape hatch alongside whatever this returns.
+  suggestProviders(category) {
+    const seen = new Set();
+    return (Store.homeProviders() || []).filter(p => {
+      if (seen.has(p.id)) return false;
+      const linked = Store.homeAssets().some(a => a.category === category && a.providerId === p.id);
+      if (p.trade !== category && !linked) return false;
+      seen.add(p.id); return true;
+    }).map(p => ({ id: p.id, name: p.name, url: p.website || '', blurb: p.notes || '' }));
+  },
 
   // Live: find real local providers ranked by Google reviews (async job + poll).
   // Returns an array of {name,rating,reviews,phone,email,website,suburb,blurb}, or null.

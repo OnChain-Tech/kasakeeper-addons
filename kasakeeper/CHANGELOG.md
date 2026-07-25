@@ -1,3 +1,13 @@
+# 0.3.0
+
+The multi-home release · KasaKeeper now works for houses beyond the one it runs in, and for households beyond the first.
+
+- **Every home gets its own settings**: suburb, "due soon" window and notification target now live per home, with your existing global values still honoured as the fallback.
+- **Every home picks its Home Assistant**: this add-on (as always, zero setup), a different Home Assistant (URL + long-lived token, kept server-side only), or none at all · schedules stay calendar-only and nothing nags about a connection that isn't there. Drift detection, weather, the daily brief and usage tracking all follow each home's choice.
+- **First-run key wizard**: a new install now walks you through getting and testing each API key · Anthropic (research, snap, ask, recalls), Google Places (richer find-a-service) and Gmail (quote emails) · straight from the setup screen or Settings. Keys are tested against the real service before saving, stored on the server only, and never shown back.
+- **Safer by construction**: pasted remote-HA URLs are strictly validated (private, loopback and cloud-metadata addresses rejected; connections pinned to the vetted IP; redirects refused), and the find-a-service fallback no longer carries any location baked into the source.
+- For developers: CONTRIBUTING.md is new · zero-build philosophy, dev setup and the cache-bump rule, ready for the project's first outside contributor.
+
 # 0.2.3
 
 - Last of the punctuation pass: the start-tracking banner and the push-test result now use the house `·` instead of em-dashes, and the Cc-me helper text reads as a proper muted note.
