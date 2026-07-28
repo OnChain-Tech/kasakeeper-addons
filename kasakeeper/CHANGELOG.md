@@ -1,3 +1,15 @@
+# 0.3.9
+
+- **Worn part? The order link is on the card**: when a device reports a consumable running out (brushes, filters, bags), KasaKeeper finds the exact replacement part's real product page for your model and puts a tappable 🛒 Order link right on the task · manufacturer's store first, validated before it lands.
+
+# 0.3.8
+
+- **Your devices can now raise their own hand**: an HA-linked asset can watch its device's problem sensors · bin full, fault codes, filter life. When one trips, a task lands on that asset ("reported today"), and one tap drafts the enquiry email with what the device is saying · every send still approved by you. Pick the sensors from the asset page under Device watch.
+
+# 0.3.7
+
+- **Times survive messy threads**: when a trade corrects themselves ("13:00 tomorrow" · "sorry, that is Thursday"), the offered date now lands as the corrected day with its time attached · "Thu 30 Jul 1:00 PM", not just "Thursday".
+
 # 0.3.6
 
 - **Ask knows what to ask**: the empty Ask screen now offers twenty starter questions in six groups · Right now, Money, Assets & warranties, Trades & quotes, Make changes, and (when connected) Live house. Chips adapt to your data — quote questions only appear when there are quotes to talk about.

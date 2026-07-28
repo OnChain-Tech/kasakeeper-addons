@@ -305,7 +305,14 @@ const Store = {
   // cadence <= 0 would make a task permanently overdue (lastDone + 0 days is always
   // in the past) — reachable via Gmail import or chat tool-writes; treat as unscheduled.
   nextDue(t) { if (!t.lastDone || !(t.cadenceDays > 0)) return null; const d = new Date(t.lastDone); d.setHours(0,0,0,0); return new Date(d.getTime() + t.cadenceDays * DAY); },
-  daysUntil(t) { const nd = Store.nextDue(t); return nd ? Math.round((nd - Store.today()) / DAY) : null; },
+  // An active device-reported fault reads as "N days overdue since it was
+  // reported" — negative daysUntil sorts it to the FRONT of every attention
+  // list with no other scheduling change.
+  faultAge(t) { if (!(t.fault && t.fault.state === 'active' && t.fault.raisedAt)) return null;
+    const d = new Date(String(t.fault.raisedAt).slice(0, 10)); if (isNaN(d)) return 0;
+    d.setHours(0,0,0,0); return Math.max(0, Math.round((Store.today() - d) / DAY)); },
+  daysUntil(t) { const fa = Store.faultAge(t); if (fa !== null) return -fa;
+    const nd = Store.nextDue(t); return nd ? Math.round((nd - Store.today()) / DAY) : null; },
   // autopilot = a standing arrangement that just happens (a weekly cleaner, a
   // lawn contract). It still sits on the schedule with its next date, but it
   // never counts as overdue/soon, so it can't nag the dashboard or the health score.
@@ -317,13 +324,18 @@ const Store = {
     return Math.max(1, Math.min(pref, Math.ceil((t.cadenceDays || 365) / 2)));
   },
   status(t) {
+    if (Store.faultAge(t) !== null) return 'overdue';   // a live fault outranks autopilot
     if (t.autopilot) return 'ok';
     const d = Store.daysUntil(t);
     if (d === null) return 'ok';
     if (d < 0) return 'overdue';
     return d <= Store.soonWindow(t) ? 'soon' : 'ok';
   },
-  dueLabel(t) { const d = Store.daysUntil(t); if (d === null) return 'not scheduled'; if (d < 0) return `${-d}d overdue`; if (d === 0) return 'due today'; if (d === 1) return 'due tomorrow'; return `in ${d}d`; },
+  dueLabel(t) {
+    const fa = Store.faultAge(t);
+    if (fa !== null) return fa === 0 ? 'reported today' : `reported ${fa}d ago`;
+    if (t.fault && t.fault.state === 'cleared') return 'device says it’s clear';
+    const d = Store.daysUntil(t); if (d === null) return 'not scheduled'; if (d < 0) return `${-d}d overdue`; if (d === 0) return 'due today'; if (d === 1) return 'due tomorrow'; return `in ${d}d`; },
 
   // ---- warranty ----
   warrantyDays(a) { // days until warranty expiry, or null if none/invalid
@@ -355,7 +367,10 @@ const Store = {
     return Store.homeTasks().filter(t => Store.daysUntil(t) !== null)
       .sort((a, b) => Store.daysUntil(a) - Store.daysUntil(b))[0] || null;
   },
-  unscheduled() { return Store.homeTasks().filter(t => !t.lastDone); }, // tasks never marked done
+  // Tasks never marked done. Device-fault tasks are excluded: they're event-
+  // driven (no lastDone by design) — "start tracking" must neither count them
+  // nor stamp a lastDone onto a live fault.
+  unscheduled() { return Store.homeTasks().filter(t => !t.lastDone && !t.fault); },
   startTracking() { // assume everything was just serviced today so the countdown begins
     const iso = Store.localISO();
     Store.unscheduled().forEach(t => { t.lastDone = iso; });
@@ -367,6 +382,10 @@ const Store = {
     const t = Store.state.tasks.find(x => x.id === taskId); if (!t) return;
     const iso = Store.localISO();
     t.lastDone = iso;
+    // Fault task: 'done' stops the server re-raising until the device is
+    // observed normal again (fault_scan then retires the row — this log entry
+    // keeps the history) and faults anew.
+    if (t.fault && t.fault.state !== 'done') { t.fault.state = 'done'; t.fault.doneAt = iso; }
     const a = Store.asset(t.assetId);
     // Record WHAT was done and WHO did it, so it reads as real job history later.
     Store.state.logs.push({ id: Store.uid('l'), taskId, assetId: t.assetId, date: iso,
@@ -488,6 +507,21 @@ const Store = {
     if (used == null) return null;
     const pct = u.threshold > 0 ? Math.min(100, Math.round((used / u.threshold) * 100)) : 0;
     return { used, threshold: u.threshold, unit: u.unit, pct, due: used >= u.threshold };
+  },
+
+  // ---- device-initiated maintenance (problem-entity watches) ----
+  // asset.ha.watch = [{ entity, kind:'problem'|'fault'|'consumable', label,
+  //                     compare:'on'|'nonzero'|'lte'|'gte', threshold?, addedAt }]
+  // The server's fault scanner is the only writer of task.fault (except the
+  // 'done' stamp in markDone below) — clients only choose WHAT to watch.
+  WATCH_MAX: 8,
+  watchFor(assetId) { const a = Store.asset(assetId); return (a && a.ha && a.ha.watch) || []; },
+  setWatch(assetId, list) {
+    const a = Store.asset(assetId);
+    if (!a || !a.ha || !a.ha.deviceId) return null;   // watches only make sense on an HA-linked asset
+    const clean = (list || []).slice(0, Store.WATCH_MAX);
+    if (clean.length) a.ha.watch = clean; else delete a.ha.watch;
+    Store.upsertAsset(a); return a;
   },
 
   suggestTasks(assetId) {

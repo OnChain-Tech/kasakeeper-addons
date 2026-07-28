@@ -110,6 +110,16 @@ const HA = {
     } catch { return { available: false, drift: [], vanished: [], newDevices: [] }; }
   },
 
+  // Watch candidates for one HA-linked asset (device-initiated maintenance) —
+  // read-only, server-cached registry read. Never throws.
+  async problemEntities(assetId) {
+    try {
+      const res = await fetch('api/ha/problem-entities?assetId=' + encodeURIComponent(assetId));
+      const j = await res.json();
+      return { available: !!(j && j.available), candidates: (j && j.candidates) || [], watching: (j && j.watching) || [] };
+    } catch { return { available: false, candidates: [], watching: [] }; }
+  },
+
   // A short human label for an entity's live value (used on asset cards).
   fmt(s) {
     if (!s) return null;

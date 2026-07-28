@@ -664,6 +664,62 @@ def _ha_live_entities(dev):
             picked = [prim]
     return [{'id': e['id'], 'dc': e.get('device_class'), 'unit': e.get('unit')} for e in picked[:4]]
 
+# ---- device-initiated maintenance: problem-entity discovery -------------------
+# Which of a device's entities can *tell us something is wrong*: problem-class
+# binary_sensors (bin full, leak, jam), error/fault-code sensors, and consumable
+# levels (filter %, brush life). Pure over ha_devices()'s registry shape — the
+# registry template already returns every entity per device (binary_sensor
+# included; _HA_NOISE_DOMAINS only gates *category relevance*), so discovery
+# needs no extra HA reads. `suggest` marks the rows the picker pre-ticks.
+_HA_PROBLEM_DCLASSES = {'problem', 'moisture', 'smoke', 'gas', 'safety', 'tamper'}
+_HA_PROBLEM_HINTS    = ('problem', 'error', 'fault', 'jam', 'stuck', 'clog', 'leak', 'overheat', '_full', 'tank')
+_HA_CONSUMABLE_HINTS = ('filter', 'brush', 'bin', 'dust', 'pad', 'cartridge', 'consumable', 'life', 'wear', 'remaining')
+_HA_WEAR_HINTS       = ('used', 'dirty', 'wear')          # inverted sense: HIGH = bad
+# Enum/state values that mean "no fault" on an error-code sensor. Anything NOT
+# here (and not numeric) reads as a fault, so err on the side of more normals —
+# a mode-ish sensor (standby/ready/disarmed) must never raise a task that can
+# then never clear.
+_HA_FAULT_NORMAL     = {'0', 'none', 'no_error', 'no error', 'no_fault', 'ok', 'normal', 'off',
+                        'idle', 'clear', 'standby', 'ready', 'nominal', 'good', 'disarmed', 'false'}
+
+def _ha_problem_label(entity_id, dev_name=''):
+    """Human label for a problem entity: the object_id, minus the device-name
+    prefix HA conventionally bakes in (binary_sensor.roomba_bin_full on the
+    'Roomba' device -> 'Bin full')."""
+    obj = str(entity_id).split('.', 1)[-1].replace('_', ' ').strip()
+    dn = str(dev_name or '').lower().strip()
+    if dn and obj.lower().startswith(dn):
+        obj = obj[len(dn):].strip() or obj
+    return (obj[:1].upper() + obj[1:]) if obj else entity_id
+
+def _ha_problem_entities(dev):
+    """Watch candidates for one registry device (ha_devices() shape). Pure /
+    unit-testable, never raises on odd rows."""
+    out = []
+    name = dev.get('name') or ''
+    for e in (dev.get('entities') or []):
+        try:
+            eid, domain = e.get('id') or '', e.get('domain') or ''
+            dc = (e.get('device_class') or '').lower()
+            low = eid.lower()
+            label = _ha_problem_label(eid, name)
+            if domain == 'binary_sensor' and dc in _HA_PROBLEM_DCLASSES:
+                out.append({'entity': eid, 'kind': 'problem', 'label': label, 'compare': 'on', 'suggest': True})
+            elif domain == 'binary_sensor' and any(h in low for h in _HA_PROBLEM_HINTS):
+                out.append({'entity': eid, 'kind': 'problem', 'label': label, 'compare': 'on', 'suggest': False})
+            elif domain == 'sensor' and re.search(r'error|fault|alarm', low) and not dc:
+                # Never pre-ticked: the registry read carries no state value, so we
+                # can't tell an error-code sensor from a mode sensor that merely
+                # matched the name — the user opts in deliberately.
+                out.append({'entity': eid, 'kind': 'fault', 'label': label, 'compare': 'nonzero', 'suggest': False})
+            elif domain == 'sensor' and (e.get('unit') or '') == '%' and any(h in low for h in _HA_CONSUMABLE_HINTS):
+                wear = any(h in low for h in _HA_WEAR_HINTS)
+                out.append({'entity': eid, 'kind': 'consumable', 'label': label,
+                            'compare': 'gte' if wear else 'lte', 'threshold': 90 if wear else 10, 'suggest': False})
+        except Exception:
+            continue
+    return out
+
 _DEV_CACHE = {}   # home_id (or "" for the legacy bare call) -> {t, data}
 
 def ha_devices(force=False, home_id=None):
@@ -792,6 +848,34 @@ def ha_drift(home_id=None):
     except Exception as e:
         print(f"[ha] drift check failed: {e}")
         return {"available": True, "drift": [], "vanished": [], "newDevices": [], "checkedAt": now_iso}
+
+def ha_problem_entities(asset_id, home_id=None):
+    """GET /api/ha/problem-entities — watch candidates for one HA-linked asset
+    (device-initiated maintenance opt-in picker). Read-only; reuses ha_devices()'s
+    cached registry read so it costs nothing on top of a recent import scan.
+    Echoes the asset's current ha.watch so the picker can pre-tick it. Never
+    raises: failures degrade to an empty, well-shaped response."""
+    empty = {"available": False, "candidates": [], "watching": []}
+    try:
+        state = state_read().get("state") or {}
+        asset = next((a for a in (state.get("assets") or []) if a.get("id") == asset_id), None)
+        if not asset:
+            return empty
+        ha = asset.get("ha") or {}
+        watching = ha.get("watch") or []
+        # The asset's OWN home wins: the route defaults home_id to currentHomeId,
+        # and an asset in another home must be looked up against its registry.
+        hid = asset.get("homeId") or home_id or state.get("currentHomeId")
+        if not ha.get("deviceId") or not ha_available(hid):
+            return {"available": False, "candidates": [], "watching": watching}
+        reg = ha_devices(home_id=hid)
+        dev = next((d for d in (reg.get("devices") or []) if d.get("deviceId") == ha["deviceId"]), None)
+        if not dev:
+            return {"available": True, "candidates": [], "watching": watching}
+        return {"available": True, "candidates": _ha_problem_entities(dev), "watching": watching}
+    except Exception as e:
+        print(f"[ha] problem-entity scan failed: {e}")
+        return empty
 
 NOTIFY_HOUR = int(os.getenv("KASA_NOTIFY_HOUR", "8"))
 
@@ -1335,7 +1419,11 @@ QUOTE_PARSE_SYSTEM = (
     "ongoing_plan (boolean — do they mention an ongoing/annual service plan), "
     "needs_site_visit (boolean — do they need to inspect before they can quote), "
     "offered_dates (array of strings — every concrete date and/or time window they OFFER to do the "
-    "job, kept short and human e.g. 'Tue 22 Jul morning', '8am Thursday 24th'; [] if none offered), "
+    "job, kept short and human e.g. 'Tue 22 Jul morning', '8am Thursday 24th'; [] if none offered. "
+    "Threads often self-correct: if a day is later corrected, use the FINAL corrected day, and carry "
+    "any stated clock time onto it — '13:00 tomorrow' followed by 'sorry, that is Thursday' means "
+    "'Thursday 1:00 PM'. Read quoted earlier messages in the thread for the time if the latest "
+    "message only names the day), "
     "paid_amount (number in AUD — any deposit or payment the email says has ALREADY been paid, or null), "
     "paid_receipt (short string — receipt/invoice number for that payment if stated, or null), "
     "balance_due (number in AUD — remaining balance if the email states one, or null), "
@@ -1744,6 +1832,331 @@ def _autobook_loop():
         except Exception as e:
             print(f"[autobook] scan error: {e}")
         time.sleep(AUTOBOOK_POLL_SEC)
+
+
+# =============================================================================
+# Device-initiated maintenance — the fault scanner (server-side, single writer)
+# Watches the problem entities each HA-linked asset opted into (asset.ha.watch,
+# picked in the client's Watch-for-problems screen) and raises a maintenance
+# task when one trips. Detection lives HERE, not in the clients, so phone +
+# tablet + web can't double-fire — and it works while every client is asleep.
+# Read-only against HA (GET states only, no service calls, no templates with
+# user input). The entire state machine lives on task.fault in the shared
+# store, so a container restart can't re-raise or lose anything:
+#   problem observed  + no task             -> raise a new task ('active')
+#   problem observed  + 'cleared'           -> re-activate the SAME task, cycles++
+#   problem observed  + 'done'              -> nothing (waits for a normal read)
+#   normal observed   + 'active'            -> 'cleared'
+#   normal observed   + 'done'              -> retire the task (delete + tombstone;
+#                                              the ✓-done log holds the history) —
+#                                              which re-arms a future raise
+#   unavailable/unknown/missing             -> nothing at all (survives HA restarts)
+# 'done' is only ever set by the user (markDone / chat complete_task) — so a
+# flapping sensor yields ONE task with a rising cycle count, never a storm.
+# Rows nothing can ever move again are retired too: un-watched entities' tasks,
+# and self-healed 'cleared' tasks older than FAULT_CLEAR_SEC.
+# =============================================================================
+FAULT_POLL_SEC = int(os.getenv("KASA_FAULT_POLL_SEC", "300"))
+FAULT_MIN_SEC = int(os.getenv("KASA_FAULT_MIN_SEC", "600"))   # a problem must hold this long before it raises
+
+def _fault_active(w, st):
+    """One watch vs one HA state row -> True (problem), False (normal), or
+    None (no signal — unavailable, unparseable, missing). `compare` is the
+    authoritative dispatch (falling back to the kind's default) — dispatching
+    on both let a mismatched row silently ignore its threshold."""
+    if not isinstance(st, dict):
+        return None
+    low = str(st.get("state", "")).strip().lower()
+    if low in ("unavailable", "unknown", ""):
+        return None
+    comp = w.get("compare") or {"problem": "on", "fault": "nonzero", "consumable": "lte"}.get(w.get("kind"))
+    if comp == "on":
+        return True if low == "on" else False if low == "off" else None
+    if comp == "nonzero":
+        if low in _HA_FAULT_NORMAL:
+            return False
+        try:
+            return float(low) != 0
+        except Exception:
+            return True   # a non-"normal" enum value (e.g. 'grease_filter') reads as a fault
+    if comp in ("lte", "gte"):
+        try:
+            n, th = float(low), float(w.get("threshold") or 0)
+        except Exception:
+            return None
+        if th <= 0:
+            return None
+        return n >= th if comp == "gte" else n <= th
+    return None
+
+FAULT_CLEAR_SEC = int(os.getenv("KASA_FAULT_CLEAR_SEC", str(3 * 86400)))   # self-healed faults expire after this
+
+# ---- order link: consumable fault -> the exact replacement part's product page ----
+# Parts you can actually BUY. A consumable-kind watch always qualifies; a
+# problem-kind one only when its label names a purchasable part (a full bin is
+# emptied, not ordered — 'bin' is deliberately absent).
+_ORDER_HINTS = ('brush', 'filter', 'bag', 'pad', 'cartridge', 'battery', 'blade', 'belt')
+
+def _order_eligible(kind, label, entity):
+    if kind == "consumable":
+        return True
+    low = (str(label) + " " + str(entity)).lower()
+    return any(h in low for h in _ORDER_HINTS)
+
+def _order_url_ok(url):
+    """Structural + reachability sanity for a Claude-found product URL before it
+    lands on a card the user will tap: https only, a real public hostname (no
+    userinfo/IP-literals), and the page answers — bot-defence statuses (403/405/
+    429) count as alive, a 404 or DNS failure does not."""
+    try:
+        p = urllib.parse.urlparse(str(url))
+        if p.scheme != "https" or not p.hostname or "@" in p.netloc:
+            return False
+        try:
+            ipaddress.ip_address(p.hostname)
+            return False   # IP-literal — never a retail product page
+        except ValueError:
+            pass
+        if "." not in p.hostname or p.hostname.endswith((".local", ".internal", ".lan")):
+            return False
+    except Exception:
+        return False
+    try:
+        _http_get(str(url)[:500], timeout=12)
+        return True
+    except urllib.error.HTTPError as e:
+        return e.code in (403, 405, 429)   # bot-blocked but real
+    except Exception:
+        return False
+
+def _fault_order_lookup(make, model, name, label):
+    """Find the manufacturer's/retailer's product page for the exact replacement
+    part behind a consumable fault (e.g. Roomba j7 brush set). Returns
+    {'url','title'} or None. Never raises; quietly None without SDK/key."""
+    try:
+        import anthropic
+    except ImportError:
+        return None
+    if not (os.getenv("ANTHROPIC_API_KEY") or os.getenv("ANTHROPIC_AUTH_TOKEN")):
+        return None
+    client = anthropic.Anthropic(max_retries=1, timeout=200.0)
+    tools = [{"type": "web_search_20260209", "name": "web_search", "max_uses": 4}]
+    unit = " ".join(x for x in (make, model) if x) or (name or "the appliance")
+    ask = (f"A home device is reporting a worn/depleted consumable. Device: {unit} ({name or 'appliance'}). "
+           f"Consumable: {label}. Use web_search to find the ONE best product page where the owner can buy "
+           f"the exact replacement part for this model — prefer the manufacturer's own store, else a major "
+           f"retailer that ships to Australia. It must be a direct product page (not a search or category page). "
+           'Respond with ONLY a JSON object: {"url": the https product page url, '
+           '"title": short product name (e.g. "iRobot j-series replacement brush set")} '
+           'or {"url": null} if you cannot find a genuine product page.')
+    messages = [{"role": "user", "content": ask}]
+    try:
+        resp = None
+        for _ in range(6):  # resume across web_search pause_turns
+            resp = client.messages.create(model=MODEL, max_tokens=800, messages=messages, tools=tools)
+            if resp.stop_reason == "pause_turn":
+                messages.append({"role": "assistant", "content": resp.content})
+                continue
+            break
+        text = "".join(b.text for b in resp.content if getattr(b, "type", "") == "text")
+        i, j = text.find("{"), text.rfind("}")
+        if i < 0 or j < 0:
+            return None
+        data = json.loads(text[i:j + 1])
+        url = data.get("url")
+        if not url or not _order_url_ok(url):
+            return None
+        return {"url": str(url)[:500], "title": str(data.get("title") or label or "Replacement part")[:120]}
+    except Exception as e:
+        print(f"[fault] order lookup failed: {e}")
+        return None
+
+def fault_scan():
+    """One pass: read each watching home's states (one GET per home), evaluate
+    every watch, and apply ALL transitions in a single state_mutate — one rev
+    bump per tick, minimal contention with client pushes. The same mutator also
+    retires rows nothing can ever update again: a fault task whose entity is no
+    longer watched (or whose asset is gone), a 'done' task whose device reads
+    normal again, and a self-healed 'cleared' task older than FAULT_CLEAR_SEC —
+    all deleted WITH a tombstone so a stale client can't resurrect them (their
+    history, where it matters, already lives in the logs markDone wrote)."""
+    import datetime
+    st = state_read().get("state") or {}
+    homes = {h.get("id"): h for h in st.get("homes", [])}
+    watched = set()   # (assetId, entity) across ALL homes — testMode included, so the sweep never eats a paused home's tasks
+    by_home = {}
+    for a in st.get("assets", []):
+        ha = a.get("ha")
+        watch = ha.get("watch") if isinstance(ha, dict) else None
+        if not isinstance(watch, list):
+            continue
+        for w in watch:
+            if isinstance(w, dict) and w.get("entity"):
+                watched.add((a.get("id"), w["entity"]))
+        if (homes.get(a.get("homeId")) or {}).get("testMode"):
+            continue   # a test/demo home — no live HA behind it, no notifies
+        by_home.setdefault(a.get("homeId"), []).append(a)
+    have_fault_tasks = any(isinstance(t.get("fault"), dict) for t in st.get("tasks", []))
+    if not by_home and not have_fault_tasks:
+        return
+    now = time.time()
+    tz = _ha_timezone()
+    now_local = datetime.datetime.now(tz) if tz else datetime.datetime.now()
+    stamp = now_local.strftime("%Y-%m-%dT%H:%M:%S")   # HA-local, matching the client's calendar-day math
+    expire_before = (now_local - datetime.timedelta(seconds=FAULT_CLEAR_SEC)).strftime("%Y-%m-%dT%H:%M:%S")
+    obs = {}   # (assetId, entity) -> (active, value, settled, watch)
+    for hid, assets in by_home.items():
+        if not ha_available(hid):
+            continue
+        try:
+            raw = ha_api_get("states", hid)
+            states = json.loads(raw) if raw else None
+        except Exception as e:
+            print(f"[fault] states read failed: {e}")
+            continue
+        if not isinstance(states, list):
+            continue
+        idx = {s.get("entity_id"): s for s in states if isinstance(s, dict)}
+        for a in assets:
+            for w in a["ha"]["watch"]:
+                if not isinstance(w, dict) or not w.get("entity"):
+                    continue   # one malformed row must not silence every home's scan
+                ent = w["entity"]
+                srow = idx.get(ent)
+                active = _fault_active(w, srow)
+                if active is None:
+                    continue
+                # Debounce enum/binary problems: only trust one that has HELD for
+                # FAULT_MIN_SEC (last_changed is stateless — HA supplies it), so a
+                # sub-10-minute blip never raises. Consumables drift smoothly and
+                # update often, so they skip the hold check.
+                settled = True
+                if active and w.get("kind") in ("problem", "fault"):
+                    try:
+                        lc = str(srow.get("last_changed") or srow.get("last_updated") or "")
+                        settled = now - datetime.datetime.fromisoformat(lc.replace("Z", "+00:00")).timestamp() >= FAULT_MIN_SEC
+                    except Exception:
+                        settled = True   # no parseable timestamp — don't silently never-raise
+                obs[(a.get("id"), ent)] = (active, str(srow.get("state", "")), settled, w)
+    raised = []   # dicts — for the post-write notify + order-link lookups
+    def mut(s):
+        raised.clear()   # state_mutate retries re-run the mutator against a fresh copy
+        changed = False
+        tasks = s.setdefault("tasks", [])
+        assets = {x.get("id"): x for x in s.get("assets", [])}
+        gone = []   # task ids to delete + tombstone this tick
+        for (aid, ent), (active, value, settled, w) in obs.items():
+            a = assets.get(aid)
+            if not a:
+                continue
+            mine = [t for t in tasks if t.get("assetId") == aid
+                    and isinstance(t.get("fault"), dict) and t["fault"].get("entity") == ent]
+            cur = max(mine, key=lambda t: str(t["fault"].get("raisedAt") or "")) if mine else None
+            fstate = cur["fault"].get("state") if cur else None
+            if active:
+                if not settled:
+                    continue
+                if cur is None:
+                    label = str(w.get("label") or ent)
+                    tid = _uid("t")
+                    tasks.append({"id": tid, "assetId": aid, "title": label,
+                                  "cadenceDays": 0, "lastDone": "", "estCost": 0, "src": "device",
+                                  "fault": {"entity": ent, "kind": w.get("kind") or "problem",
+                                            "label": label, "value": value, "state": "active",
+                                            "raisedAt": stamp, "cycles": 1}})
+                    raised.append({"hid": a.get("homeId"), "aname": a.get("name") or "a device",
+                                   "label": label, "value": value, "kind": w.get("kind"),
+                                   "tid": tid, "entity": ent,
+                                   "make": a.get("make") or "", "model": a.get("model") or ""})
+                    changed = True
+                elif fstate == "cleared":
+                    f = cur["fault"]
+                    f["state"], f["value"] = "active", value
+                    try:
+                        f["cycles"] = int(f.get("cycles") or 1) + 1
+                    except Exception:
+                        f["cycles"] = 2
+                    f["reraisedAt"] = stamp
+                    raised.append({"hid": a.get("homeId"), "aname": a.get("name") or "a device",
+                                   "label": f.get("label") or ent, "value": value, "kind": w.get("kind"),
+                                   "tid": cur.get("id"), "entity": ent,
+                                   "make": a.get("make") or "", "model": a.get("model") or ""})
+                    changed = True
+                # 'active': already raised — no value-refresh churn. 'done': waits
+                # for a normal observation before anything can re-raise.
+            else:
+                if fstate == "active":
+                    cur["fault"]["state"], cur["fault"]["clearedAt"] = "cleared", stamp
+                    changed = True
+                elif fstate == "done":
+                    gone.append(cur.get("id"))   # fixed and confirmed normal — the log holds the history; deletion re-arms a future raise
+        # Retirement sweeps — rows no observation can ever move again.
+        for t in tasks:
+            f = t.get("fault")
+            if not isinstance(f, dict) or t.get("id") in gone:
+                continue
+            if (t.get("assetId"), f.get("entity")) not in watched:
+                gone.append(t.get("id"))   # un-watched (or asset gone) — nothing will ever update it
+            elif f.get("state") == "cleared" and str(f.get("clearedAt") or "") < expire_before:
+                gone.append(t.get("id"))   # self-healed days ago and nobody acted — quietly retire it
+        if gone:
+            gone_set = set(gone)
+            s["tasks"] = [t for t in tasks if t.get("id") not in gone_set]
+            at = stamp[:10]
+            tomb = s.setdefault("tombstones", [])
+            tomb.extend({"id": tid, "at": at} for tid in gone_set if tid)
+            if len(tomb) > 400:
+                s["tombstones"] = tomb[-400:]   # same cap + oldest-out policy as the client's _tombstone
+            changed = True
+        return changed
+    if state_mutate(mut) is None:
+        print("[fault] store contended — transitions re-detected next tick")
+        return
+    if len(raised) > 3:   # one summary line per home, not a notification storm
+        by_hid = {}
+        for r in raised:
+            by_hid.setdefault(r["hid"], set()).add(r["aname"])
+        for hid, names in by_hid.items():
+            ha_notify("KasaKeeper — devices reported problems",
+                      f"{len(names)} device{'s' if len(names) != 1 else ''} raised problems: "
+                      + ", ".join(sorted(names))[:200] + " — they're on the schedule.", hid)
+    else:
+        for r in raised:
+            msg = f"{r['aname']}: {r['label']}" + (f" ({r['value']}%)" if r["kind"] == "consumable" else "")
+            ha_notify("KasaKeeper — device reported a problem",
+                      msg[:220] + " — I've added it to the schedule.", r["hid"])
+    for r in raised:
+        print(f"[fault] raised {r['label']!r} on {r['aname']}")
+    # Order links: for a purchasable consumable, find the exact part's product
+    # page and stamp it on the task (task.fault.order = {url,title}) — the card
+    # renders it as a real, tappable "order the part" action. At most 2 lookups
+    # per tick (each is a web-search round); a re-raised task keeps its link.
+    for r in [x for x in raised if x.get("tid") and _order_eligible(x.get("kind"), x.get("label"), x.get("entity"))][:2]:
+        cur_state = state_read().get("state") or {}
+        t_now = next((t for t in cur_state.get("tasks", []) if t.get("id") == r["tid"]), None)
+        if not t_now or not isinstance(t_now.get("fault"), dict) or t_now["fault"].get("order"):
+            continue   # deleted meanwhile, or already has a link from a previous cycle
+        aname = next((a.get("name") for a in cur_state.get("assets", []) if a.get("id") == t_now.get("assetId")), r["aname"])
+        order = _fault_order_lookup(r["make"], r["model"], aname, r["label"])
+        if not order:
+            continue
+        def _stamp(s, _tid=r["tid"], _order=order):
+            t = next((x for x in s.get("tasks", []) if x.get("id") == _tid), None)
+            if not t or not isinstance(t.get("fault"), dict):
+                return False
+            t["fault"]["order"] = _order
+            return True
+        state_mutate(_stamp)
+        print(f"[fault] order link for {r['label']!r}: {order['url'][:80]}")
+
+def _fault_loop():
+    time.sleep(90)  # let the add-on (and HA proxy) settle after boot
+    while True:
+        try:
+            fault_scan()
+        except Exception as e:
+            print(f"[fault] scan error: {e}")
+        time.sleep(FAULT_POLL_SEC)
 
 
 # ---- snap-to-add + describe-a-problem (Claude vision, fast synchronous calls) ---
@@ -2845,6 +3258,10 @@ def _apply_tool(tool: str, args: dict, confirm: bool = False) -> dict:
             if tool == "complete_task":
                 when = str(args.get("date") or today)
                 t["lastDone"] = when
+                # Parity with the client's markDone: a chat-completed fault task
+                # must not stay red — 'done' holds until the device reads normal.
+                if isinstance(t.get("fault"), dict) and t["fault"].get("state") != "done":
+                    t["fault"]["state"], t["fault"]["doneAt"] = "done", when
                 cost = args.get("cost")
                 state.setdefault("logs", []).append(
                     {"id": _uid("l"), "assetId": a["id"], "taskId": t.get("id"), "date": when,
@@ -3553,6 +3970,12 @@ class Handler(SimpleHTTPRequestHandler):
             except Exception as e:
                 print(f"[ha] drift route failed: {e}")
                 return self._send_json({"available": False, "drift": [], "vanished": [], "newDevices": []})
+        if p == "/api/ha/problem-entities":
+            try:
+                return self._send_json(ha_problem_entities((params.get("assetId") or [""])[0].strip()[:40], home_id))
+            except Exception as e:
+                print(f"[ha] problem-entities route failed: {e}")
+                return self._send_json({"available": False, "candidates": [], "watching": []})
         if p == "/api/enquiry/available":
             creds = _gmail_creds()
             return self._send_json({"available": bool(creds), "from": creds[0] if creds else None})
@@ -3654,6 +4077,10 @@ if __name__ == "__main__":
     # at all), and the loop already no-ops cheaply when nothing's connected.
     threading.Thread(target=_digest_pusher, daemon=True).start()
     print(f"[push] daily digest armed for {NOTIFY_HOUR:02d}:00 (home timezone)")
+    # Always armed, like the digest: it no-ops cheaply when nothing is watched
+    # or HA is unreachable, and a remote-only home still gets fault scans.
+    threading.Thread(target=_fault_loop, daemon=True).start()
+    print(f"[fault] device-fault scanner armed ({FAULT_POLL_SEC}s) — watched problem sensors raise tasks")
     if gmail_available():  # watch for trade quote replies
         threading.Thread(target=_quote_poller, daemon=True).start()
         print(f"[quote] reply poller armed ({QUOTE_POLL_SEC}s) from {_gmail_creds()[0]}")

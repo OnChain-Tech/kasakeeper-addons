@@ -119,6 +119,24 @@ function seasonChip(season) {
   return '';
 }
 
+// Device-initiated task provenance: the device itself reported this. Red while
+// the fault is live, green once the device reads normal again, quiet otherwise.
+function faultChip(t) {
+  if (!t.fault) return '';
+  if (t.fault.state === 'active') return ' <span class="chip expired">↯ device</span>';
+  if (t.fault.state === 'cleared') return ' <span class="chip live">↯ clear</span>';
+  return ' <span class="chip dim">↯ device</span>';
+}
+
+// The real product page for a fault's replacement part (server-found and
+// validated at raise time, task.fault.order = {url,title}). https re-checked
+// here too — the store is shared, don't render a link another writer mangled.
+function faultOrder(t, cls, label) {
+  const o = t && t.fault && t.fault.order;
+  if (!o || !/^https:\/\//.test(String(o.url || ''))) return '';
+  return `<a class="${cls}" data-ext href="${esc(o.url)}" target="_blank" rel="noopener" title="${esc(o.title || '')}">🛒 ${label}</a>`;
+}
+
 // Test homes have no live HA behind them — no usage bar to draw or hydrate.
 const usageBar = (a, mini) => (a.usage && !Store.isTestHome())
   ? `<div class="usagebar${mini ? ' mini' : ''}" data-usage="${a.id}"${mini ? ' data-mini="1"' : ''}><div class="u-lbl">usage: …</div></div>`
@@ -138,6 +156,7 @@ function goBack() {
     'asset': '/assets',
     'edit-asset': r[1] && r[1] !== 'new' ? '/asset/' + r[1] : '/assets',
     'edit-task': '/asset/' + (r[1] || ''), 'edit-usage': '/asset/' + (r[1] || ''),
+    'watch': '/asset/' + (r[1] || ''),
     'edit-job': r[2] ? '/asset/' + (r[1] || '') : '/asset/' + (r[1] || ''),
     'find': '/asset/' + (r[1] || ''),
     'provider': '/providers', 'edit-provider': r[1] && r[1] !== 'new' ? '/provider/' + r[1] : '/providers',
@@ -715,7 +734,7 @@ function taskCard(t, { showAsset = true } = {}) {
   return `<div class="card" data-action="open-asset" data-id="${a.id}">
     <div class="row">
       ${assetTile(a, 'emoji')}
-      <div class="grow"><div class="t-name">${esc(t.title)}${t.autoBook ? ' <span class="chip auto">🤖 auto</span>' : ''}${t.autopilot ? ' <span class="chip pilot">⟳ autopilot</span>' : ''}</div><div class="t-sub">${sub}</div>${t.note ? `<div class="t-sub note">📌 ${esc(t.note)}</div>` : ''}</div>
+      <div class="grow"><div class="t-name">${esc(t.title)}${t.autoBook ? ' <span class="chip auto">🤖 auto</span>' : ''}${faultChip(t)}${t.autopilot ? ' <span class="chip pilot">⟳ autopilot</span>' : ''}</div><div class="t-sub">${sub}</div>${t.note ? `<div class="t-sub note">📌 ${esc(t.note)}</div>` : ''}</div>
       <div class="due ${COLOR[st]}">${esc(Store.dueLabel(t))}<small>${t.estCost?money(t.estCost):''}</small></div>
     </div>
     ${usageBar(a, true)}
@@ -843,7 +862,7 @@ function viewDashboard() {
     const sub = [a.name, isDiy(t, a) ? '🛠 DIY' : (prov ? prov.name : null)].filter(Boolean).join(' · ');
     return `<div class="k-row ${COLOR[st]}" data-action="open-asset" data-id="${a.id}">
       ${assetTile(a, 'k-tile')}
-      <div class="k-main"><div class="k-title">${esc(t.title)}${t.autoBook ? ' <span class="chip auto">🤖 auto</span>' : ''}</div><div class="k-sub">${esc(sub)}</div></div>
+      <div class="k-main"><div class="k-title">${esc(t.title)}${t.autoBook ? ' <span class="chip auto">🤖 auto</span>' : ''}${faultChip(t)}</div><div class="k-sub">${esc(sub)}</div></div>
       <div class="k-right"><span class="k-pill ${COLOR[st]}">${esc(Store.dueLabel(t))}</span>${t.estCost ? `<div class="k-cost">est ${money(t.estCost)}</div>` : ''}</div>
       <button class="k-done" data-action="done" data-id="${t.id}" title="Mark done"><svg><use href="#i-check"/></svg></button>
     </div>`; };
@@ -1045,7 +1064,10 @@ function viewAssets(sub) {
         const ts = Store.tasksFor(a.id).filter(t => !t.snoozed);
         // A never-serviced task has no due date: that is "not tracked", not "healthy" —
         // it must not wear the same green pill as an asset that's genuinely on schedule.
-        const withStat = ts.map(t => ({ t, d: Store.daysUntil(t), s: Store.daysUntil(t) === null ? 'unsched' : Store.status(t) }));
+        // Device-fault tasks are event-driven, not scheduled: active ones read
+        // through status() as overdue; a cleared/done one must not drag the whole
+        // asset to "not tracked".
+        const withStat = ts.map(t => ({ t, d: Store.daysUntil(t), s: Store.daysUntil(t) === null ? (t.fault ? 'ok' : 'unsched') : Store.status(t) }));
         const rank = { overdue:0, soon:1, unsched:2, ok:3 };
         withStat.sort((x,y) => rank[x.s]-rank[y.s] || (x.d??1e9)-(y.d??1e9));
         const worst = withStat.length ? withStat[0].s : 'unsched';
@@ -1122,7 +1144,7 @@ function viewAsset(id) {
     const sub = [cadLabel(t), isDiy(t, a) ? '🛠 DIY' : (tp ? tp.name : null)].filter(Boolean).join(' · ');
     const provenance = t.src === 'maker' ? ` · <b style="color:var(--accent);font-weight:600">maker's interval</b>` : t.src === 'research' ? ` · <b style="color:var(--accent);font-weight:600">researched</b>` : '';
     return `<div class="k-row ${COLOR[st]}" data-action="edit-task" data-id="${t.id}" data-asset="${a.id}">
-      <div class="k-main" style="padding-left:4px"><div class="k-title">${esc(t.title)}${t.autoBook ? ' <span class="chip auto">🤖 auto</span>' : ''}${t.autopilot ? ' <span class="chip pilot">⟳ autopilot</span>' : ''}${seasonChip(t.season)}</div>
+      <div class="k-main" style="padding-left:4px"><div class="k-title">${esc(t.title)}${t.autoBook ? ' <span class="chip auto">🤖 auto</span>' : ''}${faultChip(t)}${t.autopilot ? ' <span class="chip pilot">⟳ autopilot</span>' : ''}${seasonChip(t.season)}</div>
         <div class="k-sub">${esc(sub)}${provenance}${t.note ? ` · 📌 ${esc(t.note)}` : ''}</div></div>
       <div class="k-right"><span class="k-pill ${COLOR[st]}">${esc(Store.dueLabel(t))}</span>${t.estCost ? `<div class="k-cost">est ${money(t.estCost)}</div>` : ''}</div>
       <button class="k-done" data-action="done" data-id="${t.id}" title="Mark done"><svg><use href="#i-check"/></svg></button>
@@ -1159,6 +1181,17 @@ function viewAsset(id) {
         <button class="btn small" data-action="stop-usage" data-id="${a.id}" style="color:var(--red)">Stop</button>
       </div>`
     : `<div class="banner">Remind me by real usage, not just the calendar — pull run-hours or energy from Home Assistant. <b class="klink" data-action="track-usage" data-id="${a.id}">📊 Track usage →</b></div>`}
+    ${(a.ha && a.ha.deviceId && !Store.isTestHome()) ? (() => {
+      const w = a.ha.watch || [];
+      const ft = ts.find(t => t.fault && t.fault.state === 'active' && !t.snoozed);
+      const kindIcon = { problem: '⚠', fault: '⛔', consumable: '◔' };
+      return `<div class="section-title">Device watch${w.length ? ` <span class="pill">${w.length}</span>` : ''}</div>
+        ${ft ? (() => { const ord = faultOrder(ft, 'klink', 'Order the part →');
+          return `<div class="banner urgent">↯ ${esc(ft.fault.label)} — ${esc(Store.dueLabel(ft))} by the device itself. <b class="klink" data-action="fault-enquiry" data-id="${ft.id}">✉︎ Get it looked at →</b>${ord ? ' · ' + ord : ''}</div>`; })() : ''}
+        ${w.length ? `<div class="card">${w.map(x => `<div class="t-sub">${kindIcon[x.kind] || '⚠'} ${esc(x.label)}${x.kind === 'consumable' ? ` · alerts ${x.compare === 'gte' ? 'above' : 'below'} ${esc(String(x.threshold))}%` : ''}</div>`).join('')}
+          <div class="btn-row" style="margin-top:8px"><button class="btn small" data-action="watch-open" data-id="${a.id}">✎ Edit sensors</button></div></div>`
+        : `<div class="banner">Let the device tell you when it needs attention — watch its own problem sensors and a task lands here the moment one trips. <b class="klink" data-action="watch-open" data-id="${a.id}">↯ Watch for problems →</b></div>`}`;
+    })() : ''}
     ${(() => { const act = ts.filter(t => !t.snoozed), snz = ts.filter(t => t.snoozed);
       return `<div class="section-title">Maintenance <span class="pill">${act.length}</span></div>
         ${act.length ? `<div class="k-list">${act.map(mRow).join('')}</div>` : `<div class="empty">No active tasks.</div>`}
@@ -1194,14 +1227,17 @@ function scheduleRow(t) {
   let action;
   if (isDiy(t, a)) action = `<button class="btn small" data-action="${t.diy ? 'toggle-diy' : 'toggle-asset-diy'}" data-id="${t.diy ? t.id : a.id}" title="You do this yourself · tap to change">🛠 DIY ✓</button>`;
   else if (prov) action = prov.email && !q
-    ? `<button class="btn small" data-action="book-service" data-id="${t.id}">✉︎ Book service</button>`
+    ? (t.fault && t.fault.state === 'active'   // device-raised: the enquiry leads with what the unit is reporting
+        ? `<button class="btn small" data-action="fault-enquiry" data-id="${t.id}">✉︎ Get it looked at</button>`
+        : `<button class="btn small" data-action="book-service" data-id="${t.id}">✉︎ Book service</button>`)
     : `<button class="btn small" data-action="call" data-id="${a.id}">📞 ${esc(prov.name)}</button>`;
   else if (q) action = `<span class="chip cost">${esc(QSTATUS[q.status] || q.status)}${q.amount ? ' · ' + money(q.amount) : ''}</span> <button class="btn small" data-action="open-quote" data-id="${q.id}">manage</button>`;
   else action = `<button class="btn small primary" data-action="find" data-id="${a.id}">🔎 Find a supplier</button>`;
+  if (t.fault && t.fault.state === 'active') action += faultOrder(t, 'btn small', 'Order part');
   const sub = [a.name, isDiy(t, a) ? null : (prov ? prov.name : null)].filter(Boolean).join(' · ');
   return `<div class="k-row ${COLOR[st]}" data-action="open-asset" data-id="${a.id}">
     ${assetTile(a, 'k-tile')}
-    <div class="k-main"><div class="k-title">${esc(t.title)}${t.autoBook ? ' <span class="chip auto">🤖 auto</span>' : ''}${t.autopilot ? ' <span class="chip pilot">⟳ autopilot</span>' : ''}${seasonChip(t.season)}</div>
+    <div class="k-main"><div class="k-title">${esc(t.title)}${t.autoBook ? ' <span class="chip auto">🤖 auto</span>' : ''}${faultChip(t)}${t.autopilot ? ' <span class="chip pilot">⟳ autopilot</span>' : ''}${seasonChip(t.season)}</div>
       <div class="k-sub">${esc(sub)}${t.note ? ` · 📌 ${esc(t.note)}` : ''}</div>
       <div class="btn-row" style="margin-top:8px">${action}</div></div>
     <div class="k-right"><span class="k-pill ${COLOR[st]}">${esc(Store.dueLabel(t))}</span>${t.estCost ? `<div class="k-cost">est ${money(t.estCost)}</div>` : ''}</div>
@@ -1735,6 +1771,66 @@ async function hydrateUsagePicker() {
   if (!ent) return;
   slot.innerHTML = `Looks like <b>${esc(best.name)}</b> in Home Assistant — <b data-action="use-suggested-entity" data-entity="${esc(ent)}" data-mode="${esc((su && su.mode) || '')}" data-unit="${esc((su && su.unit) || '')}" style="color:var(--accent);cursor:pointer">use ${esc(ent)} →</b>`;
 }
+/* ---------- device watch: opt-in picker for problem-class HA entities ---------- */
+// The device's own "something is wrong" sensors (bin full, fault codes, filter %).
+// Picking here only chooses WHAT to watch — the server's fault scanner does the
+// watching and raises the task; everything stays read-only against HA.
+let WATCH = { status: 'idle', assetId: null, rows: null, picked: null };
+const WATCH_KIND = { problem: '⚠ problem', fault: '⛔ fault code', consumable: '◔ consumable' };
+// Kick (or re-kick) the candidate scan for one asset. THIS device's saved watch
+// list is the pre-tick authority — the server's copy can lag a debounced push.
+function startWatchScan(id) {
+  const a = Store.asset(id); if (!a || !a.ha || !a.ha.deviceId) return;
+  WATCH = { status: 'loading', assetId: id, rows: null, picked: null };
+  const watching = Store.watchFor(id);
+  HA.problemEntities(id).then(res => {
+    if (WATCH.assetId !== id) return;   // navigated on to another asset meanwhile
+    // Union the registry's candidates with what's already watched, so a
+    // watched entity that vanished from HA still shows (greyed) and keeps
+    // its threshold + addedAt if re-saved.
+    const byEnt = new Map(res.candidates.map(c => [c.entity, { ...c }]));
+    watching.forEach(x => {
+      const c = byEnt.get(x.entity);
+      if (c) { if (x.threshold != null) c.threshold = x.threshold; c.addedAt = x.addedAt; }
+      else byEnt.set(x.entity, { ...x, missing: true });
+    });
+    const watched = new Set(watching.map(x => x.entity));
+    WATCH.rows = [...byEnt.values()];
+    WATCH.available = res.available || watched.size > 0;
+    // Pre-tick: what's watched already; on a first visit, the strong suggestions.
+    WATCH.picked = new Set(WATCH.rows.map((c, i) =>
+      (watched.size ? watched.has(c.entity) : c.suggest) ? i : -1).filter(i => i >= 0));
+    WATCH.status = 'done';
+    if (route()[0] === 'watch') render();
+  });
+}
+function viewWatch(assetId) {
+  const g = WATCH;
+  const a = Store.asset(assetId); if (!a) return viewDashboard();
+  if (!a.ha || !a.ha.deviceId) return viewAsset(assetId);   // unlinked from under us — nothing to watch
+  if (g.assetId !== assetId && g.status !== 'loading') setTimeout(() => startWatchScan(assetId), 0);  // direct nav / reload lands here without the click
+  if (g.status === 'loading' || g.assetId !== assetId) return `<button class="back" data-action="back">‹ Cancel</button>
+    <div class="hero"><div class="emoji">↯</div><div><h1>Reading ${esc(a.name)}'s sensors…</h1><div class="t-sub">Looking for the ones that report problems.</div></div></div>
+    <div class="banner ok">◍ Scanning the device…</div>`;
+  if (g.status !== 'done' || !g.rows) return viewAsset(assetId);
+  if (!g.available) return `<button class="back" data-action="back">‹ Back</button>
+    <div class="hero"><div class="emoji">↯</div><div><h1>Home Assistant not available</h1><div class="t-sub">Can't read the device's sensors right now — try again when it's back.</div></div></div>`;
+  if (!g.rows.length) return `<button class="back" data-action="back">‹ Back</button>
+    <div class="hero"><div class="emoji">↯</div><div><h1>No problem sensors found</h1><div class="t-sub">${esc(a.name)} doesn't expose any error, fault or consumable sensors in Home Assistant.</div></div></div>`;
+  const rows = g.rows.map((c, i) => `<div class="feat ${g.picked.has(i) ? 'on' : ''}" data-action="watch-pick" data-i="${i}"${c.missing ? ' style="opacity:.55"' : ''}>
+      <span class="feat-check">${g.picked.has(i) ? '✓' : '＋'}</span>
+      <div class="grow"><div class="t-name">${esc(c.label)} <span class="chip dim">${esc(WATCH_KIND[c.kind] || c.kind)}</span></div>
+      <div class="t-sub">${esc(c.entity)}${c.missing ? ' · not seen in Home Assistant right now' : ''}</div>
+      ${c.kind === 'consumable' ? `<div class="t-sub">raise a task when ${c.compare === 'gte' ? 'above' : 'below'}
+        <input id="w_th_${i}" type="number" min="1" max="100" value="${esc(String(c.threshold != null ? c.threshold : 10))}" style="width:64px;display:inline-block;padding:4px 8px"> %</div>` : ''}</div>
+    </div>`).join('');
+  return `<button class="back" data-action="back">‹ Cancel</button>
+    <div class="hero"><div class="emoji">↯</div><div><h1>Watch for problems</h1><div class="t-sub">${esc(a.name)} · when a ticked sensor trips, a task lands on this asset — you approve any email before it goes out.</div></div></div>
+    ${rows}
+    <div class="btn-row"><button class="btn primary wide" data-action="watch-save">Watch ${WATCH.picked.size} sensor${WATCH.picked.size === 1 ? '' : 's'} →</button></div>
+    <p class="kk-note">Read-only: KasaKeeper only listens to these sensors, it never controls the device. Up to ${Store.WATCH_MAX} per asset.</p>`;
+}
+
 function editTask(assetId, taskId) {
   const t = taskId ? Store.state.tasks.find(x=>x.id===taskId) : { cadenceDays:365, estCost:0 };
   if (!t) return viewAsset(assetId);   // deleted from under us (another device) — fall back, don't freeze
@@ -1747,11 +1843,12 @@ function editTask(assetId, taskId) {
       ${field('f_note','Note (optional)',t.note,'text','e.g. replace the filter at the next service')}
       ${selectField('f_prov_t','Who does this job', t.providerId || '',
         [{v:'',l:"— the asset's provider —"}].concat(Store.homeProviders().map(p => ({ v: p.id, l: p.name }))))}
+      ${t.fault ? `<div class="banner" style="margin-top:12px">↯ Raised by the device itself (${esc(t.fault.label || '')}) — it isn't on a repeating schedule, and clears for good once you mark it done and the sensor reads normal.</div>` : `
       <label style="display:flex;gap:10px;align-items:flex-start;margin-top:12px;cursor:pointer">
         <input type="checkbox" id="f_auto" style="width:auto;margin-top:3px" ${t.autoBook ? 'checked' : ''}>
         <span><b>🤖 Auto-book this service</b><br>
         <span class="t-sub" style="white-space:normal">When it comes due, KasaKeeper emails the linked provider from its own mailbox asking for a quote and dates, then pings you to confirm one. Needs a provider with an email on the asset. Nothing is booked without your confirmation.</span></span>
-      </label>
+      </label>`}
       <label style="display:flex;gap:10px;align-items:flex-start;margin-top:12px;cursor:pointer">
         <input type="checkbox" id="f_autopilot" style="width:auto;margin-top:3px" ${t.autopilot ? 'checked' : ''}>
         <span><b>⟳ On autopilot</b><br>
@@ -2090,6 +2187,7 @@ function render() {
   else if (r[0] === 'edit-asset') html = editAsset(r[1]);
   else if (r[0] === 'edit-task') html = editTask(r[1], r[2]);
   else if (r[0] === 'edit-usage') html = editUsage(r[1]);
+  else if (r[0] === 'watch') html = viewWatch(r[1]);
   else if (r[0] === 'edit-job') html = editJob(r[1], r[2]);
   else if (r[0] === 'book') html = bookQuote(r[1]);
   else if (r[0] === 'provider') html = viewProvider(r[1]);
@@ -2356,6 +2454,26 @@ function bookingEmail(prov, focusAsset, focusTask) {
     subject: `Booking request — ${focusTask ? focusTask.title : focusAsset.name}`,
     body: `Hi ${prov.name},\n\nWe'd like to book a service${home.address ? ` at ${home.address}` : ''}. `
       + `Could you quote for the following and offer a couple of dates that suit?\n\n${lines.join('\n')}\n\n`
+      + signOff(),
+  };
+}
+
+// Device-reported fault → enquiry draft. Same draft-first pipeline as
+// bookingEmail; the body leads with what the device itself is saying.
+function faultEmail(prov, asset, task) {
+  const f = task.fault || {};
+  const home = Store.home() || {};
+  const mm = [asset.make, asset.model].filter(Boolean).join(' ');
+  const age = Store.faultAge(task);
+  const firstSeen = f.raisedAt ? jobDate(String(f.raisedAt).slice(0, 10)) : 'recently';
+  const reading = f.kind === 'consumable' && f.value !== undefined ? ` (reading ${f.value}%)` : '';
+  const flap = (f.cycles || 1) > 1 ? ` It has come and gone ${f.cycles} times, so it may be intermittent.` : '';
+  return {
+    subject: `${asset.name} — ${f.label || task.title} (reported by the unit)`,
+    body: `Hi ${prov.name},\n\nOur ${asset.name.toLowerCase()}${mm ? ` (${mm})` : ''}${home.address ? ` at ${home.address}` : ''} `
+      + `is reporting a problem: ${f.label || task.title}${reading}, first seen ${firstSeen}`
+      + `${age > 0 ? ` — ${age} day${age === 1 ? '' : 's'} ago` : ''}.${flap}\n\n`
+      + `Could you quote to take a look, and offer a couple of dates that would suit?\n\n`
       + signOff(),
   };
 }
@@ -2761,6 +2879,22 @@ document.addEventListener('click', async e => {
       location.href = `mailto:${encodeURIComponent(prov.email)}?subject=${encodeURIComponent(subject)}&body=${encodeURIComponent(body)}`;
       return render();
     }
+    case 'fault-enquiry': {   // device-raised task → drafted enquiry carrying the fault context
+      const t = Store.state.tasks.find(x => x.id === id); if (!t || !t.fault) return render();
+      const a = Store.asset(t.assetId); if (!a) return render();
+      const prov = taskProv(t, a);
+      if (!prov || !prov.email) return go('/find/' + a.id);   // nobody to email yet — find someone first
+      const { subject, body } = faultEmail(prov, a, t);
+      const q = ensureQuote(a.id, 'to_contact'); if (q) { q.provider = prov.name; q.taskId = t.id; Store.upsertQuote(q); }
+      if (await Research.emailAvailable()) {
+        return composeEnquiry({ quoteId: q.id, to: prov.email, subject, body, sendLabel: 'Send enquiry', onSent: ({ to: to2 }) => {
+          q.status = 'enquiry_sent'; q.token = 'KK-' + q.id; q.channel = 'email'; q.enquiryTo = to2; q.enquirySentAt = todayISO();
+          Store.upsertQuote(q); toast('Enquiry sent to ' + prov.name + ' — watching for the reply'); render(); } });
+      }
+      if (q) { q.status = 'enquiry_sent'; Store.upsertQuote(q); }
+      location.href = `mailto:${encodeURIComponent(prov.email)}?subject=${encodeURIComponent(subject)}&body=${encodeURIComponent(body)}`;
+      return render();
+    }
     case 'enquiry': {
       const a = Store.asset(id); if (!a) return render();   // gone from under us (another device / chat edit)
       const { subject, body } = Research.enquiryEmail(a), prov = Store.provider(a.providerId);
@@ -2930,6 +3064,41 @@ document.addEventListener('click', async e => {
     }
     case 'reset-usage': { if (!confirm('Reset the usage counter (mark as just serviced)?')) return; await Store.resetUsage(id); USAGE.t = 0; delete USAGE.map[id]; return render(); }
     case 'stop-usage': { const a = Store.asset(id); if (a) { delete a.usage; Store.upsertAsset(a); USAGE.t = 0; } return render(); }
+    case 'watch-open': {   // asset card → problem-sensor picker (device-initiated maintenance)
+      const a = Store.asset(id); if (!a || !a.ha || !a.ha.deviceId) return render();
+      startWatchScan(id);
+      return go('/watch/' + id);
+    }
+    case 'watch-pick': {
+      if (e.target.tagName === 'INPUT') return;   // typing a threshold must not toggle the row
+      if (WATCH.status !== 'done' || !WATCH.rows) return;
+      // Park any typed thresholds on the rows before re-render wipes the inputs.
+      WATCH.rows.forEach((c, j) => { const el = document.getElementById('w_th_' + j);
+        if (el && Number(el.value) > 0) c.threshold = Number(el.value); });
+      const i = +node.getAttribute('data-i');
+      if (WATCH.picked.has(i)) WATCH.picked.delete(i);
+      else if (WATCH.picked.size >= Store.WATCH_MAX) { toast(`Up to ${Store.WATCH_MAX} sensors per asset.`); return; }
+      else WATCH.picked.add(i);
+      return render();
+    }
+    case 'watch-save': {
+      const g = WATCH; if (g.status !== 'done' || !g.rows) return;
+      g.rows.forEach((c, j) => { const el = document.getElementById('w_th_' + j);
+        if (el && Number(el.value) > 0) c.threshold = Number(el.value); });
+      await Store.syncRemote();   // BEFORE mutating — another device may have edited this asset
+      const a = Store.asset(g.assetId); if (!a || !a.ha || !a.ha.deviceId) { toast('That asset is no longer HA-linked.'); return go('/assets'); }
+      const list = [...g.picked].sort((x, y) => x - y).map(i => { const c = g.rows[i]; if (!c) return null;
+        // Thresholds are percentages — clamp to 1..100 (a typed 500 on an "alert
+        // below" sensor would be a fault that can never clear).
+        const th = Math.min(100, Math.max(1, Number(c.threshold) || 10));
+        return { entity: c.entity, kind: c.kind, label: c.label, compare: c.compare,
+                 ...(c.kind === 'consumable' ? { threshold: th } : {}),
+                 addedAt: c.addedAt || new Date().toISOString() }; }).filter(Boolean);
+      Store.setWatch(g.assetId, list);
+      await Store.push();
+      toast(list.length ? `Watching ${list.length} sensor${list.length === 1 ? '' : 's'} on ${a.name}` : 'Not watching any sensors');
+      return go('/asset/' + g.assetId);
+    }
     case 'suggest': { const n = Store.suggestTasks(id); alert(n ? `Added ${n} suggested task${n>1?'s':''}.` : 'Already has the standard schedule.'); return render(); }
     case 'start-tracking': { const n = Store.unscheduled().length; Store.startTracking(); alert(`Tracking ${n} service${n>1?'s':''} — countdowns started.`); return render(); }
     case 'book-pack': {
@@ -3013,7 +3182,21 @@ document.addEventListener('click', async e => {
       return;
     }
     case 'del-asset': if (confirm('Delete this asset and its tasks?')) { Store.deleteAsset(id); return go('/assets'); } return;
-    case 'del-task': if (confirm('Delete this task?')) { Store.deleteTask(id); return go('/asset/' + node.getAttribute('data-asset')); } return;
+    case 'del-task': {
+      const t = Store.state.tasks.find(x => x.id === id);
+      // A device-raised task with its sensor still watched would be re-raised
+      // within a poll tick — deleting it only sticks if the watch goes too.
+      if (t && t.fault) {
+        const a = Store.asset(t.assetId);
+        const stillWatched = !!(a && a.ha && (a.ha.watch || []).some(w => w.entity === t.fault.entity));
+        if (!confirm(stillWatched
+          ? `The device raised this task and its "${t.fault.label}" sensor is still being watched — deleting it also stops watching that sensor. (Snooze instead to keep watching.) Delete?`
+          : 'Delete this task?')) return;
+        if (stillWatched) Store.setWatch(a.id, (a.ha.watch || []).filter(w => w.entity !== t.fault.entity));
+        Store.deleteTask(id); return go('/asset/' + node.getAttribute('data-asset'));
+      }
+      if (confirm('Delete this task?')) { Store.deleteTask(id); return go('/asset/' + node.getAttribute('data-asset')); } return;
+    }
     case 'buy': {
       const a = Store.asset(id); if (!a) return;
       const url = a.purchaseUrl ? webUrl(a.purchaseUrl)
@@ -3360,8 +3543,11 @@ document.addEventListener('click', async e => {
       const tid = id, assetId = node.getAttribute('data-asset');
       const t = tid ? Store.state.tasks.find(x=>x.id===tid) : { assetId };
       const diy = !!(document.getElementById('f_diy') || {}).checked;
+      // Fault tasks hide the auto-book checkbox (the missing element reads unchecked)
+      // and live at cadence 0 — the ||365 default would put a device fault on a
+      // yearly repeat the first time its note was edited.
       const auto = !!(document.getElementById('f_auto') || {}).checked && !diy;   // DIY wins: never auto-email about a job you do yourself
-      Object.assign(t, { assetId, title:val('f_title'), cadenceDays:Number(val('f_cad'))||365,
+      Object.assign(t, { assetId, title:val('f_title'), cadenceDays:Number(val('f_cad'))||(t.fault?0:365),
         lastDone:val('f_last'), estCost:Number(val('f_cost'))||0, note:val('f_note'), providerId:val('f_prov_t'), autoBook: auto, diy,
         autopilot: !!(document.getElementById('f_autopilot')||{}).checked });
       Store.upsertTask(t);
