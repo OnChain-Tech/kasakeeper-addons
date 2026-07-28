@@ -1147,7 +1147,7 @@ function viewAsset(id) {
     <div class="btn-row"><button class="btn small" data-action="del-asset" data-id="${a.id}" style="color:var(--red)">Delete asset</button></div>`;
 }
 
-const QSTATUS = { to_contact: 'needs a supplier', enquiry_sent: 'enquiry sent', quoted: 'quote in', dates_offered: 'pick a date', booked: 'booked' };
+const QSTATUS = { to_contact: 'needs a supplier', enquiry_sent: 'enquiry sent', replied: 'reply in', quoted: 'quote in', dates_offered: 'pick a date', booked: 'booked' };
 // Schedule row in the instrument language: rail+pill carry status, the sub names
 // the asset and who does it, and ONE context action drives the triage — everything
 // else (edit/snooze/delete) lives one tap away on the asset page.
@@ -1257,16 +1257,17 @@ function qCard(q) {
     const draftBtn = q.draft ? `<button class="btn small primary" data-action="open-draft" data-id="${q.id}">✉︎ Review &amp; send</button>` : '';
     const nextBtns = draftBtn + (q.status === 'to_contact' ? `<button class="btn small" data-action="quote-sent" data-id="${q.id}">✉︎ Mark enquiry sent</button>`
       : waiting ? `<span class="chip watching">⌁ awaiting reply</span><button class="btn small" data-action="quote-amount" data-id="${q.id}">💲 Log manually</button>`
+      : q.status === 'replied' ? `<button class="btn small primary" data-action="quote-amount" data-id="${q.id}">💲 Log quote</button>${q.replyFrom ? `<a class="btn small" data-ext href="mailto:${esc(q.replyFrom)}?subject=${encodeURIComponent('Re: ' + (q.enquirySubject || 'your reply'))}">✉︎ Reply</a>` : ''}`
       : q.status === 'enquiry_sent' ? `<button class="btn small" data-action="quote-amount" data-id="${q.id}">💲 Log quote</button>`
       : q.status === 'dates_offered' ? (q.offeredDates || []).map(d =>
           `<button class="btn small primary" data-action="confirm-date" data-id="${q.id}" data-date="${esc(d)}">✅ ${esc(d)}</button>`).join('')
           + `<button class="btn small" data-action="quote-amount" data-id="${q.id}">💲 Log quote</button>`
-      : q.status === 'quoted' ? `<button class="btn small primary" data-action="quote-book" data-id="${q.id}">✅ Book it</button>` : '');
+      : q.status === 'quoted' ? `<button class="btn small primary" data-action="quote-book" data-id="${q.id}">✅ Book it${q.amount ? ' · ' + money(q.amount) : ''}</button><button class="btn small" data-action="quote-amount" data-id="${q.id}">✎ Change</button>` : '');
     const meta = [
       q.bookedDate ? `📌 booked — ${esc(q.bookedDate)}` : (q.availability ? `📅 ${esc(q.availability)}` : ''),
       q.replyNote ? esc(q.replyNote) : (waiting && q.enquiryTo ? `enquiry sent to ${esc(q.enquiryTo)}` : ''),
     ].filter(Boolean).join(' · ');
-    const cls = q.status === 'booked' ? 'green' : 'amber';
+    const cls = q.status === 'booked' ? 'green' : q.status === 'replied' ? 'blue' : 'amber';
     return `<div class="k-row ${cls}">
       <div class="k-tile"><span class="em">🧾</span></div>
       <div class="k-main"><div class="k-title">${esc((a && (!q.trade || q.trade === a.category)) ? a.name : (q.trade || 'Quote'))}${q.amount ? ' · ' + money(q.amount) : ''}${q.auto ? ' <span class="chip auto">🤖 auto</span>' : q.autoParsed ? ' <span class="chip auto">auto</span>' : ''}</div>
@@ -3539,6 +3540,19 @@ Store.syncRemote().then(res => {
 document.addEventListener('visibilitychange', () => {
   if (document.visibilityState === 'visible') Store.syncRemote().then(res => { if (res === 'adopted') render(); });
 });
+// The wall tablet never fires visibilitychange (always on, always visible), so an
+// idle device would sit on stale quotes the Green already knows about. Gentle
+// periodic reconcile — 3 min, half the server's quote-poll cadence — only while
+// visible; hidden tabs keep relying on the visibilitychange sync above.
+setInterval(() => {
+  if (document.visibilityState !== 'visible') return;
+  // Never re-render under someone's fingers: a timer (unlike visibilitychange)
+  // can fire mid-typing, and render() would eat the form. Skip the tick; the
+  // next one, or the eventual focus change, picks the sync up.
+  const ae = document.activeElement;
+  if (ae && (ae.tagName === 'INPUT' || ae.tagName === 'TEXTAREA' || ae.tagName === 'SELECT' || ae.isContentEditable)) return;
+  Store.syncRemote().then(res => { if (res === 'adopted') render(); });
+}, 180000);
 // The live strip must not poll HA hard, but should feel fresh when you pick the
 // tablet back up — force past the 30s min-interval on regaining visibility.
 document.addEventListener('visibilitychange', () => {

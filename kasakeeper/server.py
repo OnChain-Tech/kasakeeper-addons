@@ -1430,7 +1430,11 @@ def poll_quote_replies():
         if msgs:
             uid, msgid, frm, ts, body = msgs[-1]
             newest[qid] = {"msgid": msgid, "from": frm, "body": body}
-    if not newest:
+    # Repair-only cycles must still reach the mutator: a pre-'replied'-era quote
+    # whose reply was later archived would otherwise stay "enquiry sent" forever.
+    needs_repair = any(q.get("status") == "enquiry_sent" and q.get("replyNote")
+                       for q in st["quotes"])
+    if not newest and not needs_repair:
         return
     # Claude parse happens OUTSIDE the state lock (slow); apply results in one mutate
     parsed = {qid: (info, parse_quote_reply(info["body"])) for qid, info in newest.items()}
@@ -1462,7 +1466,11 @@ def poll_quote_replies():
             else:
                 q["replyNote"] = (res or {}).get("summary") or "Reply received — no price yet."
                 q["needsSiteVisit"] = bool((res or {}).get("needs_site_visit"))
-            if dates and q.get("status") in ("enquiry_sent", "quoted"):
+                # A reply that parses to neither price nor dates must still leave
+                # "awaiting reply" — the trade answered, the user just has to read it.
+                if q.get("status") == "enquiry_sent":
+                    q["status"] = "replied"
+            if dates and q.get("status") in ("enquiry_sent", "replied", "quoted"):
                 q["status"] = "dates_offered"  # dates in hand — user picks one to confirm
             who = q.get("provider") or "A trade"
             if q.get("status") == "dates_offered":
@@ -1470,10 +1478,26 @@ def poll_quote_replies():
                                f"{who} offered: {' / '.join(dates[:3])}"
                                + (f" · {money_str(q.get('amount'))}" if q.get("amount") else "")
                                + " — open KasaKeeper to confirm one.", q.get("homeId")))
-            elif q.get("auto"):
+            elif q.get("status") == "quoted":
+                # The push must carry the proposed cost — the user confirms or
+                # changes it from the card, so lead with the number.
+                notify.append(("KasaKeeper — quote in",
+                               f"{who} quoted {money_str(q.get('amount'))}"
+                               + (f" · {q.get('availability')}" if q.get("availability") else "")
+                               + " — open KasaKeeper to book or adjust.", q.get("homeId")))
+            else:
+                # Every processed reply is worth a push, not just auto-book ones —
+                # a disputed invoice or "need a site visit" answer is exactly what
+                # the user is waiting on.
                 notify.append(("KasaKeeper — reply received",
-                               f"{who}: " + (q.get("replyNote") or "replied to the booking enquiry."), q.get("homeId")))
+                               f"{who}: " + (q.get("replyNote") or "replied to the enquiry."), q.get("homeId")))
             changed = True
+        # One-time repair for replies processed before the 'replied' state existed:
+        # the lastReplyId guard means they will never re-enter the branch above.
+        for q in state.get("quotes", []):
+            if q.get("status") == "enquiry_sent" and q.get("replyNote"):
+                q["status"] = "replied"
+                changed = True
         return changed
 
     res = state_mutate(mutator)

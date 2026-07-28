@@ -1,3 +1,9 @@
+# 0.3.1
+
+- **Trade replies now surface properly**: a reply that isn't a clean quote (a dispute, a question, "need to see it first") flips the card to a blue **reply in** state with the summary, a one-tap Log quote and a direct ✉︎ Reply · no more cards stuck on "awaiting reply" after the trade has answered. Existing stuck cards repair themselves on the next mail poll.
+- **Proposed costs and dates are decisions, not facts**: the quote card leads with the number on Book it and adds ✎ Change; date offers stay one-tap confirmable. Every processed reply now pushes to your phone · a priced quote leads with the amount.
+- **Idle devices stay fresh**: the wall tablet reconciles with the shared store every 3 minutes, so quote updates appear without touching it.
+
 # 0.3.0
 
 The multi-home release · KasaKeeper now works for houses beyond the one it runs in, and for households beyond the first.
