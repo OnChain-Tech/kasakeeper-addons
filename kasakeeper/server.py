@@ -524,6 +524,7 @@ HA_DEVICES_TEMPLATE = """
      'serial_number': device_attr(d, 'serial_number'),
      'entry_type': device_attr(d, 'entry_type'),
      'area': area_name(d),
+     'via_device': device_attr(d, 'via_device_id'),
      'entities': ns.ents}] %}
 {% endfor %}
 {{ ns.devs | tojson }}
@@ -673,6 +674,14 @@ def _ha_live_entities(dev):
 # needs no extra HA reads. `suggest` marks the rows the picker pre-ticks.
 _HA_PROBLEM_DCLASSES = {'problem', 'moisture', 'smoke', 'gas', 'safety', 'tamper'}
 _HA_PROBLEM_HINTS    = ('problem', 'error', 'fault', 'jam', 'stuck', 'clog', 'leak', 'overheat', '_full', 'tank')
+# Some integrations publish binary problem flags as *sensor* entities with
+# "True"/"False" string states (Eight Sleep's need_priming, plus a bogus
+# device_class of "binary_sensors" — plural, nonstandard). Offer those as fault
+# candidates too: 'nonzero' handles them because 'false' is in _HA_FAULT_NORMAL.
+# has_/is_-prefixed ids are skipped — their healthy state is True (has_water),
+# which 'nonzero' would read as a permanent fault.
+_HA_NEED_HINTS       = ('need_', 'needs_', 'requires_', 'require_', 'low_', '_low', 'empty', 'depleted', 'priming')
+_HA_INVERTED_RE      = re.compile(r'(^|[._])(has|is)_')
 _HA_CONSUMABLE_HINTS = ('filter', 'brush', 'bin', 'dust', 'pad', 'cartridge', 'consumable', 'life', 'wear', 'remaining')
 _HA_WEAR_HINTS       = ('used', 'dirty', 'wear')          # inverted sense: HIGH = bad
 # Enum/state values that mean "no fault" on an error-code sensor. Anything NOT
@@ -711,6 +720,11 @@ def _ha_problem_entities(dev):
                 # Never pre-ticked: the registry read carries no state value, so we
                 # can't tell an error-code sensor from a mode sensor that merely
                 # matched the name — the user opts in deliberately.
+                out.append({'entity': eid, 'kind': 'fault', 'label': label, 'compare': 'nonzero', 'suggest': False})
+            elif (domain == 'sensor' and not (e.get('unit') or '')
+                  and (dc == 'binary_sensors' or (not dc and any(h in low for h in _HA_NEED_HINTS)))
+                  and not _HA_INVERTED_RE.search(low)):
+                # Pseudo-binary sensor (True/False string states) — see _HA_NEED_HINTS.
                 out.append({'entity': eid, 'kind': 'fault', 'label': label, 'compare': 'nonzero', 'suggest': False})
             elif domain == 'sensor' and (e.get('unit') or '') == '%' and any(h in low for h in _HA_CONSUMABLE_HINTS):
                 wear = any(h in low for h in _HA_WEAR_HINTS)
@@ -759,8 +773,41 @@ def ha_devices(force=False, home_id=None):
             print(f"[ha] device row skipped: {e}")
             continue
     data = {"available": True, "devices": devices, "everythingElse": everything_else}
-    _DEV_CACHE[key] = {"t": now, "data": data}
+    # Raw template rows are kept server-side only (never sent to the client):
+    # problem-sensor discovery needs the entities of devices _ha_relevant()
+    # rejects — an Eight Sleep *hub* is bridge-named so it lands in
+    # everythingElse, yet it is exactly where need_priming lives.
+    _DEV_CACHE[key] = {"t": now, "data": data, "raw": devs}
     return data
+
+def _ha_registry_raw(home_id=None):
+    """Raw template rows for one home's registry (every device, relevant or
+    not), riding ha_devices()'s cache — no extra HA read on a warm cache."""
+    ha_devices(home_id=home_id)
+    return (_DEV_CACHE.get(home_id or "") or {}).get("raw") or []
+
+def _ha_related_rows(raw, device_id):
+    """The raw registry rows problem discovery should scan for one linked
+    device: the device itself, its via_device parent, and its via_device
+    children. An Eight Sleep 'Side' is via-linked to the hub that owns the
+    priming sensors; a hub-linked asset symmetrically sees its sides. Pure /
+    unit-testable; self first, each device at most once."""
+    rows, seen = [], set()
+    def add(r):
+        did = (r or {}).get('device_id')
+        if r and did and did not in seen:
+            seen.add(did)
+            rows.append(r)
+    by_id = {r.get('device_id'): r for r in raw if isinstance(r, dict)}
+    me = by_id.get(device_id)
+    if not me:
+        return []
+    add(me)
+    add(by_id.get(me.get('via_device')))
+    for r in raw:
+        if isinstance(r, dict) and r.get('via_device') == device_id:
+            add(r)
+    return rows
 
 # ---- drift detection (the correction loop — slice 3) --------------------------
 # Compares imported assets' stamped ha.snapshot (see app.js ha-import-apply)
@@ -868,11 +915,17 @@ def ha_problem_entities(asset_id, home_id=None):
         hid = asset.get("homeId") or home_id or state.get("currentHomeId")
         if not ha.get("deviceId") or not ha_available(hid):
             return {"available": False, "candidates": [], "watching": watching}
-        reg = ha_devices(home_id=hid)
-        dev = next((d for d in (reg.get("devices") or []) if d.get("deviceId") == ha["deviceId"]), None)
-        if not dev:
-            return {"available": True, "candidates": [], "watching": watching}
-        return {"available": True, "candidates": _ha_problem_entities(dev), "watching": watching}
+        # Scan the linked device AND its via_device relatives from the RAW
+        # registry rows — the linked device may be paired with a bridge-named
+        # hub that _ha_relevant() rejects yet owns the problem sensors (Eight
+        # Sleep: the Side is the asset, need_priming lives on the hub).
+        cands, seen = [], set()
+        for row in _ha_related_rows(_ha_registry_raw(hid), ha["deviceId"]):
+            for c in _ha_problem_entities(row):
+                if c["entity"] not in seen:
+                    seen.add(c["entity"])
+                    cands.append(c)
+        return {"available": True, "candidates": cands, "watching": watching}
     except Exception as e:
         print(f"[ha] problem-entity scan failed: {e}")
         return empty

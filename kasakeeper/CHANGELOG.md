@@ -1,3 +1,11 @@
+# 0.3.11
+
+- **The watch picker now looks at the whole appliance, not just the linked device**: an Eight Sleep "Side" is the device your asset links to, but "needs priming" lives on the pod's hub · discovery now follows the device family (hub ↔ sides) so those sensors show up in the picker instead of "No problem sensors found".
+
+# 0.3.10
+
+- **Device watch finds shy sensors too**: some integrations report problems as plain True/False sensors instead of proper binary sensors (Eight Sleep's "needs priming", a dishwasher's "salt low") · the sensor picker now offers those as watchable fault candidates instead of "No problem sensors found". Healthy-when-True sensors (has water, is priming) are left out so they can't raise a task that never clears.
+
 # 0.3.9
 
 - **Worn part? The order link is on the card**: when a device reports a consumable running out (brushes, filters, bags), KasaKeeper finds the exact replacement part's real product page for your model and puts a tappable 🛒 Order link right on the task · manufacturer's store first, validated before it lands.
