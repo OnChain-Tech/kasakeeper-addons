@@ -1,3 +1,7 @@
+# 0.3.6
+
+- **Ask knows what to ask**: the empty Ask screen now offers twenty starter questions in six groups · Right now, Money, Assets & warranties, Trades & quotes, Make changes, and (when connected) Live house. Chips adapt to your data — quote questions only appear when there are quotes to talk about.
+
 # 0.3.5
 
 - **Forward a trade's email and KasaKeeper reads it**: trades often reply to your personal inbox instead of the enquiry thread · forward that email to the KasaKeeper mailbox and the quote fills itself in on the next check, with the reply address kept as the trade's, not yours.

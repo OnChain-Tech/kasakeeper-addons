@@ -315,7 +315,8 @@ select.feat-var{margin-top:7px;width:auto;max-width:240px;padding:6px 9px;font-s
 .chat-intro{text-align:center;padding:26px 10px 8px;color:var(--muted)}
 .chat-hero{width:52px;height:52px;color:var(--accent);margin-bottom:10px}
 .chat-intro .t-name{font-size:17px;color:var(--text);margin-bottom:4px}
-.chat-sugg{display:flex;flex-wrap:wrap;gap:7px;justify-content:center;margin-top:16px}
+.chat-sugg{display:flex;flex-wrap:wrap;gap:7px;justify-content:center;margin-top:10px}
+.sugg-label{font:600 11px var(--mono);color:var(--faint);text-transform:uppercase;letter-spacing:.08em;margin-top:18px}
 .chip.sugg{cursor:pointer;font-size:12px;padding:7px 12px;text-align:left;position:relative}
 /* ~30px tall chrome → -8px clears 44px */
 .chip.sugg::after{content:'';position:absolute;inset:-8px}

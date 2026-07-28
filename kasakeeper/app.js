@@ -907,12 +907,48 @@ function viewDashboard() {
 
 /* ---------- Ask — the house assistant ---------- */
 let CHAT = { messages: [], busy: false };
-const CHAT_SUGGESTIONS = [
-  'What needs doing this month?',
-  'Who cleans the house and what does it cost a year?',
-  'Which warranties expire soonest?',
-  'Log the gutter clean as done today',
-];
+// Grouped, lightly context-aware: a chip should never lead to an empty answer,
+// so quote/HA groups only appear when the store actually has something to say.
+function chatSuggestionGroups() {
+  const qs = Store.homeQuotes ? Store.homeQuotes() : (Store.state.quotes || []);
+  const liveQuotes = qs.filter(q => !['booked', 'done', 'dismissed'].includes(q.status)).length;
+  const ha = (Store.homeHA ? Store.homeHA() : { mode: 'local' }).mode !== 'none';
+  const groups = [
+    { label: 'Right now', qs: [
+      'What needs doing this month?',
+      'What’s overdue, and how urgent is each one?',
+      'What’s coming up in the next 90 days and what will it cost?',
+      'Anything I should do before summer?',
+    ]},
+    { label: 'Money', qs: [
+      'What have I spent this year, by category?',
+      'Which asset costs the most to run?',
+      'Who cleans the house and what does it cost a year?',
+      'Where could I save on maintenance?',
+    ]},
+    { label: 'Assets & warranties', qs: [
+      'Which warranties expire soonest?',
+      'Which assets have no serial or model recorded?',
+      'When was the aircon last serviced?',
+      'Any product recalls on my appliances?',
+    ]},
+    { label: 'Trades & quotes', qs: [
+      liveQuotes ? 'Where are my open quotes up to?' : 'Which jobs should I get quotes for?',
+      'Who’s my go-to for each trade?',
+      'Which tasks have no supplier lined up?',
+    ]},
+    { label: 'Make changes', qs: [
+      'Log the gutter clean as done today',
+      'Snooze the pool service for a month',
+      'Set a reminder to test the smoke alarms',
+    ]},
+  ];
+  if (ha) groups.push({ label: 'Live house', qs: [
+    'Which devices are usage-tracked, and how close to service are they?',
+    'Does Home Assistant disagree with any of my assets?',
+  ]});
+  return groups;
+}
 
 function viewChat() {
   const bubbles = CHAT.messages.map((m, mi) => {
@@ -945,7 +981,8 @@ function viewChat() {
       <svg class="chat-hero"><use href="#kk-mark"/></svg>
       <div class="t-name">Ask me about the house</div>
       <div class="t-sub">I know your assets, schedules, warranties, trades and quotes — and I can update them.</div>
-      <div class="chat-sugg">${CHAT_SUGGESTIONS.map(s => `<button class="chip sugg" data-action="chat-suggest" data-q="${esc(s)}">${esc(s)}</button>`).join('')}</div>
+      ${chatSuggestionGroups().map(g => `<div class="sugg-label">${esc(g.label)}</div>
+      <div class="chat-sugg">${g.qs.map(s => `<button class="chip sugg" data-action="chat-suggest" data-q="${esc(s)}">${esc(s)}</button>`).join('')}</div>`).join('')}
     </div>`;
   return topbar('Ask') + `
     <div class="chat-log">${empty}${bubbles}

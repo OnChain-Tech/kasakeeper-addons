@@ -1,5 +1,5 @@
 name: KasaKeeper
-version: "0.3.5"
+version: "0.3.6"
 slug: kasakeeper
 description: Home-maintenance dashboard — assets, schedules, trades, and live Home Assistant data.
 url: "https://github.com/OnChain-Tech/kasakeeper"
