@@ -1336,6 +1336,9 @@ QUOTE_PARSE_SYSTEM = (
     "needs_site_visit (boolean — do they need to inspect before they can quote), "
     "offered_dates (array of strings — every concrete date and/or time window they OFFER to do the "
     "job, kept short and human e.g. 'Tue 22 Jul morning', '8am Thursday 24th'; [] if none offered), "
+    "paid_amount (number in AUD — any deposit or payment the email says has ALREADY been paid, or null), "
+    "paid_receipt (short string — receipt/invoice number for that payment if stated, or null), "
+    "balance_due (number in AUD — remaining balance if the email states one, or null), "
     "summary (one short sentence, max ~18 words)."
 )
 
@@ -1411,6 +1414,49 @@ def _imap_replies_for_tokens(tokens):
         except Exception: pass
     return out
 
+def _imap_replies_from(senders):
+    """{addr: [(uid, msgid, from, ts, body), ...]} — newest few INBOX messages FROM each
+    watched sender. Fallback for follow-ups that dropped the [KK-] subject token
+    (a trade composing a fresh email instead of replying is common)."""
+    creds = _gmail_creds()
+    if not creds or not senders:
+        return {}
+    user, pwd = creds
+    out = {s: [] for s in senders}
+    m = imaplib.IMAP4_SSL(GMAIL_IMAP, 993, ssl_context=_tls_ctx(), timeout=30)
+    try:
+        m.login(user, pwd)
+        m.select("INBOX", readonly=True)
+        for addr in senders:
+            # addr comes from a trade-controlled From: header — allow only plain
+            # addr-spec characters so it can't break out of the quoted SEARCH atom.
+            if not _re.fullmatch(r"[A-Za-z0-9._%+@-]{3,254}", addr):
+                continue
+            if addr.startswith("@"):
+                # Domain tier searches full text, not just From: — a reply the OWNER
+                # forwards into this mailbox carries the trade's address in the body.
+                typ, data = m.uid("SEARCH", None, "X-GM-RAW", '"%s"' % addr[1:])
+            else:
+                typ, data = m.uid("SEARCH", None, "FROM", '"%s"' % addr)
+            if typ != "OK" or not data or not data[0]:
+                continue
+            for uid in data[0].split()[-3:]:  # newest few
+                typ, fetched = m.uid("FETCH", uid, "(RFC822)")
+                if typ != "OK" or not fetched or not isinstance(fetched[0], tuple):
+                    continue
+                msg = emaillib.message_from_bytes(fetched[0][1], policy=emaillib.policy.default)
+                try:
+                    ts = emaillib.utils.parsedate_to_datetime(msg.get("Date")).timestamp()
+                except Exception:
+                    ts = 0
+                out[addr].append((uid.decode(), str(msg.get("Message-ID", "")),
+                                  str(msg.get("From", "")), ts, _plain_body(msg)))
+            out[addr].sort(key=lambda r: r[3])
+    finally:
+        try: m.logout()
+        except Exception: pass
+    return out
+
 def poll_quote_replies():
     """One poll cycle: match INBOX replies to enquiry_sent quotes, parse, update the store."""
     if not gmail_available():
@@ -1418,8 +1464,11 @@ def poll_quote_replies():
     st = state_read().get("state")
     if not st or not st.get("quotes"):
         return
+    # Watch every quote whose conversation is still live — a trade replies more
+    # than once (quote, then dates, then payment details). The lastReplyId guard
+    # keeps already-processed messages from re-applying.
     watched = {q["token"]: q["id"] for q in st["quotes"]
-               if q.get("status") == "enquiry_sent" and q.get("token")}
+               if q.get("status") in ("enquiry_sent", "replied", "quoted", "dates_offered") and q.get("token")}
     if not watched:
         return
     replies = _imap_replies_for_tokens(list(watched))
@@ -1429,7 +1478,51 @@ def poll_quote_replies():
         msgs = replies.get(tok) or []
         if msgs:
             uid, msgid, frm, ts, body = msgs[-1]
-            newest[qid] = {"msgid": msgid, "from": frm, "body": body}
+            newest[qid] = {"msgid": msgid, "from": frm, "body": body, "ts": ts}
+    # Sender fallback: trades drop the [KK-] token constantly (fresh emails, edited
+    # subjects, a different mailbox on the same domain). Tiered search per quote:
+    # exact replyFrom → the enquiryTo we wrote to → anyone @ that domain. Domain-tier
+    # hits must also LOOK like job mail so a newsletter can't hijack the card.
+    by_qid = {q["id"]: q for q in st["quotes"]}
+    pending = {}
+    for tok, qid in watched.items():
+        q = by_qid.get(qid) or {}
+        cur = newest.get(qid)
+        if cur and cur["msgid"] != q.get("lastReplyId"):
+            continue  # token search already found something new
+        terms = []
+        for a in ((q.get("replyFrom") or ""), (q.get("enquiryTo") or "")):
+            a = a.strip().lower()
+            if a and a not in terms:
+                terms.append(a)
+        for d in ["@" + a.split("@", 1)[1] for a in list(terms) if "@" in a]:
+            if d not in terms:
+                terms.append(d)
+        if terms:
+            pending[qid] = terms
+    if pending:
+        found = _imap_replies_from(sorted({t for ts_ in pending.values() for t in ts_}))
+        for qid, terms in pending.items():
+            q = by_qid.get(qid) or {}
+            gate_words = [w.lower() for w in ("quote", "booking", "invoice", "job", "deposit",
+                          (q.get("provider") or "").split(" ")[0], (q.get("trade") or "").split(" ")[0]) if w]
+            best = None
+            for t in terms:
+                for r in (found.get(t) or []):
+                    if not r[1] or r[1] == q.get("lastReplyId"):
+                        continue
+                    if t.startswith("@") and not any(w in (r[4] or "").lower() for w in gate_words):
+                        continue  # domain-wide hit with no job-ish content — ignore
+                    if best is None or r[3] > best[3]:
+                        best = r
+            if best:
+                uid, msgid, frm, ts, body = best
+                prev = newest.get(qid)
+                if not prev or ts >= (prev.get("ts") or 0):
+                    newest[qid] = {"msgid": msgid, "from": frm, "body": body, "ts": ts}
+    # drop entries that are just the already-processed message again
+    newest = {qid: info for qid, info in newest.items()
+              if info["msgid"] != (by_qid.get(qid) or {}).get("lastReplyId")}
     # Repair-only cycles must still reach the mutator: a pre-'replied'-era quote
     # whose reply was later archived would otherwise stay "enquiry sent" forever.
     needs_repair = any(q.get("status") == "enquiry_sent" and q.get("replyNote")
@@ -1450,7 +1543,13 @@ def poll_quote_replies():
                 continue  # this exact reply already processed
             q["lastReplyId"] = info["msgid"]
             q["repliedAt"] = time.strftime("%Y-%m-%d")
-            q["replyFrom"] = _email_addr(info["from"])
+            # A forwarded reply arrives FROM the owner — keep the trade's address
+            # as the reply-to target, never the household's own.
+            _sender = _email_addr(info["from"]) or ""
+            _own = {(_gmail_creds() or ("", ""))[0].lower(),
+                    str(((state.get("settings") or {}).get("emailCc") or "")).lower()}
+            if _sender and _sender.lower() not in _own:
+                q["replyFrom"] = _sender
             dates = [str(d).strip() for d in ((res or {}).get("offered_dates") or [])
                      if str(d).strip()][:5]
             if dates:
@@ -1470,6 +1569,14 @@ def poll_quote_replies():
                 # "awaiting reply" — the trade answered, the user just has to read it.
                 if q.get("status") == "enquiry_sent":
                     q["status"] = "replied"
+            # Payments already made (deposits) are facts, not decisions — record the
+            # typed fields so the card can show them; nothing books or sends off them.
+            if res and res.get("paid_amount") is not None:
+                q["paidAmount"] = res["paid_amount"]
+                if res.get("paid_receipt"):
+                    q["paidReceipt"] = str(res["paid_receipt"])[:40]
+            if res and res.get("balance_due") is not None:
+                q["balanceDue"] = res["balance_due"]
             if dates and q.get("status") in ("enquiry_sent", "replied", "quoted"):
                 q["status"] = "dates_offered"  # dates in hand — user picks one to confirm
             who = q.get("provider") or "A trade"

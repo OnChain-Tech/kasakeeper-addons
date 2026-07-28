@@ -1257,14 +1257,15 @@ function qCard(q) {
     const draftBtn = q.draft ? `<button class="btn small primary" data-action="open-draft" data-id="${q.id}">✉︎ Review &amp; send</button>` : '';
     const nextBtns = draftBtn + (q.status === 'to_contact' ? `<button class="btn small" data-action="quote-sent" data-id="${q.id}">✉︎ Mark enquiry sent</button>`
       : waiting ? `<span class="chip watching">⌁ awaiting reply</span><button class="btn small" data-action="quote-amount" data-id="${q.id}">💲 Log manually</button>`
-      : q.status === 'replied' ? `<button class="btn small primary" data-action="quote-amount" data-id="${q.id}">💲 Log quote</button>${q.replyFrom ? `<a class="btn small" data-ext href="mailto:${esc(q.replyFrom)}?subject=${encodeURIComponent('Re: ' + (q.enquirySubject || 'your reply'))}">✉︎ Reply</a>` : ''}`
+      : q.status === 'replied' ? `<button class="btn small primary" data-action="quote-amount" data-id="${q.id}">💲 Log quote</button><button class="btn small" data-action="quote-book" data-id="${q.id}">📌 Book</button>${(q.replyFrom || q.enquiryTo) ? `<button class="btn small" data-action="quote-reply" data-id="${q.id}">✉︎ Reply</button>` : ''}`
       : q.status === 'enquiry_sent' ? `<button class="btn small" data-action="quote-amount" data-id="${q.id}">💲 Log quote</button>`
       : q.status === 'dates_offered' ? (q.offeredDates || []).map(d =>
           `<button class="btn small primary" data-action="confirm-date" data-id="${q.id}" data-date="${esc(d)}">✅ ${esc(d)}</button>`).join('')
           + `<button class="btn small" data-action="quote-amount" data-id="${q.id}">💲 Log quote</button>`
-      : q.status === 'quoted' ? `<button class="btn small primary" data-action="quote-book" data-id="${q.id}">✅ Book it${q.amount ? ' · ' + money(q.amount) : ''}</button><button class="btn small" data-action="quote-amount" data-id="${q.id}">✎ Change</button>` : '');
+      : q.status === 'quoted' ? `<button class="btn small primary" data-action="quote-book" data-id="${q.id}">✅ Book it${q.amount ? ' · ' + money(q.amount) : ''}</button><button class="btn small" data-action="quote-amount" data-id="${q.id}">✎ Change</button>${(q.replyFrom || q.enquiryTo) ? `<button class="btn small" data-action="quote-reply" data-id="${q.id}">✉︎ Reply</button>` : ''}` : '');
     const meta = [
       q.bookedDate ? `📌 booked — ${esc(q.bookedDate)}` : (q.availability ? `📅 ${esc(q.availability)}` : ''),
+      q.paidAmount ? `✓ ${money(q.paidAmount)} paid${q.paidReceipt ? ' · receipt ' + esc(q.paidReceipt) : ''}${q.balanceDue ? ' · ' + money(q.balanceDue) + ' owing' : ''}` : '',
       q.replyNote ? esc(q.replyNote) : (waiting && q.enquiryTo ? `enquiry sent to ${esc(q.enquiryTo)}` : ''),
     ].filter(Boolean).join(' · ');
     const cls = q.status === 'booked' ? 'green' : q.status === 'replied' ? 'blue' : 'amber';
@@ -2577,6 +2578,13 @@ document.addEventListener('click', async e => {
     }
     case 'open-quote': return go('/providers');
     case 'quote-sent': { const q = Store.quote(id); if (q) { q.status = 'enquiry_sent'; Store.upsertQuote(q); } return render(); }
+    case 'quote-reply': {  // inline reply that stays in the tracked thread — the [KK-] token keeps the poller watching
+      const q = Store.quote(id); if (!q) return;
+      const to = q.replyFrom || q.enquiryTo; if (!to) return;
+      const subject = `Re: ${q.trade || 'your quote'}${q.token ? ` [${q.token}]` : ''}`;
+      return composeEnquiry({ quoteId: q.id, to, subject, body: '', sendLabel: 'Send reply',
+        onSent: () => { toast('Reply sent · watching for their answer'); render(); } });
+    }
     case 'quote-amount': { const q = Store.quote(id); if (!q) return; const amt = prompt('Quoted amount ($)?', q.amount || ''); if (amt === null) return; q.amount = Number(amt) || 0; q.status = 'quoted'; Store.upsertQuote(q); return render(); }
     case 'quote-book': return go('/book/' + id);   // capture the date, log it, draft the confirmation
     case 'confirm-date': {  // auto-book: user picks one of the offered dates -> approved confirmation email

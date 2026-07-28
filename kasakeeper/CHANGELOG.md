@@ -1,3 +1,22 @@
+# 0.3.5
+
+- **Forward a trade's email and KasaKeeper reads it**: trades often reply to your personal inbox instead of the enquiry thread · forward that email to the KasaKeeper mailbox and the quote fills itself in on the next check, with the reply address kept as the trade's, not yours.
+
+# 0.3.4
+
+- **Reply matching got three tiers**: exact sender, the address the enquiry went to, then anyone at the trade's domain (with a job-mail relevance check so newsletters can't pose as replies) · catches the trade who answers from a different mailbox with a fresh subject.
+
+# 0.3.3
+
+- **Follow-ups without the tracking token are heard too**: when a trade sends a fresh email instead of replying (dropping the [KK-] subject token), KasaKeeper now also checks recent mail from their known address · Breezy's date offer is exactly this case.
+
+# 0.3.2
+
+- **KasaKeeper watches the whole conversation now**: replies keep being read until the job is booked · a trade who quotes first and offers dates in a second email no longer goes unheard.
+- **Payments are read too**: a mentioned deposit shows on the card as "✓ $X paid · receipt #N · $Y owing" · recorded facts, never actions.
+- **Reply without leaving**: quote cards gained an in-app ✉︎ Reply that keeps the tracked thread (and your approval step) · no more bouncing to a mail app.
+- **Book from anywhere**: a phone-confirmed job books straight from the reply-in card · 📌 Book captures date and time, the confirmation email stays optional.
+
 # 0.3.1
 
 - **Trade replies now surface properly**: a reply that isn't a clean quote (a dispute, a question, "need to see it first") flips the card to a blue **reply in** state with the summary, a one-tap Log quote and a direct ✉︎ Reply · no more cards stuck on "awaiting reply" after the trade has answered. Existing stuck cards repair themselves on the next mail poll.
