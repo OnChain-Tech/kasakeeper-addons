@@ -1885,10 +1885,13 @@ let SETUP = { step: 1, address: '', msg: '', detected: null, selected: new Set()
 const existsCat = cat => Store.homeAssets().some(a => a.category === cat);
 const existsLabel = l => Store.homeAssets().some(a => a.name.toLowerCase() === l.toLowerCase());
 
+let RESEARCH_RUN = 0;   // run token: a rerun bumps it, so a slow earlier run's callbacks land dead
 function runResearch(addr) {
+  const run = ++RESEARCH_RUN;
   SETUP.address = addr || 'Your home'; SETUP.step = 2; SETUP.msg = 'Starting…'; render();
-  Research.run(SETUP.address, m => { SETUP.msg = m; const el = document.querySelector('.wz-live'); if (el) el.textContent = '◍ ' + m; })
+  Research.run(SETUP.address, m => { if (run !== RESEARCH_RUN) return; SETUP.msg = m; const el = document.querySelector('.wz-live'); if (el) el.textContent = '◍ ' + m; })
     .then(d => {
+      if (run !== RESEARCH_RUN) return;   // a newer run owns SETUP now — drop this stale result
       SETUP.detected = d;
       SETUP.selected = new Set(d.features.map(f => f.key));   // detected = inferred → all pre-selected
       SETUP.extras = buildExtras(d.features);                 // everything else in the catalog → off until turned on

@@ -1,3 +1,7 @@
+# 0.3.12
+
+- **Restarting an address search can't be hijacked by the first try**: if you rerun the Create-a-Home research while a slow earlier attempt is still thinking, the old attempt's late answer is now dropped instead of overwriting the new one.
+
 # 0.3.11
 
 - **The watch picker now looks at the whole appliance, not just the linked device**: an Eight Sleep "Side" is the device your asset links to, but "needs priming" lives on the pod's hub · discovery now follows the device family (hub ↔ sides) so those sensors show up in the picker instead of "No problem sensors found".
