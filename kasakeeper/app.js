@@ -971,7 +971,9 @@ function chatSuggestionGroups() {
 
 function viewChat() {
   const bubbles = CHAT.messages.map((m, mi) => {
-    const body = esc(m.content).replace(/\n/g, '<br>');
+    // Replies arrive with light markdown emphasis — render **bold** as bold, not literal
+    // asterisks. Runs AFTER esc, so the swap only ever operates on already-safe text.
+    const body = esc(m.content).replace(/\*\*([^*\n]+)\*\*/g, '<b>$1</b>').replace(/\n/g, '<br>');
     const chg = (m.changes && m.changes.length)
       ? `<div class="chat-changes">${m.changes.map(c => `✓ ${esc(c)}`).join('<br>')}</div>` : '';
     // Grounding: what the reply was based on — the usage-tracked entities + their live state.
@@ -2539,7 +2541,50 @@ function tradeTemplates(p) {
   return out.slice(0, 4);
 }
 
-function composeEnquiry({ quoteId, providerId, to, cc, subject, body, sendLabel, templates, onSent }) {
+// Native prompt()/confirm() break the Night/Paper look with OS chrome — on the wall
+// tablet an unstyled system box reads as "the app crashed", and on a phone PWA it
+// renders inconsistently. These reuse the .kk-modal shell composeEnquiry already
+// uses, and return promises so call sites keep reading top-to-bottom.
+function kkModal(inner, { onOpen, resolveOn } = {}) {
+  // Native prompt() blocked the thread, so a double-tap could never open two of them.
+  // These don't block, so an impatient second tap on ✓ Done would open a second dialog
+  // and log the job twice. One dialog at a time; the duplicate trigger resolves null.
+  // (Scoped to .kk-dialog so the template confirm nested inside composeEnquiry's own
+  // .kk-modal still opens.)
+  if (document.querySelector('.kk-dialog')) return Promise.resolve(null);
+  return new Promise(resolve => {
+    const wrap = document.createElement('div');
+    wrap.className = 'kk-modal kk-dialog';
+    wrap.innerHTML = `<div class="kk-modal-card" role="dialog" aria-modal="true">${inner}</div>`;
+    document.body.appendChild(wrap);
+    const close = v => { wrap.remove(); document.removeEventListener('keydown', key); resolve(v); };
+    const key = e => { if (e.key === 'Escape') close(null); };
+    document.addEventListener('keydown', key);
+    wrap.addEventListener('click', e => {
+      if (e.target === wrap) return close(null);            // backdrop tap cancels
+      const b = e.target.closest('[data-kk]'); if (!b) return;
+      close(b.getAttribute('data-kk') === 'ok' ? (resolveOn ? resolveOn(wrap) : true) : null);
+    });
+    if (onOpen) onOpen(wrap);
+  });
+}
+// true / null (null = cancelled), so `if (!await kkConfirm(...)) return;` reads naturally.
+const kkConfirm = (message, { okLabel = 'OK', danger = false } = {}) => kkModal(
+  `<div class="kk-modal-h">${esc(message)}</div>
+   <div class="kk-modal-b"><button class="btn" data-kk="cancel">Cancel</button>
+     <button class="btn ${danger ? '' : 'primary'}" data-kk="ok" ${danger ? 'style="color:var(--red)"' : ''}>${esc(okLabel)}</button></div>`);
+// The typed string, or null if cancelled.
+const kkPrompt = (label, value = '', { okLabel = 'Save', type = 'text', hint = '' } = {}) => kkModal(
+  `<div class="kk-modal-h">${esc(label)}</div>
+   ${hint ? `<div class="kk-note" style="margin-bottom:8px">${esc(hint)}</div>` : ''}
+   <input class="kk-i" id="kk_p" type="${esc(type)}" value="${esc(String(value ?? ''))}" autocomplete="off">
+   <div class="kk-modal-b"><button class="btn" data-kk="cancel">Cancel</button>
+     <button class="btn primary" data-kk="ok">${esc(okLabel)}</button></div>`,
+  { onOpen: w => { const i = w.querySelector('#kk_p'); i.focus(); i.select();
+      i.addEventListener('keydown', e => { if (e.key === 'Enter') w.querySelector('[data-kk="ok"]').click(); }); },
+    resolveOn: w => w.querySelector('#kk_p').value });
+
+function composeEnquiry({ quoteId, providerId, to, cc, subject, body, sendLabel, templates, onSent, draftKind }) {
   const wrap = document.createElement('div');
   wrap.className = 'kk-modal';
   wrap.innerHTML = `<div class="kk-modal-card" role="dialog" aria-modal="true">
@@ -2567,7 +2612,7 @@ function composeEnquiry({ quoteId, providerId, to, cc, subject, body, sendLabel,
   const draftOn = () => quoteId ? Store.quote(quoteId) : (providerId ? Store.provider(providerId) : null);
   const saveDraft = () => {
     const o = draftOn(); if (!o) return;
-    o.draft = { to: val('cm_to'), cc: val('cm_cc'), subject: val('cm_su'), body: val('cm_bo'), sendLabel: sendLabel || 'Send' };
+    o.draft = { to: val('cm_to'), cc: val('cm_cc'), subject: val('cm_su'), body: val('cm_bo'), sendLabel: sendLabel || 'Send', kind: draftKind || '' };
     quoteId ? Store.upsertQuote(o) : Store.upsertProvider(o); Store.push && Store.push();
   };
   const clearDraft = () => { const o = draftOn(); if (!o || !o.draft) return;
@@ -2580,7 +2625,7 @@ function composeEnquiry({ quoteId, providerId, to, cc, subject, body, sendLabel,
     if (ti !== null && ti !== undefined) {
       const t = templates[+ti]; if (!t) return;
       const cur = val('cm_bo');
-      if (cur && cur !== applied.trim() && !confirm('Replace what you have written with the "' + t.label + '" wording?')) return;
+      if (cur && cur !== applied.trim() && !await kkConfirm('Replace what you have written with the "' + t.label + '" wording?', { okLabel: 'Replace' })) return;
       document.getElementById('cm_su').value = t.subject;
       document.getElementById('cm_bo').value = t.body;
       applied = t.body; saveDraft(); return;
@@ -2632,7 +2677,7 @@ document.addEventListener('click', async e => {
     case 'set-variant': {
       const a = Store.asset(id), svc = Catalog.get(+node.getAttribute('data-svc')), v = node.getAttribute('data-var');
       if (!a || a.variant === v) return;
-      if (!confirm(`Set “${a.name}” to ${v} and use that schedule?`)) return;
+      if (!await kkConfirm(`Set “${a.name}” to ${v} and use that schedule?`, { okLabel: 'Set it' })) return;
       a.variant = v; Store.upsertAsset(a);
       Store.tasksFor(a.id).forEach(t => Store.deleteTask(t.id));
       Catalog.tasksFor(svc, v).forEach(t => Store.upsertTask({ ...t, assetId: a.id }));
@@ -2727,8 +2772,13 @@ document.addEventListener('click', async e => {
                  : Store.homeProviders().find(p => p.name === q.provider);
       return composeEnquiry({ quoteId: q.id, to: d.to, cc: d.cc, subject: d.subject, body: d.body, sendLabel: d.sendLabel,
         onSent: async ({ to: t, subject: su }) => {
-          q.status = 'enquiry_sent'; q.token = 'KK-' + q.id; q.channel = 'email';
-          q.enquiryTo = t; q.enquirySentAt = todayISO(); Store.upsertQuote(q);
+          // A REPLY draft continues an answered thread — sending it must not rewind a
+          // priced quote to "awaiting reply". Only the first enquiry sets that state.
+          if (d.kind !== 'reply') {
+            q.status = 'enquiry_sent'; q.enquirySentAt = todayISO();
+          }
+          q.token = q.token || ('KK-' + q.id); q.channel = 'email';
+          q.enquiryTo = q.enquiryTo || t; Store.upsertQuote(q);
           if (prov) Store.addMail({ providerId: prov.id, quoteId: q.id, date: todayISO(),
             from: 'me', subject: su, snippet: (d.body || '').split('\n').filter(Boolean)[1] || '', direction: 'out' });
           await Store.push(); toast('Sent — watching for the reply'); go('/providers');
@@ -2740,10 +2790,10 @@ document.addEventListener('click', async e => {
       const q = Store.quote(id); if (!q) return;
       const to = q.replyFrom || q.enquiryTo; if (!to) return;
       const subject = `Re: ${q.trade || 'your quote'}${q.token ? ` [${q.token}]` : ''}`;
-      return composeEnquiry({ quoteId: q.id, to, subject, body: '', sendLabel: 'Send reply',
+      return composeEnquiry({ quoteId: q.id, to, subject, body: '', sendLabel: 'Send reply', draftKind: 'reply',
         onSent: () => { toast('Reply sent · watching for their answer'); render(); } });
     }
-    case 'quote-amount': { const q = Store.quote(id); if (!q) return; const amt = prompt('Quoted amount ($)?', q.amount || ''); if (amt === null) return; q.amount = Number(amt) || 0; q.status = 'quoted'; Store.upsertQuote(q); return render(); }
+    case 'quote-amount': { const q = Store.quote(id); if (!q) return; const amt = await kkPrompt('Quoted amount ($)', q.amount || '', { type: 'number' }); if (amt === null) return; q.amount = Number(amt) || 0; q.status = 'quoted'; Store.upsertQuote(q); return render(); }
     case 'quote-book': return go('/book/' + id);   // capture the date, log it, draft the confirmation
     case 'confirm-date': {  // auto-book: user picks one of the offered dates -> approved confirmation email
       const q = Store.quote(id); if (!q) return;
@@ -2771,7 +2821,7 @@ document.addEventListener('click', async e => {
       if (to) location.href = `mailto:${to}?subject=${encodeURIComponent(subject)}&body=${encodeURIComponent(body)}`;
       finalize(); toast('Booked — ' + date); return render();
     }
-    case 'del-quote': if (confirm('Remove this quote request?')) { Store.deleteQuote(id); return render(); } return;
+    case 'del-quote': if (await kkConfirm('Remove this quote request?', { okLabel: 'Remove', danger: true })) { Store.deleteQuote(id); return render(); } return;
     case 'setup': SETUP = { step:1, address:'', msg:'', detected:null, selected:new Set(), extras:[], testMode:false, selectedImage:null }; delete IMAGERY.setup; return go('/setup');
     case 'research-home': SETUP.testMode = !!document.getElementById('wz_test')?.checked; return runResearch(val('wz_addr'));
     case 'pick-addr': {
@@ -2838,7 +2888,7 @@ document.addEventListener('click', async e => {
     }
     case 'switch-home': Store.switchHome(id); return go('/');
     case 'del-home':
-      if (confirm('Delete this home and all its assets?')) { Store.deleteHome(id); return Store.state.currentHomeId ? go('/') : go('/setup'); }
+      if (await kkConfirm('Delete this home and all its assets?', { okLabel: 'Delete home', danger: true })) { Store.deleteHome(id); return Store.state.currentHomeId ? go('/') : go('/setup'); }
       return;
     case 'toggle-imagery': { IMG_OPEN.has(id) ? IMG_OPEN.delete(id) : IMG_OPEN.add(id); return render(); }
     case 'pick-image': {
@@ -2997,7 +3047,7 @@ document.addEventListener('click', async e => {
     case 'call': { const p = Store.provider((Store.asset(id)||{}).providerId); if (p?.phone) location.href = 'tel:'+p.phone.replace(/\s/g,''); else if (Store.asset(id)) findService(id); return; }
     case 'done': {
       const t = Store.state.tasks.find(x=>x.id===id); if (!t) return render();
-      const c = prompt('Log this as done. Cost ($)?', t.estCost || 0);
+      const c = await kkPrompt('Log this as done', t.estCost || 0, { okLabel: 'Log it', type: 'number', hint: 'Cost ($) · leave as-is or clear it if there was none.' });
       if (c === null) return;
       Store.markDone(id, c);
       const a = Store.asset(t.assetId);
@@ -3047,7 +3097,7 @@ document.addEventListener('click', async e => {
       return go('/asset/' + assetId);
     }
     case 'del-job':
-      if (confirm('Remove this job from the history?')) { Store.deleteLog(id); return go('/asset/' + node.getAttribute('data-asset')); }
+      if (await kkConfirm('Remove this job from the history?', { okLabel: 'Remove', danger: true })) { Store.deleteLog(id); return go('/asset/' + node.getAttribute('data-asset')); }
       return;
     case 'track-usage': return go('/edit-usage/' + id);
     case 'save-usage': {
@@ -3065,7 +3115,7 @@ document.addEventListener('click', async e => {
       USAGE.t = 0;
       return go('/asset/' + id);
     }
-    case 'reset-usage': { if (!confirm('Reset the usage counter (mark as just serviced)?')) return; await Store.resetUsage(id); USAGE.t = 0; delete USAGE.map[id]; return render(); }
+    case 'reset-usage': { if (!await kkConfirm('Reset the usage counter (mark as just serviced)?', { okLabel: 'Reset' })) return; await Store.resetUsage(id); USAGE.t = 0; delete USAGE.map[id]; return render(); }
     case 'stop-usage': { const a = Store.asset(id); if (a) { delete a.usage; Store.upsertAsset(a); USAGE.t = 0; } return render(); }
     case 'watch-open': {   // asset card → problem-sensor picker (device-initiated maintenance)
       const a = Store.asset(id); if (!a || !a.ha || !a.ha.deviceId) return render();
@@ -3155,13 +3205,14 @@ document.addEventListener('click', async e => {
     case 'unuse-pack': { Store.usePack(id, -1); await Store.push(); return render(); }
     case 'edit-pack': {
       const a = Store.asset(id), p = a.pack || {};
-      const bought = prompt(`How many services did you buy for ${a.name}?\n(0 removes the pack)`, p.bought || '');
+      const bought = await kkPrompt(`How many services did you buy for ${a.name}?`, p.bought || '',
+        { type: 'number', hint: '0 removes the pack' });
       if (bought === null) return;
       const n = parseInt(bought, 10) || 0;
       if (!n) { Store.setPack(id, null); await Store.push(); toast('Pack removed'); return render(); }
-      const used = parseInt(prompt('How many have you used so far?', p.used || 0), 10) || 0;
-      const cost = parseFloat(prompt('What did the whole block cost? ($, blank to skip)', p.cost || '')) || 0;
-      const when = prompt('When did you buy it? (YYYY-MM-DD, blank to skip)', p.purchasedOn || '') || '';
+      const used = parseInt(await kkPrompt('How many have you used so far?', p.used || 0, { type: 'number' }), 10) || 0;
+      const cost = parseFloat(await kkPrompt('What did the whole block cost?', p.cost || '', { type: 'number', hint: '$ · blank to skip' })) || 0;
+      const when = await kkPrompt('When did you buy it?', p.purchasedOn || '', { type: 'date', hint: 'Blank to skip' }) || '';
       Store.setPack(id, { bought: n, used: Math.min(used, n), cost, purchasedOn: when.trim(),
                           unit: p.unit || 'visit', note: p.note || '' });
       await Store.push(); toast('Service pack saved'); return render();
@@ -3180,11 +3231,11 @@ document.addEventListener('click', async e => {
     case 'del-provider': {
       const p = Store.provider(id); if (!p) return go('/providers');
       const linked = Store.homeAssets().filter(a => a.providerId === id).length;
-      const msg = `Delete ${p.name || 'this provider'}?` + (linked ? `\nThey're linked to ${linked} asset${linked>1?'s':''} — those will be unlinked (assets kept).` : '');
-      if (confirm(msg)) { Store.deleteProvider(id); return go('/providers'); }
+      const msg = `Delete ${p.name || 'this provider'}?` + (linked ? ` They're linked to ${linked} asset${linked>1?'s':''} · those will be unlinked (assets kept).` : '');
+      if (await kkConfirm(msg, { okLabel: 'Delete', danger: true })) { Store.deleteProvider(id); return go('/providers'); }
       return;
     }
-    case 'del-asset': if (confirm('Delete this asset and its tasks?')) { Store.deleteAsset(id); return go('/assets'); } return;
+    case 'del-asset': if (await kkConfirm('Delete this asset and its tasks?', { okLabel: 'Delete asset', danger: true })) { Store.deleteAsset(id); return go('/assets'); } return;
     case 'del-task': {
       const t = Store.state.tasks.find(x => x.id === id);
       // A device-raised task with its sensor still watched would be re-raised
@@ -3192,13 +3243,13 @@ document.addEventListener('click', async e => {
       if (t && t.fault) {
         const a = Store.asset(t.assetId);
         const stillWatched = !!(a && a.ha && (a.ha.watch || []).some(w => w.entity === t.fault.entity));
-        if (!confirm(stillWatched
-          ? `The device raised this task and its "${t.fault.label}" sensor is still being watched — deleting it also stops watching that sensor. (Snooze instead to keep watching.) Delete?`
-          : 'Delete this task?')) return;
+        if (!await kkConfirm(stillWatched
+          ? `The device raised this task and its “${t.fault.label}” sensor is still being watched · deleting it also stops watching that sensor. Snooze instead to keep watching.`
+          : 'Delete this task?', { okLabel: 'Delete task', danger: true })) return;
         if (stillWatched) Store.setWatch(a.id, (a.ha.watch || []).filter(w => w.entity !== t.fault.entity));
         Store.deleteTask(id); return go('/asset/' + node.getAttribute('data-asset'));
       }
-      if (confirm('Delete this task?')) { Store.deleteTask(id); return go('/asset/' + node.getAttribute('data-asset')); } return;
+      if (await kkConfirm('Delete this task?', { okLabel: 'Delete task', danger: true })) { Store.deleteTask(id); return go('/asset/' + node.getAttribute('data-asset')); } return;
     }
     case 'buy': {
       const a = Store.asset(id); if (!a) return;
@@ -3234,7 +3285,7 @@ document.addEventListener('click', async e => {
       toast(j.detail || 'Done.');
       return render();
     }
-    case 'del-task-inline': if (confirm('Delete this task permanently?')) { Store.deleteTask(id); return render(); } return;
+    case 'del-task-inline': if (await kkConfirm('Delete this task permanently?', { okLabel: 'Delete', danger: true })) { Store.deleteTask(id); return render(); } return;
     case 'set-theme': { localStorage.setItem(THEME_KEY, node.getAttribute('data-theme') || 'auto'); applyTheme(); return render(); }
     case 'save-manual': {   // vault the manual: server fetches the PDF onto /data; flag syncs to every device
       const a = Store.asset(id); if (!a || !a.manualUrl) return render();
@@ -3408,7 +3459,7 @@ document.addEventListener('click', async e => {
       return;
     }
     case 'ha-unlink': {
-      if (!confirm('Unlink this asset from Home Assistant? It stays as a regular asset — nothing else changes.')) return;
+      if (!await kkConfirm('Unlink this asset from Home Assistant? It stays as a regular asset · nothing else changes.', { okLabel: 'Unlink' })) return;
       await Store.syncRemote();   // BEFORE reading — another device may have edited or deleted this asset since the scan
       const a = Store.asset(id); if (!a) return;   // gone (or never existed) — nothing to unlink
       delete a.ha;
@@ -3633,7 +3684,7 @@ document.addEventListener('click', async e => {
     case 'clear-ha-remote': {
       const homeId = id;
       if (!Store.state.homes.find(x => x.id === homeId)) return;
-      if (!confirm("Disconnect this remote Home Assistant? The saved token is deleted from the server.")) return;
+      if (!await kkConfirm('Disconnect this remote Home Assistant? The saved token is deleted from the server.', { okLabel: 'Disconnect', danger: true })) return;
       fetch('api/ha/token', { method:'POST', headers:{'Content-Type':'application/json'},
         body: JSON.stringify({ homeId, url:'', token:'' }) })
         .then(res => res.json()).then(j => {
@@ -3708,7 +3759,7 @@ document.addEventListener('click', async e => {
     }
     // Honest destructive copy: there is no "sample house" — this empties the store,
     // and the shared-store sync propagates the wipe to every device.
-    case 'reset': if (confirm('Erase everything? This permanently deletes all homes, assets, tasks, quotes and history — on every device, since KasaKeeper syncs your data. This cannot be undone.')) { Store.reset(); return go('/'); } return;
+    case 'reset': if (await kkConfirm('Erase everything? This permanently deletes all homes, assets, tasks, quotes and history on every device, since KasaKeeper syncs your data. This cannot be undone.', { okLabel: 'Erase everything', danger: true })) { Store.reset(); return go('/'); } return;
   }
 });
 

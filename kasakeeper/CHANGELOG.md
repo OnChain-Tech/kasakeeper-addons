@@ -1,3 +1,17 @@
+# 0.3.14
+
+- **No more system pop-ups.** Every confirmation and every "how much did it cost?" now uses KasaKeeper's own dark (or Paper) dialog instead of the browser's grey OS box · twenty of them, from marking a job done to erasing everything. Destructive choices are labelled and red ("Delete asset", not "OK"), Escape and a tap outside both cancel, and Enter accepts. On the wall tablet a system dialog looked like the app had crashed; now it looks like the app.
+
+# 0.3.13
+
+Security and correctness pass over the quote email loop, from a full review of this week's releases.
+
+- **Only the real trade can fill in your quote card.** Reply matching is now a true ladder (exact sender → the address we wrote to → their domain), every hit is verified against the message's real sender rather than a header substring, free-mail domains are never used as a domain match, and a message already belonging to another quote's thread is left alone. A stranger who knows the KasaKeeper mailbox address can no longer stage a quote, a price, or their own address behind the Reply button.
+- **Quote tokens are validated** before they ever reach the mail server, and rejected at the store boundary.
+- **One reply, one notification** · a busy moment can no longer turn a single trade reply into a burst of duplicate pushes.
+- **Replying no longer rewinds a quote**: sending an in-app reply on a priced quote keeps the price and the state instead of dropping it back to "awaiting reply".
+- Amounts parsed out of email are coerced properly ("$250" no longer becomes $0), and email-derived text is length-bounded everywhere it's stored or shown.
+- New offline test suite `tools/test-quote-matching.py` covers seventeen matching and parsing cases, including the attack scenarios above.
 # 0.3.12
 
 - **Restarting an address search can't be hijacked by the first try**: if you rerun the Create-a-Home research while a slow earlier attempt is still thinking, the old attempt's late answer is now dropped instead of overwriting the new one.

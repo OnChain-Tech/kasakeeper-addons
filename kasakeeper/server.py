@@ -1535,6 +1535,12 @@ def _imap_replies_for_tokens(tokens):
         m.login(user, pwd)
         m.select("INBOX", readonly=True)
         for tok in tokens:
+            # `token` comes from the shared store, which any ingress client can write.
+            # imaplib does NO arg validation — a quote or CRLF here would break out of
+            # the quoted atom and inject raw IMAP commands (defeating readonly=True).
+            if not _re.fullmatch(r"KK-[A-Za-z0-9_-]{1,40}", tok):
+                print("[quote] skipping malformed token")
+                continue
             typ, data = m.uid("SEARCH", None, "SUBJECT", '"%s"' % tok)
             if typ != "OK" or not data or not data[0]:
                 continue
@@ -1598,6 +1604,27 @@ def _imap_replies_from(senders):
         except Exception: pass
     return out
 
+def _money(v):
+    """A model-emitted amount as a float, or None. '$250'/'250 AUD'/'1,349.00' all
+    parse; anything else is None so a bad parse shows nothing rather than '$0'."""
+    if v is None or isinstance(v, bool):
+        return None
+    if isinstance(v, (int, float)):
+        return float(v)
+    m = _re.search(r"-?[0-9][0-9,]*(?:\.[0-9]+)?", str(v))
+    try:
+        return float(m.group(0).replace(",", "")) if m else None
+    except Exception:
+        return None
+
+def _short(v, n):
+    """Email-derived text, bounded and single-line. The body is third-party content:
+    an injected reply could otherwise stuff kilobytes of prose (or newlines that read
+    as new instructions downstream) into a field the UI and chat context both use."""
+    if v is None:
+        return None
+    return _re.sub(r"\s+", " ", str(v)).strip()[:n] or None
+
 def poll_quote_replies():
     """One poll cycle: match INBOX replies to enquiry_sent quotes, parse, update the store."""
     if not gmail_available():
@@ -1621,46 +1648,89 @@ def poll_quote_replies():
             uid, msgid, frm, ts, body = msgs[-1]
             newest[qid] = {"msgid": msgid, "from": frm, "body": body, "ts": ts}
     # Sender fallback: trades drop the [KK-] token constantly (fresh emails, edited
-    # subjects, a different mailbox on the same domain). Tiered search per quote:
-    # exact replyFrom → the enquiryTo we wrote to → anyone @ that domain. Domain-tier
-    # hits must also LOOK like job mail so a newsletter can't hijack the card.
+    # subjects, a different mailbox on the same domain), and the owner forwards mail
+    # that reached their personal inbox. A TRUE LADDER, most-specific first: the exact
+    # address we last heard from → the address we wrote to → anyone @ that domain.
+    # The first tier that yields a message wins; later tiers never run for that quote.
+    #
+    # SECURITY (a stranger who learns this mailbox address must not be able to write a
+    # quote card or put their address behind the Reply button):
+    #  · IMAP SEARCH is a substring match on the raw header, so every hit is re-checked
+    #    against the parsed envelope From — display names cannot supply the address.
+    #  · Free-mail domains never become a domain term (this mailbox IS gmail.com, so
+    #    "@gmail.com" would match the entire inbox).
+    #  · Every fallback tier must clear the job-mail relevance gate, not just tier 3.
+    #  · A message carrying a DIFFERENT quote's [KK-] token belongs to that quote, and
+    #    one message can never be claimed by two quotes in the same cycle.
     by_qid = {q["id"]: q for q in st["quotes"]}
+    all_tokens = {str(q.get("token") or "") for q in st["quotes"] if q.get("token")}
+    claimed = {info["msgid"] for info in newest.values() if info.get("msgid")}
+    FREEMAIL = {"gmail.com", "googlemail.com", "outlook.com", "hotmail.com", "live.com",
+                "yahoo.com", "yahoo.com.au", "icloud.com", "me.com", "bigpond.com",
+                "bigpond.net.au", "optusnet.com.au", "iinet.net.au", "proton.me", "protonmail.com"}
+    own_addrs = {(_gmail_creds() or ("", ""))[0].lower(),
+                 str(((st.get("settings") or {}).get("emailCc") or "")).lower()} - {""}
+
+    def _tiers_for(q):
+        """[(search_term, verifier)] most-specific first; verifier(from_addr) -> bool."""
+        out, seen = [], set()
+        for a in ((q.get("replyFrom") or ""), (q.get("enquiryTo") or "")):
+            a = a.strip().lower()
+            if a and "@" in a and a not in seen:
+                seen.add(a)
+                out.append((a, (lambda addr: (lambda f: f == addr or f in own_addrs))(a)))
+        for a in list(seen):
+            dom = a.split("@", 1)[1]
+            if dom in FREEMAIL or "@" + dom in seen:
+                continue
+            seen.add("@" + dom)
+            out.append(("@" + dom, (lambda d: (lambda f: f.endswith("@" + d) or f in own_addrs))(dom)))
+        return out
+
     pending = {}
     for tok, qid in watched.items():
         q = by_qid.get(qid) or {}
         cur = newest.get(qid)
         if cur and cur["msgid"] != q.get("lastReplyId"):
-            continue  # token search already found something new
-        terms = []
-        for a in ((q.get("replyFrom") or ""), (q.get("enquiryTo") or "")):
-            a = a.strip().lower()
-            if a and a not in terms:
-                terms.append(a)
-        for d in ["@" + a.split("@", 1)[1] for a in list(terms) if "@" in a]:
-            if d not in terms:
-                terms.append(d)
-        if terms:
-            pending[qid] = terms
+            continue  # token search already found something new for this quote
+        tiers = _tiers_for(q)
+        if tiers:
+            pending[qid] = tiers
     if pending:
-        found = _imap_replies_from(sorted({t for ts_ in pending.values() for t in ts_}))
-        for qid, terms in pending.items():
+        found = _imap_replies_from(sorted({t for tiers in pending.values() for t, _ in tiers}))
+        for qid, tiers in pending.items():
             q = by_qid.get(qid) or {}
             gate_words = [w.lower() for w in ("quote", "booking", "invoice", "job", "deposit",
-                          (q.get("provider") or "").split(" ")[0], (q.get("trade") or "").split(" ")[0]) if w]
+                          (q.get("provider") or "").split(" ")[0], (q.get("trade") or "").split(" ")[0])
+                          if w and len(w) > 2]
+            other_tokens = all_tokens - {str(q.get("token") or "")}
             best = None
-            for t in terms:
-                for r in (found.get(t) or []):
-                    if not r[1] or r[1] == q.get("lastReplyId"):
+            for term, verify in tiers:
+                for r in (found.get(term) or []):
+                    msgid, frm, ts, body = r[1], r[2], r[3], (r[4] or "")
+                    if not msgid or msgid == q.get("lastReplyId") or msgid in claimed:
                         continue
-                    if t.startswith("@") and not any(w in (r[4] or "").lower() for w in gate_words):
-                        continue  # domain-wide hit with no job-ish content — ignore
-                    if best is None or r[3] > best[3]:
+                    # parseaddr, NOT the addr regex: `From: "bob@trade.com" <evil@x>`
+                    # would otherwise verify against the DISPLAY NAME (first regex hit)
+                    # while the mail actually came from the attacker.
+                    sender = (emaillib.utils.parseaddr(frm)[1] or "").strip().lower()
+                    if not sender or not verify(sender):
+                        continue  # header substring matched but the real sender doesn't
+                    low = body.lower()
+                    if any(t.lower() in low for t in other_tokens):
+                        continue  # this message belongs to a different quote's thread
+                    if not any(w in low for w in gate_words):
+                        continue  # nothing job-shaped in it — not this conversation
+                    if best is None or ts > best[3]:
                         best = r
+                if best:
+                    break  # a more specific tier answered — never fall further down
             if best:
                 uid, msgid, frm, ts, body = best
                 prev = newest.get(qid)
                 if not prev or ts >= (prev.get("ts") or 0):
                     newest[qid] = {"msgid": msgid, "from": frm, "body": body, "ts": ts}
+                    claimed.add(msgid)
     # drop entries that are just the already-processed message again
     newest = {qid: info for qid, info in newest.items()
               if info["msgid"] != (by_qid.get(qid) or {}).get("lastReplyId")}
@@ -1676,6 +1746,9 @@ def poll_quote_replies():
 
     def mutator(state):
         changed = False
+        # state_mutate re-runs this on rev contention — without clearing, a single
+        # reply would push once per retry (same reason fault_scan clears `raised`).
+        notify.clear()
         for q in state.get("quotes", []):
             if q["id"] not in parsed:
                 continue
@@ -1686,7 +1759,7 @@ def poll_quote_replies():
             q["repliedAt"] = time.strftime("%Y-%m-%d")
             # A forwarded reply arrives FROM the owner — keep the trade's address
             # as the reply-to target, never the household's own.
-            _sender = _email_addr(info["from"]) or ""
+            _sender = emaillib.utils.parseaddr(info["from"])[1] or ""
             _own = {(_gmail_creds() or ("", ""))[0].lower(),
                     str(((state.get("settings") or {}).get("emailCc") or "")).lower()}
             if _sender and _sender.lower() not in _own:
@@ -1695,16 +1768,16 @@ def poll_quote_replies():
                      if str(d).strip()][:5]
             if dates:
                 q["offeredDates"] = dates
-            if res and res.get("is_quote") and res.get("amount") is not None:
-                q["amount"] = res["amount"]
+            if res and res.get("is_quote") and _money(res.get("amount")) is not None:
+                q["amount"] = _money(res["amount"])
                 q["currency"] = "AUD"
-                q["availability"] = res.get("availability")
+                q["availability"] = _short(res.get("availability"), 60)
                 q["status"] = "quoted"
-                q["replyNote"] = res.get("summary")
+                q["replyNote"] = _short(res.get("summary"), 200)
                 q["autoParsed"] = True
                 q["isEstimate"] = bool(res.get("amount_is_estimate"))
             else:
-                q["replyNote"] = (res or {}).get("summary") or "Reply received — no price yet."
+                q["replyNote"] = _short((res or {}).get("summary"), 200) or "Reply received — no price yet."
                 q["needsSiteVisit"] = bool((res or {}).get("needs_site_visit"))
                 # A reply that parses to neither price nor dates must still leave
                 # "awaiting reply" — the trade answered, the user just has to read it.
@@ -1712,12 +1785,13 @@ def poll_quote_replies():
                     q["status"] = "replied"
             # Payments already made (deposits) are facts, not decisions — record the
             # typed fields so the card can show them; nothing books or sends off them.
-            if res and res.get("paid_amount") is not None:
-                q["paidAmount"] = res["paid_amount"]
+            # Coerced: the model can emit "$250"/"250 AUD", which would render as $0.
+            if res and _money(res.get("paid_amount")) is not None:
+                q["paidAmount"] = _money(res["paid_amount"])
                 if res.get("paid_receipt"):
-                    q["paidReceipt"] = str(res["paid_receipt"])[:40]
-            if res and res.get("balance_due") is not None:
-                q["balanceDue"] = res["balance_due"]
+                    q["paidReceipt"] = _short(res["paid_receipt"], 40)
+            if res and _money(res.get("balance_due")) is not None:
+                q["balanceDue"] = _money(res["balance_due"])
             if dates and q.get("status") in ("enquiry_sent", "replied", "quoted"):
                 q["status"] = "dates_offered"  # dates in hand — user picks one to confirm
             who = q.get("provider") or "A trade"
@@ -1875,7 +1949,9 @@ def autobook_scan():
         ha_notify("KasaKeeper — auto-book",
                   f"Emailed {p.get('name')} to book “{t.get('title')}” — I'll ping you when dates come back.",
                   a.get("homeId"))
-        print(f"[autobook] enquiry sent for {t.get('title')!r} -> {to} token={token}")
+        # The token is the credential for token-tier reply matching — log the quote
+        # id instead; add-on logs get pasted into support threads.
+        print(f"[autobook] enquiry sent for {t.get('title')!r} -> {to} quote={qid}")
 
 def _autobook_loop():
     time.sleep(120)  # let the add-on (and HA proxy) settle after boot
@@ -3058,7 +3134,12 @@ def _chat_context(state):
         if p.get("archived"):
             d["archived"] = True          # past provider — don't recommend for new work
         out_provs.append(d)
-    quotes = [{k: q.get(k) for k in ("trade", "provider", "status", "amount", "availability") if q.get(k)}
+    # `availability` is parsed out of third-party email, and HOME DATA lands in the
+    # chat SYSTEM prompt — injected prose there would read as instructions to a
+    # tool-enabled agent. It is already bounded at write time; bound it again here
+    # (defence in depth) rather than trusting rows written by an older build.
+    quotes = [{k: (_short(q.get(k), 60) if k == "availability" else q.get(k))
+               for k in ("trade", "provider", "status", "amount", "availability") if q.get(k)}
               for q in state.get("quotes", []) if q.get("homeId") == hid]
     return {"today": time.strftime("%Y-%m-%d"),
             "home": {k: v for k, v in {"address": home.get("address"), "beds": home.get("beds"),
@@ -3827,6 +3908,15 @@ class Handler(SimpleHTTPRequestHandler):
             if isinstance(state.get("settings"), dict):
                 state["settings"].pop("haToken", None)
                 state["settings"].pop("haUrl", None)
+            # A quote token is interpolated into an IMAP SEARCH atom by the poller.
+            # Reject malformed ones at the boundary too, so a bad token can never be
+            # persisted (the poller skips them, but stored junk would silently stop
+            # that quote's replies from ever matching).
+            for _q in state.get("quotes", []):
+                if isinstance(_q, dict) and _q.get("token") is not None and not (
+                        isinstance(_q["token"], str)
+                        and re.fullmatch(r"KK-[A-Za-z0-9_-]{1,40}", _q["token"])):
+                    return self._send_json({"error": "malformed quote token"}, 400)
             ok, doc = state_write(int(payload.get("baseRev") or 0), state)
             if ok:
                 return self._send_json({"ok": True, "rev": doc["rev"]})
