@@ -1,3 +1,9 @@
+# 0.3.17
+
+- **Ask now reads the manual before it answers.** Questions about an asset are grounded in its actual documentation: the saved copy in your vault wins, otherwise the asset's manual link is fetched — a PDF is consulted directly (and quietly saved to the vault for next time), a support page has its readable text extracted and cached for a week. Assets with a manual on file get a 📖 chip on grounded answers; assets without one get an honest "no manual on file" rather than a guess.
+- **Contact changes suggested in chat now wait for your ✓.** Because chat context can carry text from third parties, an Ask-suggested change to a provider's email, phone, or website is held as pending until you confirm it — same as sending an enquiry.
+- Under the hood: every URL the server is asked to fetch — stored manual links, saved documents, and the reachability probe behind order links on consumable faults — now goes through one hardened fetcher that refuses private and internal addresses even when a public-looking hostname points at them, re-checks every redirect, and bounds how much it reads.
+
 # 0.3.16
 
 - **Home Assistant knows where things are, so KasaKeeper stops asking.** An asset linked to an HA device now shows that device's area — on the asset, in lists, on task cards — labelled 📍 via Home Assistant. Move a device to another room in HA and KasaKeeper follows, with no import and no editing. Things HA can't know about (a wall, the gutters, a garden bed) keep their typed location, and an asset falls back to it whenever HA has no area, is unreachable, or the home isn't connected.

@@ -2186,7 +2186,13 @@ def _order_url_ok(url):
     """Structural + reachability sanity for a Claude-found product URL before it
     lands on a card the user will tap: https only, a real public hostname (no
     userinfo/IP-literals), and the page answers — bot-defence statuses (403/405/
-    429) count as alive, a 404 or DNS failure does not."""
+    429) count as alive, a 404 or DNS failure does not. The probe rides
+    _fetch_public, not _http_get: the hostname checks below are structural only,
+    and a public-looking name whose A record points into RFC1918 would otherwise
+    be connected to — with the bool answer doubling as an internal port-scan
+    oracle. max_bytes is tiny on purpose ('too large' still proves a real page
+    answered — we never want the body), hops=1 covers the single vendor-CDN
+    redirect real product pages use."""
     try:
         p = urllib.parse.urlparse(str(url))
         if p.scheme != "https" or not p.hostname or "@" in p.netloc:
@@ -2201,10 +2207,12 @@ def _order_url_ok(url):
     except Exception:
         return False
     try:
-        _http_get(str(url)[:500], timeout=12)
+        _fetch_public(str(url)[:500], 4096, timeout=12, hops=1, max_seconds=20)
         return True
-    except urllib.error.HTTPError as e:
-        return e.code in (403, 405, 429)   # bot-blocked but real
+    except ValueError as e:
+        m = str(e)
+        # 'too large' = a 2xx answered with more than our tiny cap — a live page.
+        return m == "that file is too large" or m in ("HTTP 403", "HTTP 405", "HTTP 429")
     except Exception:
         return False
 
