@@ -20,4 +20,4 @@ This is a thin *distribution* repository — each release, the add-on's runtime 
 
 - `kasakeeper/` — the KasaKeeper add-on (config.yaml, Dockerfile, server, frontend, docs).
 
-Current version: **0.3.14**.
+Current version: **0.3.16**.

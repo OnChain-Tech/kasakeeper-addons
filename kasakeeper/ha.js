@@ -91,9 +91,13 @@ const HA = {
 
   // Maintenance-relevant HA devices for the import screen. Never throws —
   // degrades to {available:false, devices:[]} so the caller always has shape.
-  async devices() {
+  // `homeId` is optional — omit it to fall back to the server's currentHomeId
+  // (every existing caller); pass it to resolve a SPECIFIC home explicitly
+  // (assetLocation()'s area cache, which must not drift onto whatever home
+  // happens to be current when the fetch lands).
+  async devices(homeId) {
     try {
-      const res = await fetch('api/ha/devices');
+      const res = await fetch('api/ha/devices' + (homeId ? '?homeId=' + encodeURIComponent(homeId) : ''));
       const j = await res.json();
       return { available: !!(j && j.available), devices: (j && j.devices) || [], everythingElse: (j && j.everythingElse) || [] };
     } catch { return { available: false, devices: [], everythingElse: [] }; }

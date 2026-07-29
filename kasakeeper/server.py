@@ -19,12 +19,15 @@ Run:
 With no key / no SDK it still serves the app and returns a sensible baseline
 home, so the UI always works.
 """
-import json, os, re, time, functools, threading, base64, urllib.request, urllib.parse, urllib.error, socket, ipaddress, http.client
+import json
+import math, os, re, time, functools, threading, base64, urllib.request, urllib.parse, urllib.error, socket, ipaddress, http.client
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 import pdfkit  # tiny stdlib PDF writer (repo-root module) — the home logbook export
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
-DATA_DIR = "/data" if os.path.isdir("/data") else ROOT       # /data = add-on persistent volume
+# /data = add-on persistent volume; KASA_DATA overrides it for staging/dev instances
+# that need an isolated data dir without touching the add-on volume or the repo root.
+DATA_DIR = os.getenv("KASA_DATA") or ("/data" if os.path.isdir("/data") else ROOT)
 
 def _load_env(root):
     """Load KEY=VALUE lines from a local .env (never overrides real env vars)."""
@@ -862,6 +865,29 @@ def state_read():
     except Exception:
         return {"rev": 0, "state": None}
 
+def _purge_ha_secrets_for_removed_homes(old_state, new_state):
+    """A deleted home must take its remote-HA token with it. kk-ha-secrets.json
+    is server-side only, so Store.deleteHome()'s cascade can't reach it — the
+    accepted state write is the one place the delete is observable. Diffs only
+    when the homes list actually shrank, so the common save never touches the
+    secrets file. Never raises: a purge failure must not fail the state write."""
+    try:
+        # A write with no homes list at all is "no signal", not "all homes gone" —
+        # the /api/state shape check tolerates a missing key, and treating it as a
+        # mass delete would irreversibly destroy every stored token.
+        if not isinstance((new_state or {}).get("homes"), list):
+            return
+        old_ids = {h.get("id") for h in (old_state or {}).get("homes") or [] if isinstance(h, dict)}
+        new_ids = {h.get("id") for h in (new_state or {}).get("homes") or [] if isinstance(h, dict)}
+        gone = old_ids - new_ids - {None}
+        if not gone:
+            return
+        _ha_secrets_update(lambda d: [d.pop(hid, None) for hid in gone])
+        for hid in gone:
+            print(f"[ha] token purged for deleted home={hid}")   # id only, never the token
+    except Exception as e:
+        print(f"[ha] secret purge on home delete failed: {e}")
+
 def state_write(base_rev, new_state):
     """Returns (ok, doc). ok=False means the caller was stale — doc is the server copy."""
     with _STATE_LOCK:
@@ -873,6 +899,9 @@ def state_write(base_rev, new_state):
         tmp = STATE_FILE + ".tmp"
         json.dump(doc, open(tmp, "w"))
         os.replace(tmp, STATE_FILE)  # atomic — a crash never corrupts the store
+        # Only after the delete is durable: a failed save must not cost a
+        # still-live home its token.
+        _purge_ha_secrets_for_removed_homes(cur.get("state"), new_state)
         return True, doc
 
 def ha_drift(home_id=None):
@@ -1609,11 +1638,15 @@ def _money(v):
     parse; anything else is None so a bad parse shows nothing rather than '$0'."""
     if v is None or isinstance(v, bool):
         return None
+    # NaN/inf must not pass: they survive arithmetic, render as "$nan"/"$inf", and a
+    # long-but-ordinary digit string overflows float() to inf on the regex path below.
     if isinstance(v, (int, float)):
-        return float(v)
+        f = float(v)
+        return f if math.isfinite(f) else None
     m = _re.search(r"-?[0-9][0-9,]*(?:\.[0-9]+)?", str(v))
     try:
-        return float(m.group(0).replace(",", "")) if m else None
+        f = float(m.group(0).replace(",", "")) if m else None
+        return f if (f is None or math.isfinite(f)) else None
     except Exception:
         return None
 
@@ -1624,6 +1657,82 @@ def _short(v, n):
     if v is None:
         return None
     return _re.sub(r"\s+", " ", str(v)).strip()[:n] or None
+
+# Free-mail domains must never become a domain search term: this mailbox IS a gmail
+# address, so "@gmail.com" would match the entire inbox.
+FREEMAIL_DOMAINS = {"gmail.com", "googlemail.com", "outlook.com", "hotmail.com", "live.com",
+                    "yahoo.com", "yahoo.com.au", "icloud.com", "me.com", "bigpond.com",
+                    "bigpond.net.au", "optusnet.com.au", "iinet.net.au", "proton.me", "protonmail.com"}
+
+def reply_search_tiers(q, own_addrs=()):
+    """[(search_term, verifier)] most-specific first: the address we last heard from →
+    the address we wrote to → anyone @ that domain. verifier(envelope_from) -> bool.
+    Module-level and pure so tools/test-quote-matching.py exercises the REAL ladder."""
+    if not isinstance(q, dict):
+        return []                     # a malformed store row must not wedge the poller
+    own = {str(a).lower() for a in own_addrs if a}
+    out, seen = [], set()
+    for a in ((q.get("replyFrom") or ""), (q.get("enquiryTo") or "")):
+        a = a.strip().lower()
+        if a and "@" in a and a not in seen:
+            seen.add(a)
+            out.append((a, (lambda addr: (lambda f: f == addr or f in own))(a)))
+    for a in list(seen):
+        dom = a.split("@", 1)[1]
+        if dom in FREEMAIL_DOMAINS or "@" + dom in seen:
+            continue
+        seen.add("@" + dom)
+        out.append(("@" + dom, (lambda d: (lambda f: f.endswith("@" + d) or f in own))(dom)))
+    return out
+
+def pick_reply(q, found, all_tokens=(), claimed=(), own_addrs=()):
+    """The newest message that genuinely belongs to THIS quote, or None.
+
+    `found` is {search_term: [(uid, msgid, from_header, ts, body), ...]}.
+    Security rules this enforces (each one regressed once — see tools/test-quote-matching.py):
+      · IMAP SEARCH is a substring match on the raw header, so every hit is re-verified
+        against the parsed envelope From. parseaddr, NOT the addr regex: the regex takes
+        the FIRST match, so `From: "bob@trade.com" <evil@x>` would verify as Bob.
+      · Tiers short-circuit — a more specific tier answering means later tiers never run.
+      · Every tier (not just the domain one) must clear the job-mail relevance gate.
+      · A message carrying a DIFFERENT quote's [KK-] token belongs to that quote, and one
+        message is never claimed by two quotes in the same cycle.
+    """
+    gate_words = [w.lower() for w in ("quote", "booking", "invoice", "job", "deposit",
+                  (q.get("provider") or "").split(" ")[0], (q.get("trade") or "").split(" ")[0])
+                  if w and len(w) > 2]
+    other_tokens = {str(t) for t in all_tokens} - {str(q.get("token") or "")}
+    claimed = set(claimed)
+    def _ts(v):   # timestamps arrive as float from IMAP but a stub/legacy row may differ
+        try:
+            f = float(v)
+            return f if math.isfinite(f) else 0.0
+        except Exception:
+            return 0.0
+    best, best_ts = None, None
+    for term, verify in reply_search_tiers(q, own_addrs):
+        for r in (found.get(term) or []):
+            # A malformed row (short tuple, wrong shape) is skipped, not fatal: this
+            # loop runs over mailbox-derived data on a background thread, and one bad
+            # row must not wedge the poller for every quote.
+            if not isinstance(r, (list, tuple)) or len(r) < 5:
+                continue
+            msgid, frm, ts, body = r[1], r[2], _ts(r[3]), (r[4] or "")
+            if not msgid or msgid == q.get("lastReplyId") or msgid in claimed:
+                continue
+            sender = (emaillib.utils.parseaddr(frm)[1] or "").strip().lower()
+            if not sender or not verify(sender):
+                continue  # header substring matched but the real sender doesn't
+            low = body.lower()
+            if any(t.lower() in low for t in other_tokens):
+                continue  # belongs to a different quote's thread
+            if not any(w in low for w in gate_words):
+                continue  # nothing job-shaped in it — not this conversation
+            if best is None or ts > best_ts:
+                best, best_ts = r, ts
+        if best:
+            break  # a more specific tier answered — never fall further down
+    return best
 
 def poll_quote_replies():
     """One poll cycle: match INBOX replies to enquiry_sent quotes, parse, update the store."""
@@ -1665,66 +1774,28 @@ def poll_quote_replies():
     by_qid = {q["id"]: q for q in st["quotes"]}
     all_tokens = {str(q.get("token") or "") for q in st["quotes"] if q.get("token")}
     claimed = {info["msgid"] for info in newest.values() if info.get("msgid")}
-    FREEMAIL = {"gmail.com", "googlemail.com", "outlook.com", "hotmail.com", "live.com",
-                "yahoo.com", "yahoo.com.au", "icloud.com", "me.com", "bigpond.com",
-                "bigpond.net.au", "optusnet.com.au", "iinet.net.au", "proton.me", "protonmail.com"}
     own_addrs = {(_gmail_creds() or ("", ""))[0].lower(),
                  str(((st.get("settings") or {}).get("emailCc") or "")).lower()} - {""}
 
-    def _tiers_for(q):
-        """[(search_term, verifier)] most-specific first; verifier(from_addr) -> bool."""
-        out, seen = [], set()
-        for a in ((q.get("replyFrom") or ""), (q.get("enquiryTo") or "")):
-            a = a.strip().lower()
-            if a and "@" in a and a not in seen:
-                seen.add(a)
-                out.append((a, (lambda addr: (lambda f: f == addr or f in own_addrs))(a)))
-        for a in list(seen):
-            dom = a.split("@", 1)[1]
-            if dom in FREEMAIL or "@" + dom in seen:
-                continue
-            seen.add("@" + dom)
-            out.append(("@" + dom, (lambda d: (lambda f: f.endswith("@" + d) or f in own_addrs))(dom)))
-        return out
-
+    # Sender fallback: trades drop the [KK-] token constantly (fresh emails, edited
+    # subjects, a different mailbox on the same domain), and the owner forwards mail
+    # that reached their personal inbox. The ladder and ALL its security rules live in
+    # reply_search_tiers()/pick_reply() above, so tools/test-quote-matching.py exercises
+    # the shipped decision rather than a copy of it.
     pending = {}
     for tok, qid in watched.items():
         q = by_qid.get(qid) or {}
         cur = newest.get(qid)
         if cur and cur["msgid"] != q.get("lastReplyId"):
             continue  # token search already found something new for this quote
-        tiers = _tiers_for(q)
+        tiers = reply_search_tiers(q, own_addrs)
         if tiers:
             pending[qid] = tiers
     if pending:
         found = _imap_replies_from(sorted({t for tiers in pending.values() for t, _ in tiers}))
         for qid, tiers in pending.items():
             q = by_qid.get(qid) or {}
-            gate_words = [w.lower() for w in ("quote", "booking", "invoice", "job", "deposit",
-                          (q.get("provider") or "").split(" ")[0], (q.get("trade") or "").split(" ")[0])
-                          if w and len(w) > 2]
-            other_tokens = all_tokens - {str(q.get("token") or "")}
-            best = None
-            for term, verify in tiers:
-                for r in (found.get(term) or []):
-                    msgid, frm, ts, body = r[1], r[2], r[3], (r[4] or "")
-                    if not msgid or msgid == q.get("lastReplyId") or msgid in claimed:
-                        continue
-                    # parseaddr, NOT the addr regex: `From: "bob@trade.com" <evil@x>`
-                    # would otherwise verify against the DISPLAY NAME (first regex hit)
-                    # while the mail actually came from the attacker.
-                    sender = (emaillib.utils.parseaddr(frm)[1] or "").strip().lower()
-                    if not sender or not verify(sender):
-                        continue  # header substring matched but the real sender doesn't
-                    low = body.lower()
-                    if any(t.lower() in low for t in other_tokens):
-                        continue  # this message belongs to a different quote's thread
-                    if not any(w in low for w in gate_words):
-                        continue  # nothing job-shaped in it — not this conversation
-                    if best is None or ts > best[3]:
-                        best = r
-                if best:
-                    break  # a more specific tier answered — never fall further down
+            best = pick_reply(q, found, all_tokens, claimed, own_addrs)
             if best:
                 uid, msgid, frm, ts, body = best
                 prev = newest.get(qid)
@@ -1830,7 +1901,10 @@ def poll_quote_replies():
 
 def money_str(v):
     try:
-        return f"${float(v):,.0f}"
+        f = float(v)
+        if not math.isfinite(f):     # never render "$nan"/"$inf" at a user
+            return ""
+        return f"${f:,.0f}"
     except Exception:
         return str(v)
 
@@ -2591,9 +2665,9 @@ def _recall_alert_line(state):
     a.recall.ack), or None when there's nothing to say."""
     if not isinstance(state, dict):
         return None
-    names = [a.get("name") or "an asset" for a in state.get("assets", [])
-             if isinstance(a.get("recall"), dict) and a["recall"].get("status") == "recall"
-             and not a["recall"].get("ack")]
+    names = [a.get("name") or "an asset" for a in (state.get("assets") or [])
+             if isinstance(a, dict) and isinstance(a.get("recall"), dict)
+             and a["recall"].get("status") == "recall" and not a["recall"].get("ack")]
     if not names:
         return None
     shown = ", ".join(names[:4])
@@ -3065,12 +3139,18 @@ def gmail_scan():
 def _uid(prefix: str) -> str:
     return prefix + os.urandom(3).hex()
 
+def _rows(state, key):
+    """Only the dict rows of a collection. A malformed row (string/number/None) must
+    never take a home-wide feature down — Ask, the daily digest and the quote ladder
+    all walk these lists on a background thread or a user request."""
+    return [r for r in (state.get(key) or []) if isinstance(r, dict)]
+
 def _home_scope(state):
     hid = state.get("currentHomeId")
-    assets = [a for a in state.get("assets", []) if a.get("homeId") == hid]
-    provs = [p for p in state.get("providers", []) if p.get("homeId") == hid]
-    ids = {a["id"] for a in assets}
-    tasks = [t for t in state.get("tasks", []) if t.get("assetId") in ids]
+    assets = [a for a in _rows(state, "assets") if a.get("homeId") == hid]
+    provs = [p for p in _rows(state, "providers") if p.get("homeId") == hid]
+    ids = {a.get("id") for a in assets}
+    tasks = [t for t in _rows(state, "tasks") if t.get("assetId") in ids]
     return hid, assets, provs, tasks
 
 def _match(items, name, field="name"):
@@ -3899,10 +3979,15 @@ class Handler(SimpleHTTPRequestHandler):
             state = payload.get("state")
             # Shape-check before persisting: a malformed state makes every background
             # thread (poller / autobook / digest) throw on each cycle until restart.
+            _COLLS = ("homes", "assets", "tasks", "providers", "quotes", "logs", "mail")
             if not isinstance(state, dict) or not all(
-                    isinstance(state.get(k, []), list)
-                    for k in ("homes", "assets", "tasks", "providers", "quotes", "logs", "mail")):
+                    isinstance(state.get(k, []), list) for k in _COLLS):
                 return self._send_json({"error": "malformed state"}, 400)
+            # ...and every ROW must be a dict. A string or number in state["assets"]
+            # used to reach the store and then crash Ask and the daily digest home-wide
+            # on every cycle. Readers are defensive now too, but keep the junk out.
+            if not all(isinstance(r, dict) for k in _COLLS for r in (state.get(k) or [])):
+                return self._send_json({"error": "malformed state row"}, 400)
             # HA direct-mode creds are device-local; scrub any legacy copy so the
             # long-lived token can never be read back via GET /api/state.
             if isinstance(state.get("settings"), dict):
@@ -4203,6 +4288,17 @@ class Handler(SimpleHTTPRequestHandler):
                 return self._send_bytes(data, "image/jpeg")
             except Exception:
                 return self._send_json({"error": "streetview fetch failed"}, 502)
+        # ---- never let secret/state files (or dotfiles) be web-servable, even if a
+        # dev-mode DATA_DIR fallback (no /data volume) puts them under ROOT — see
+        # SECRETS_FILE/HA_SECRETS_FILE/STATE_FILE above. Static assets never start
+        # with "kk-" or ".", so this can't shadow real files. `p` is still
+        # percent-encoded (urlparse doesn't decode it) but super().do_GET() ->
+        # translate_path() does decode before opening the file, so we must decode
+        # here too or a %-encoded basename (e.g. /kk-secrets%2ejson) would slip past
+        # this check and still be served.
+        basename = urllib.parse.unquote(p).rsplit("/", 1)[-1]
+        if basename.startswith(".") or re.fullmatch(r"kk-[\w.-]*\.json", basename):
+            return self._send_json({"error": "not found"}, 404)
         return super().do_GET()
 
     def log_message(self, *a):  # quieter

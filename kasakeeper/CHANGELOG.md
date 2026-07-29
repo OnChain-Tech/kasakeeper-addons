@@ -1,3 +1,16 @@
+# 0.3.16
+
+- **Home Assistant knows where things are, so KasaKeeper stops asking.** An asset linked to an HA device now shows that device's area — on the asset, in lists, on task cards — labelled 📍 via Home Assistant. Move a device to another room in HA and KasaKeeper follows, with no import and no editing. Things HA can't know about (a wall, the gutters, a garden bed) keep their typed location, and an asset falls back to it whenever HA has no area, is unreachable, or the home isn't connected.
+
+# 0.3.15
+
+Hardening release · a new fuzzing suite went looking for trouble and found seven real bugs.
+
+- **Ask and the morning brief can no longer be taken down by one bad row.** A single malformed entry anywhere in your assets used to crash them for the whole home; malformed rows are now skipped, and the sync endpoint refuses to store them in the first place.
+- **A trade's malformed email can no longer stall the quote poller** for every other quote.
+- **Amounts are sane or absent**: a nonsense figure parsed out of an email no longer becomes an infinite number, and nothing ever renders as "$nan".
+- Under the hood: the test suite grew from ~91 checks to 170 offline plus 51 API checks, all running automatically on every commit, with a staging environment and a release gate between main and your house.
+
 # 0.3.14
 
 - **No more system pop-ups.** Every confirmation and every "how much did it cost?" now uses KasaKeeper's own dark (or Paper) dialog instead of the browser's grey OS box · twenty of them, from marking a job done to erasing everything. Destructive choices are labelled and red ("Delete asset", not "OK"), Escape and a tap outside both cancel, and Enter accepts. On the wall tablet a system dialog looked like the app had crashed; now it looks like the app.

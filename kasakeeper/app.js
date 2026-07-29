@@ -709,7 +709,7 @@ const railDate = iso => { const d = iso ? new Date(iso) : null;
 function taskCard(t, { showAsset = true } = {}) {
   const a = Store.asset(t.assetId); if (!a) return '';
   const st = Store.status(t), prov = taskProv(t, a);
-  const sub = [showAsset ? esc(a.name) : '', esc(a.location || ''), isDiy(t, a) && !t.snoozed ? '🛠 DIY' : ''].filter(Boolean).join(' · ');
+  const sub = [showAsset ? esc(a.name) : '', esc(assetLocation(a).text), isDiy(t, a) && !t.snoozed ? '🛠 DIY' : ''].filter(Boolean).join(' · ');
   if (t.snoozed) {  // disabled/ignored — sleeping eye, restore or delete
     return `<div class="k-row snoozed" data-action="open-asset" data-id="${a.id}">
       ${assetTile(a, 'k-tile')}
@@ -1047,11 +1047,12 @@ function viewAssets(sub) {
   if (onWarranty) {
     body = warr.length ? `<div class="k-list">${warr.map(({ a, d }) => {
       const mm = [a.make, a.model].filter(Boolean).join(' ');
+      const loc = assetLocation(a);
       const cls = d < 0 ? 'red' : d <= 60 ? 'amber' : 'green';
       return `<div class="k-row ${cls}" data-action="open-asset" data-id="${a.id}">
         ${assetTile(a, 'k-tile')}
         <div class="k-main"><div class="k-title">${esc(a.name)}</div>
-          <div class="k-sub">${esc(mm || a.location || a.category)}${a.warrantyUntil ? ' · until ' + esc(a.warrantyUntil) : ''}</div></div>
+          <div class="k-sub">${esc(mm || loc.text || a.category)}${a.warrantyUntil ? ' · until ' + esc(a.warrantyUntil) : ''}</div></div>
         <div class="k-right"><span class="k-pill ${cls}">${d < 0 ? `expired ${-d}d ago` : d === 0 ? 'ends today' : `${d}d left`}</span></div>
       </div>`;
     }).join('')}</div>` : `<div class="empty">No warranty dates yet — add one when you edit an asset. ${Store.homeAssets().length
@@ -1074,9 +1075,10 @@ function viewAssets(sub) {
         withStat.sort((x,y) => rank[x.s]-rank[y.s] || (x.d??1e9)-(y.d??1e9));
         const worst = withStat.length ? withStat[0].s : 'unsched';
         const label = worst === 'unsched' ? 'not tracked' : worst === 'ok' ? 'ok' : Store.dueLabel(withStat[0].t);
+        const loc = assetLocation(a);
         return `<div class="k-row ${worst==='unsched' ? '' : COLOR[worst]}" data-action="open-asset" data-id="${a.id}">
           ${assetTile(a, 'k-tile')}
-          <div class="k-main"><div class="k-title">${esc(a.name)}</div><div class="k-sub">${esc(a.location||'')}${a.location?' · ':''}${worst==='unsched' ? 'not tracked yet' : ts.length + ' task' + (ts.length!==1?'s':'')}${a.lookupPending ? ' · <b style="color:var(--accent)">✦ research ready</b>' : ''}</div></div>
+          <div class="k-main"><div class="k-title">${esc(a.name)}</div><div class="k-sub">${loc.text ? esc(loc.text) + ' · ' : ''}${worst==='unsched' ? 'not tracked yet' : ts.length + ' task' + (ts.length!==1?'s':'')}${a.lookupPending ? ' · <b style="color:var(--accent)">✦ research ready</b>' : ''}</div></div>
           <div class="k-right"><span class="k-pill ${worst==='unsched' ? 'dim' : COLOR[worst]}">${esc(label)}</span></div>
         </div>`;
       }).join('')}</div>`).join('') || `<div class="empty">No assets yet. <b data-action="catalog" style="color:var(--accent);cursor:pointer">＋ Add your first asset →</b></div>`;
@@ -1117,6 +1119,10 @@ function packCard(a) {
 function viewAsset(id) {
   const a = Store.asset(id); if (!a) return viewDashboard();
   const ts = Store.tasksFor(id), prov = Store.provider(a.providerId);
+  const loc = assetLocation(a);
+  // Location came from HA, not a typed field — say so quietly, same shelf as the
+  // other provenance chips, rather than let it read like the user set it here.
+  const locChip = loc.source === 'ha' ? `<span class="chip dim">📍 via Home Assistant</span>` : '';
   const liveChip = (a.haEntity && !Store.isTestHome()) ? `<span class="chip live" data-ha="${esc(a.haEntity)}">● live: …</span>` : '';
   const wd = Store.warrantyDays(a);
   const warrChip = wd !== null ? `<span class="chip ${wd < 0 ? 'expired' : wd <= 90 ? 'cost' : 'live'}">🛡 ${esc(Store.warrantyLabel(a))}</span>` : '';
@@ -1160,7 +1166,7 @@ function viewAsset(id) {
     </div>`; };
   return `<button class="back" data-action="back">‹ Back</button>
     <div class="hero">${assetTile(a, 'emoji')}
-      <div><h1>${esc(a.name)}</h1><div class="t-sub">${esc(a.category)}${a.variant?' · '+esc(a.variant):''}${(a.make||a.model)?' · '+esc([a.make,a.model].filter(Boolean).join(' ')):''}${a.location?' · '+esc(a.location):''}</div><div class="chip-row">${liveChip}${warrChip}${manualChip}</div></div></div>
+      <div><h1>${esc(a.name)}</h1><div class="t-sub">${esc(a.category)}${a.variant?' · '+esc(a.variant):''}${(a.make||a.model)?' · '+esc([a.make,a.model].filter(Boolean).join(' ')):''}${loc.text?' · '+esc(loc.text):''}</div><div class="chip-row">${locChip}${liveChip}${warrChip}${manualChip}</div></div></div>
     ${a.ha ? `<div class="ha-strip" data-ha-strip="${a.id}"><span class="hs-lbl">live · via Home Assistant</span><span class="hs-vals">…</span></div>` : ''}
     <img class="asset-photo" src="api/photo/${a.id}" alt="" onerror="this.remove()">
     <div class="meta-grid">
@@ -1298,11 +1304,11 @@ function viewProvider(id) {
     </div>
     ${p.notes ? `<div class="banner">${esc(p.notes)}</div>` : ''}
     <div class="section-title">Looks after <span class="pill">${assets.length}</span></div>
-    ${assets.length ? `<div class="k-list">${assets.map(a => `<div class="k-row" data-action="open-asset" data-id="${a.id}">
+    ${assets.length ? `<div class="k-list">${assets.map(a => { const loc = assetLocation(a); return `<div class="k-row" data-action="open-asset" data-id="${a.id}">
         ${assetTile(a, 'k-tile')}
         <div class="k-main"><div class="k-title">${esc(a.name)}</div>
-        <div class="k-sub">${esc(a.category)}${a.location ? ' · ' + esc(a.location) : ''}</div></div>
-      </div>`).join('')}</div>`
+        <div class="k-sub">${esc(a.category)}${loc.text ? ' · ' + esc(loc.text) : ''}</div></div>
+      </div>`; }).join('')}</div>`
       : `<div class="empty">Not linked to any asset yet.</div>`}
     <div class="section-title">Job history <span class="pill">${jobs.length}</span>${spent ? `<span class="pill">${money(spent)} total</span>` : ''}</div>
     ${jobs.length ? `<div class="k-list" style="padding:2px 12px">${jobs.map(l => {
@@ -1711,7 +1717,7 @@ function editAsset(id) {
     <div class="card">
       ${field('f_name','Name',a.name)}
       ${selectField('f_cat','Category',a.category,cats)}
-      ${field('f_loc','Location',a.location)}
+      <div data-loc-field="${id}">${locFieldHTML(a)}</div>
       ${field('f_trade','Trade to call (optional)',a.trade,'text','e.g. stonemason — overrides the category default')}
       ${field('f_installed','Installed on',a.installedOn,'date')}
       ${field('f_warranty','Warranty until (optional)',a.warrantyUntil,'date')}
@@ -2218,6 +2224,7 @@ function render() {
   hydrateHaStrip();
   hydrateHaBanner();
   hydrateHaDrift();
+  hydrateAreas();
   hydrateImagery();
   hydrateUsagePicker();
   updateEye(); // the mark reflects live status: watch / glance-at-badge / sleep
@@ -2258,6 +2265,84 @@ async function hydrateHA() {
   for (const n of nodes) {
     const s = await HA.entity(n.getAttribute('data-ha'));
     n.textContent = s ? '● live: ' + HA.fmt(s) : '● unavailable';
+  }
+}
+// Home Assistant is the source of truth for WHERE an asset is: an HA-linked
+// device's area wins over the manual `location` field, never the other way
+// round, and nothing is copied into the store — resolved at read time so
+// there's exactly one source of truth (the owner's call: "HA already
+// captures this"). AREAS is deviceId -> area name, cached client-side like
+// USAGE/HASTRIP so renders stay synchronous; hydrateAreas() keeps it warm and
+// redraws once on a cold-for-this-home cache so a fresh load or a home switch
+// doesn't sit on stale text until the next navigation happens to redraw it.
+// Precedence: HA area (asset HA-linked AND HA reports one) -> manual
+// location -> nothing. A home with HA mode 'none'/unreachable, or an asset
+// with no a.ha.deviceId (an unlinked asset, e.g. a limestone wall with no
+// device), falls straight through to the manual value.
+let AREAS = { t: 0, homeId: null, map: {} };
+async function computeAreas(force) {
+  const home = Store.home();
+  const hid = home && home.id;
+  if (!hid || Store.isTestHome()) { AREAS = { t: Date.now(), homeId: hid, map: {} }; return AREAS.map; }
+  // HA.ready() can still be false this early (HA.init() hasn't resolved yet at
+  // boot) — t:0 leaves this UNresolved rather than caching a false "no HA" for
+  // 5 min, so the very next call (the render HA.init() itself triggers once it
+  // resolves) retries instead of sitting on an empty map till the TTL rolls.
+  if (!HA.ready()) { AREAS = { t: 0, homeId: hid, map: {} }; return AREAS.map; }
+  if (!force && AREAS.homeId === hid && AREAS.t && Date.now() - AREAS.t < 5 * 60e3) return AREAS.map;
+  try {
+    const { devices } = await HA.devices(hid);
+    const map = {};
+    (devices || []).forEach(d => { if (d.deviceId && d.area) map[d.deviceId] = d.area; });
+    AREAS = { t: Date.now(), homeId: hid, map };
+  } catch { AREAS = { t: 0, homeId: hid, map: {} }; }   // transient — retry next call, don't lock in empty
+  return AREAS.map;
+}
+// The single resolver every render site routes through — see precedence note above.
+function assetLocation(a) {
+  const devId = a && a.ha && a.ha.deviceId;
+  const haArea = devId && AREAS.homeId === a.homeId ? AREAS.map[devId] : null;
+  if (haArea) return { text: haArea, source: 'ha' };
+  if (a && a.location) return { text: a.location, source: 'manual' };
+  return { text: '', source: '' };
+}
+// Builds the edit-asset Location field: a locked, HA-fed display when the
+// asset is linked and HA currently reports an area for it (with a note on
+// where to actually change it), otherwise a normal editable field — still
+// available as the fallback for anything unlinked, or linked-but-area-less.
+function locFieldHTML(a) {
+  const linked = !!(a.ha && a.ha.deviceId);
+  const loc = assetLocation(a);
+  if (linked && loc.source === 'ha') {
+    return `<label>Location</label><input type="text" value="${esc(loc.text)}" disabled>
+      <div class="t-sub dim" style="margin-top:2px">From Home Assistant · to change it, edit this device's area in Home Assistant</div>`;
+  }
+  return field('f_loc', 'Location', a.location, 'text', linked ? 'no area set in Home Assistant yet · type one here' : '');
+}
+async function hydrateAreas() {
+  if (Store.isTestHome()) return;
+  const home = Store.home();
+  // Redraw once when either: the home changed (switch invalidated the cache),
+  // or this is the first time THIS home resolved to a real answer (covers the
+  // boot race — HA.init() hasn't necessarily resolved by the first render, so
+  // the very first pass often leaves AREAS unresolved; computeAreas() keeps
+  // t:0 in that case specifically so this transition still fires once the
+  // proxy comes up). Every other render already reads a warm cache
+  // synchronously — no need to force anything. Same focus guard as the
+  // boot-time "adopted -> render()" sync below: never under someone's fingers
+  // (SY-7 — no scroll-jumping an idle wall tablet, and no eating mid-edit input).
+  const prevHomeId = AREAS.homeId, wasResolved = !!AREAS.t;
+  await computeAreas();
+  const changed = (!!home && prevHomeId !== home.id) || (!wasResolved && !!AREAS.t);
+  const ae = document.activeElement;
+  const typing = ae && (ae.tagName === 'INPUT' || ae.tagName === 'TEXTAREA' || ae.tagName === 'SELECT' || ae.isContentEditable);
+  if (changed && !typing) return render();
+  // Same-home refresh (the 5-min cache just rolled): patch the one place a
+  // stale value would otherwise sit until the next navigation.
+  const lf = document.querySelector('[data-loc-field]');
+  if (lf && (!ae || !lf.contains(ae))) {
+    const a = Store.asset(lf.getAttribute('data-loc-field'));
+    if (a) lf.innerHTML = locFieldHTML(a);
   }
 }
 // Live strip on an ha-linked asset page: 2–4 headline readings, hydrated async
@@ -3335,10 +3420,18 @@ document.addEventListener('click', async e => {
     case 'unsnooze-task': Store.unsnoozeTask(id); return render(); // bring it back
     case 'save-asset': {
       const a = id==='new' ? {} : Store.asset(id);
-      Object.assign(a, { name:val('f_name'), category:val('f_cat'), location:val('f_loc'), trade:val('f_trade'),
+      // Location isn't in this Object.assign: while HA reports an area for a
+      // linked device, the field renders disabled and its value is the HA
+      // text, not the stored manual one — saving it as-is would silently
+      // overwrite whatever manual value the asset already had. Only write
+      // f_loc when the field was the real editable one (unlinked, or linked
+      // with no HA area — see locFieldHTML).
+      const haGoverned = a.ha && a.ha.deviceId && AREAS.homeId === a.homeId && AREAS.map[a.ha.deviceId];
+      Object.assign(a, { name:val('f_name'), category:val('f_cat'), trade:val('f_trade'),
         installedOn:val('f_installed'), warrantyUntil:val('f_warranty'), providerId:val('f_prov'),
         make:val('f_make'), model:val('f_model'), serial:val('f_serial'), haEntity:val('f_ha'),
         purchaseUrl:val('f_purchase') });
+      if (!haGoverned) a.location = val('f_loc');
       const saved = Store.upsertAsset(a);
       if (SNAP.pending) {  // snapped asset: keep the photo on the Green + build its schedule
         if (SNAP.image) fetch('api/photo', { method:'POST', headers:{'Content-Type':'application/json'},
