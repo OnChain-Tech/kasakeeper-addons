@@ -3,7 +3,7 @@
 KasaKeeper backend — serves the PWA and does live property research.
 
   POST /api/research  { "address": "1 Beach Rd, Bondi NSW" }
-      -> DetectedHome JSON (beds/baths/levels + maintenance features)
+      -> DetectedHome JSON (suburb + maintenance features)
 
 It asks Claude (with the web_search server tool) to research the address on
 Domain / realestate.com.au / sold-price sites, read the listing details, and
@@ -151,13 +151,10 @@ PROPERTY_SITES = ["domain.com.au", "realestate.com.au", "allhomes.com.au",
 SCHEMA = {
     "type": "object",
     "additionalProperties": False,
-    "required": ["address", "suburb", "levels", "beds", "baths", "summary", "features"],
+    "required": ["address", "suburb", "summary", "features"],
     "properties": {
         "address": {"type": "string"},
         "suburb": {"type": "string"},
-        "levels": {"anyOf": [{"type": "integer"}, {"type": "null"}]},
-        "beds": {"anyOf": [{"type": "integer"}, {"type": "null"}]},
-        "baths": {"anyOf": [{"type": "integer"}, {"type": "null"}]},
         "summary": {"type": "string"},
         "features": {
             "type": "array",
@@ -181,7 +178,7 @@ SYSTEM = (
     "You research an Australian residential property and produce its home-maintenance profile. "
     "Use the web_search tool to find the address on real-estate sites (Domain, realestate.com.au, "
     "allhomes, onthehouse, getsoldprice, propertyvalue) and read the most recent sale/lease listing. "
-    "Extract bedrooms, bathrooms, number of levels/storeys, and suburb. From the listing's description "
+    "Extract the suburb. From the listing's description "
     "and photos, detect maintenance-relevant features and map EACH to exactly one category from this list: "
     + ", ".join(CATEGORIES) + ". Examples: pool/spa->Pool/Spa; sauna->Sauna; 'ducted'/'reverse cycle'/"
     "'air conditioning'->HVAC; 'gas heating'/'gas bayonet'/fireplace->Heating; solar/battery->Energy; "
@@ -190,11 +187,11 @@ SYSTEM = (
     "the listing doesn't mention them: gutters (Roof/Exterior), smoke alarms (Safety), hot-water service "
     "(Water), termite/pest inspection (Roof/Exterior), and general house cleaning (Cleaning). For each feature set source to where it came from "
     "('listing', 'photos', 'inferred') and confidence high/medium/low. If you cannot find the specific "
-    "address, set levels/beds/baths to null, note that in summary, and still return the baseline features. "
+    "address, note that in summary, and still return the baseline features. "
     "Give each feature a short lowercase key (e.g. 'pool', 'ducted_aircon'). "
     "When finished searching, respond with ONLY a single JSON object (no markdown fences, no commentary "
-    "before or after) with exactly these keys: address (string), suburb (string), levels (integer or null), "
-    "beds (integer or null), baths (integer or null), lat (number or null), lon (number or null), "
+    "before or after) with exactly these keys: address (string), suburb (string), "
+    "lat (number or null), lon (number or null), "
     "summary (string), features (array of objects with keys "
     "key, label, category, source, confidence). For lat/lon give the property's decimal-degree coordinates if "
     "the listing or a map makes them available (this centres an aerial scan), else null. category must be one "
@@ -218,7 +215,7 @@ def baseline_home(address, note="Baseline profile — live research unavailable.
         suburb = parts[-1]
     return {
         "address": address or "Your home", "suburb": suburb,
-        "levels": None, "beds": None, "baths": None, "summary": note,
+        "summary": note,
         "features": [{"key": k, "label": l, "category": c, "source": "inferred", "confidence": "low"}
                      for (k, l, c) in base],
     }
@@ -1183,7 +1180,7 @@ def research(address):
         return baseline_home(address, "Set ANTHROPIC_API_KEY for live research.")
 
     client = anthropic.Anthropic(max_retries=1, timeout=200.0)
-    # --- 1) listing research via web search (bedrooms/baths/levels + listed features) ---
+    # --- 1) listing research via web search (suburb + listed features) ---
     # No allowed_domains — some property sites (realestate.com.au) are on the
     # web-search blocklist and would 400 the whole request. Steer via the prompt.
     # No output_config.format — it suppresses the web-search tool loop; instead we
@@ -1486,6 +1483,7 @@ def find_services_web(trade, suburb, address):
 # mutates quote status in the store — it never sends anything on its own.
 # =============================================================================
 import smtplib, imaplib, email as emaillib, email.policy, email.utils, re as _re
+import email.mime.multipart, email.mime.text, email.mime.application
 
 GMAIL_IMAP, GMAIL_SMTP = "imap.gmail.com", "smtp.gmail.com"
 QUOTE_POLL_SEC = int(os.getenv("KASA_QUOTE_POLL_SEC", "120"))
@@ -1526,30 +1524,150 @@ def _validate_gmail_creds(user, app_password):
     except Exception as e:
         return False, _safe_err(e)
 
-def send_email(to_addr, subject, body_text, reply_to=None, cc=None):
-    """SMTP-send a plaintext email from the KasaKeeper Gmail. Returns the Message-ID.
-    Raises on failure so the caller can surface it."""
+def send_email(to_addr, subject, body_text, reply_to=None, cc=None, ics_text=None, ics_filename="invite.ics"):
+    """SMTP-send an email from the KasaKeeper Gmail. Plain text/plain, unless
+    ics_text is given, in which case it goes out as a proper calendar invite:
+    multipart/mixed with a text/plain + text/calendar;method=REQUEST alternative
+    (so Gmail renders 'Add to calendar' inline) plus the same .ics as a file
+    attachment for clients that only honour the attachment. Returns the
+    Message-ID. Raises on failure so the caller can surface it."""
     creds = _gmail_creds()
     if not creds:
         raise RuntimeError("Gmail not configured (set GMAIL_USER / GMAIL_APP_PASSWORD).")
     user, pwd = creds
-    msg = emaillib.message.EmailMessage()
-    msg["From"] = user
-    msg["To"] = to_addr
-    msg["Subject"] = subject
     msgid = emaillib.utils.make_msgid(domain=user.split("@")[-1])
-    msg["Message-ID"] = msgid
-    if reply_to:
-        msg["Reply-To"] = reply_to
-    if cc:
-        msg["Cc"] = cc          # keeps the household copy in their own inbox
-    msg.set_content(body_text)
+    if ics_text:
+        msg = email.mime.multipart.MIMEMultipart("mixed")
+        msg["From"] = user
+        msg["To"] = to_addr
+        msg["Subject"] = subject
+        msg["Message-ID"] = msgid
+        if reply_to:
+            msg["Reply-To"] = reply_to
+        if cc:
+            msg["Cc"] = cc
+        alt = email.mime.multipart.MIMEMultipart("alternative")
+        alt.attach(email.mime.text.MIMEText(body_text, "plain", "utf-8"))
+        cal_part = email.mime.text.MIMEText(ics_text, "calendar", "utf-8")
+        cal_part.set_param("method", "REQUEST")
+        alt.attach(cal_part)
+        msg.attach(alt)
+        attachment = email.mime.application.MIMEApplication(ics_text.encode("utf-8"), _subtype="ics",
+                                                              name=ics_filename)
+        attachment["Content-Disposition"] = f'attachment; filename="{ics_filename}"'
+        msg.attach(attachment)
+    else:
+        msg = emaillib.message.EmailMessage()
+        msg["From"] = user
+        msg["To"] = to_addr
+        msg["Subject"] = subject
+        msg["Message-ID"] = msgid
+        if reply_to:
+            msg["Reply-To"] = reply_to
+        if cc:
+            msg["Cc"] = cc          # keeps the household copy in their own inbox
+        msg.set_content(body_text)
     with smtplib.SMTP(GMAIL_SMTP, 587, timeout=30) as s:
         s.starttls(context=_tls_ctx())
         s.login(user, pwd)
         s.send_message(msg)
-    print(f"[enquiry] sent to {to_addr!r} subj={subject!r}")
+    print(f"[enquiry] sent to {to_addr!r} subj={subject!r}" + (" +ics" if ics_text else ""))
     return msgid
+
+# ---- calendar invite (RFC 5545) --------------------------------------------
+# There is no Home Assistant calendar integration in this codebase — this is the
+# substitute: email a real VEVENT to the OWNER'S OWN inbox so a booked job lands
+# in their calendar app, via the same user-approved send path as everything else.
+# UID is derived from the quote id, so re-sending the same booking (e.g. after a
+# reschedule) UPDATEs the existing calendar entry rather than duplicating it;
+# SEQUENCE increments on each re-send per RFC 5545's METHOD:REQUEST semantics.
+ICS_DEFAULT_MINUTES = 120  # trades rarely state a duration; 2 hours is a safe, honest default
+
+def _ics_escape(s):
+    """RFC 5545 §3.3.11 TEXT escaping: backslash, semicolon, comma, newline."""
+    return (str(s if s is not None else "")
+            .replace("\\", "\\\\").replace(";", "\\;").replace(",", "\\,")
+            .replace("\r\n", "\\n").replace("\n", "\\n"))
+
+def _ics_fold(line):
+    """RFC 5545 §3.1 line folding: no physical line may exceed 75 octets: split
+    on a UTF-8-safe boundary and continue with CRLF + a single leading space."""
+    b = line.encode("utf-8")
+    if len(b) <= 75:
+        return line
+    parts, start, limit = [], 0, 75
+    while start < len(b):
+        end = min(start + limit, len(b))
+        while end > start and end < len(b) and (b[end] & 0xC0) == 0x80:   # never split a multi-byte utf-8 char
+            end -= 1
+        parts.append(b[start:end].decode("utf-8"))
+        start, limit = end, 74   # continuation lines reserve 1 octet for the leading space
+    return "\r\n ".join(parts)
+
+_ICS_TIME_RE = _re.compile(r"^\s*(\d{1,2})(?::(\d{2}))?\s*([AaPp]\.?[Mm]\.?)?\s*$")
+
+def _parse_booked_time(text):
+    """Best-effort parse of the free-text 'bookedTime' field ('1:30 PM', '9am',
+    '14:00', '', 'sometime after lunch'). Returns (hour, minute), or None —
+    None means give up, never guess a time (build_booking_ics then emits an
+    honest all-day event instead of inventing 9am)."""
+    m = _ICS_TIME_RE.match(text or "")
+    if not m:
+        return None
+    hour, minute = int(m.group(1)), int(m.group(2) or 0)
+    ap = (m.group(3) or "").lower().replace(".", "")
+    if minute > 59:
+        return None
+    if ap:
+        if not (1 <= hour <= 12):
+            return None
+        hour = hour % 12
+        if ap == "pm":
+            hour += 12
+    elif hour > 23:
+        return None
+    return hour, minute
+
+def build_booking_ics(*, quote_id, summary, description="", location="", start_date, start_time="",
+                       duration_minutes=ICS_DEFAULT_MINUTES, organizer_email, attendee_email,
+                       sequence=0, tz=None, now=None):
+    """Build an RFC 5545 VCALENDAR/VEVENT (METHOD:REQUEST) as CRLF text. Timed
+    when start_time parses; otherwise an honest all-day VALUE=DATE event. tz is
+    the local timezone the (date, time) pair is expressed in — DTSTART/DTEND are
+    always emitted in UTC (Z) so no VTIMEZONE block is needed and DST across the
+    date is handled correctly. Pure function: no I/O, no store access."""
+    import datetime
+    uid = f"kk-booking-{quote_id}@kasakeeper.local"
+    dtstamp = (now or datetime.datetime.now(datetime.timezone.utc)).strftime("%Y%m%dT%H%M%SZ")
+    y, mo, d = (int(x) for x in start_date.split("-"))
+    parsed = _parse_booked_time(start_time)
+    lines = ["BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//KasaKeeper//Booking//EN",
+             "CALSCALE:GREGORIAN", "METHOD:REQUEST", "BEGIN:VEVENT", f"UID:{uid}", f"DTSTAMP:{dtstamp}"]
+    if parsed:
+        hh, mm = parsed
+        local = datetime.datetime(y, mo, d, hh, mm, tzinfo=tz or datetime.timezone.utc)
+        start_utc = local.astimezone(datetime.timezone.utc)
+        minutes = max(15, min(int(duration_minutes or ICS_DEFAULT_MINUTES), 1440))
+        end_utc = start_utc + datetime.timedelta(minutes=minutes)
+        lines.append(f"DTSTART:{start_utc.strftime('%Y%m%dT%H%M%SZ')}")
+        lines.append(f"DTEND:{end_utc.strftime('%Y%m%dT%H%M%SZ')}")
+    else:
+        nextday = datetime.date(y, mo, d) + datetime.timedelta(days=1)
+        lines.append(f"DTSTART;VALUE=DATE:{y:04d}{mo:02d}{d:02d}")
+        lines.append(f"DTEND;VALUE=DATE:{nextday.strftime('%Y%m%d')}")
+    lines.append(f"SUMMARY:{_ics_escape(summary or 'Booked job')}")
+    if description:
+        lines.append(f"DESCRIPTION:{_ics_escape(description)}")
+    if location:
+        lines.append(f"LOCATION:{_ics_escape(location)}")
+    lines.append(f"ORGANIZER;CN=KasaKeeper:mailto:{organizer_email}")
+    lines.append(f"ATTENDEE;CN=Owner;ROLE=REQ-PARTICIPANT;PARTSTAT=NEEDS-ACTION;RSVP=TRUE:mailto:{attendee_email}")
+    lines.append(f"SEQUENCE:{max(0, int(sequence or 0))}")
+    lines.append("STATUS:CONFIRMED")
+    lines.append("TRANSP:OPAQUE")
+    lines.append("END:VEVENT")
+    lines.append("END:VCALENDAR")
+    return "\r\n".join(_ics_fold(l) for l in lines) + "\r\n"
 
 def _plain_body(msg):
     """Best-effort plaintext of an email.message. Falls back to de-tagged HTML."""
@@ -2477,7 +2595,10 @@ LOOKUP_SYSTEM = (
     "the accepted trade-standard maintenance for that kind of thing at an Australian home. "
     "Respond with ONLY a JSON object (no prose, no code fences): "
     "{\"summary\": one sentence on what this unit is, "
-    "\"manualUrl\": direct URL to the official manual/spec PDF or the manufacturer's product-support page, or null, "
+    "\"manualUrl\": the manual for THIS EXACT model — strongly prefer a DIRECT PDF link "
+    "(manufacturer media/document CDNs and download endpoints, e.g. .../Documents/....pdf); "
+    "fall back to the manufacturer's product-support page only when no PDF turns up; else null, "
+    "\"manualKind\": \"pdf\" when manualUrl is the PDF document itself, \"page\" when it is a web page, else null, "
     "\"specs\": {2-6 short key facts a home maintainer needs, e.g. \"filter\": \"...\", \"capacity\": \"...\"}, "
     "\"tasks\": [up to 5 of {\"title\": short task name, \"cadenceDays\": number, \"note\": one practical line}] "
     "— the MANUFACTURER-recommended maintenance schedule, "
@@ -2485,8 +2606,87 @@ LOOKUP_SYSTEM = (
     "\"tips\": [up to 3 short practical owner tips]}. "
     "Rules: cadenceDays is a NUMBER of days. Prefer the manufacturer's stated intervals; if none found, "
     "use the accepted trade standard for this exact equipment type and say so in the note. "
-    "manualUrl must be a URL you actually found — never invented. Null anything you cannot verify."
+    "Manual rules: support pages are often JS shells whose text can't be read later, so hunt the direct PDF "
+    "first — if your best find is a product/support page, spend one extra search like "
+    "'\"<model>\" manual filetype:pdf' before answering. When no PDF surfaces, the manufacturer's "
+    "support/product page for this model is still worth returning (kind \"page\") — null only when you found "
+    "neither. manualUrl must be a URL a search actually returned — never invented — and must document the "
+    "EXACT model asked: a manual for a different model, even a near-identical sibling in the same range, is "
+    "worse than none — return null instead. Null anything else you cannot verify."
 )
+
+def _url_names_other_model(model, url):
+    """True when the url visibly carries a SIBLING model code — the same
+    letters-and-digits pattern as the asset's model but different digits (the
+    Parex TA90SS lookup that came back with the DeLonghi TA60SS manual).
+    Purely numeric document ids never trip it (no letters to match), and a url
+    that names the exact model anywhere is always trusted."""
+    norm = re.sub(r"[^A-Za-z0-9]", "", str(model or "")).upper()
+    if len(norm) < 4 or not re.search(r"[A-Z]", norm) or not re.search(r"\d", norm):
+        return False                       # too generic to form a discriminating pattern
+    skel = re.sub(r"\d", "#", norm)
+    other = False
+    for tok in re.findall(r"[A-Z0-9]+", str(url or "").upper()):
+        if norm in tok:
+            return False                   # the exact model is named — trust the link
+        if re.sub(r"\d", "#", tok) == skel:
+            other = True                   # same family pattern, different digits
+    return other
+
+def _manual_fields(data, model):
+    """(manualUrl, manualKind) from the raw lookup JSON — shape-guarded, kind
+    inferred from the url when the model didn't say, wrong-model links dropped."""
+    url = str(data.get("manualUrl"))[:500] if data.get("manualUrl") else None
+    if not url:
+        return None, None
+    if _url_names_other_model(model, url):
+        print(f"[lookup] manual link names another model — dropped: {url[:120]}")
+        return None, None
+    kind = str(data.get("manualKind") or "").strip().lower()
+    if kind not in ("pdf", "page"):
+        kind = "pdf" if url.lower().split("?", 1)[0].split("#", 1)[0].endswith(".pdf") else "page"
+    return url, kind
+
+# Cheap second pass when the main lookup landed on a support page (or nothing):
+# one focused filetype:pdf hunt for the direct document.
+MANUAL_PDF_SYSTEM = (
+    "You find the official PDF manual for one exact appliance model. Use web_search — a "
+    "'\"<model>\" manual filetype:pdf' query works well, manufacturer media/document CDNs usually host it. "
+    "Respond with ONLY a JSON object (no prose, no code fences): "
+    "{\"pdfUrl\": direct https URL to the manufacturer's manual/instruction PDF for this EXACT model, or null}. "
+    "Rules: the link must be the PDF document itself, not a page that links to one. It must document the "
+    "exact model asked — a manual for a different or merely similar model is worse than none: return null. "
+    "Never invent a URL — only return one a search actually surfaced."
+)
+
+def _manual_pdf_search(client, unit, queries):
+    """One small extra web_search call hunting the direct PDF. Best-effort:
+    any failure returns None and the lookup ships with what it already has."""
+    try:
+        tools = [{"type": "web_search_20260209", "name": "web_search", "max_uses": 3}]
+        messages = [{"role": "user", "content": f'Find the direct PDF manual for: "{unit}"'}]
+        resp = None
+        for _ in range(4):
+            resp = client.messages.create(model=MODEL, max_tokens=600, system=MANUAL_PDF_SYSTEM,
+                                          tools=tools, messages=messages)
+            for b in resp.content:
+                if getattr(b, "type", "") == "server_tool_use":
+                    q = (getattr(b, "input", None) or {}).get("query")
+                    if q:
+                        queries.append(str(q)[:120])
+            if resp.stop_reason == "pause_turn":
+                messages.append({"role": "assistant", "content": resp.content})
+                continue
+            break
+        text = "".join(b.text for b in resp.content if getattr(b, "type", "") == "text")
+        i, j = text.find("{"), text.rfind("}")
+        if i >= 0 and j >= 0:
+            u = json.loads(text[i:j + 1]).get("pdfUrl")
+            if u and re.match(r"^https?://", str(u)):
+                return str(u)[:500]
+    except Exception as e:
+        print(f"[lookup] pdf pass failed: {e}")
+    return None
 
 def lookup_features(make, model, name, category):
     empty = {"error": "lookup unavailable"}
@@ -2526,12 +2726,20 @@ def lookup_features(make, model, name, category):
         if i >= 0 and j >= 0:
             data = json.loads(text[i:j + 1])
             # Shape-guard everything the client will render or write into tasks.
+            murl, mkind = _manual_fields(data, model)
+            if model and mkind != "pdf":
+                # Landed on a support page (or nothing) for a known model — one
+                # focused filetype:pdf pass; JS-shell pages defeat read_manual later.
+                job_stage("Hunting the direct PDF manual…")
+                u = _manual_pdf_search(client, " ".join(x for x in (make, model) if x), queries)
+                if u and not _url_names_other_model(model, u):
+                    murl, mkind = u, "pdf"
             out = {"summary": str(data.get("summary") or "")[:300],
-                   "manualUrl": (str(data.get("manualUrl"))[:500] if data.get("manualUrl") else None),
+                   "manualUrl": murl, "manualKind": mkind if murl else None,
                    "specs": {str(k)[:40]: str(v)[:120] for k, v in (data.get("specs") or {}).items() if v},
                    "tips": [str(t)[:200] for t in (data.get("tips") or [])[:3]],
                    # the data behind the action — what we asked and what was actually searched
-                   "debug": {"asked": ask[:300], "queries": queries[:10]},
+                   "debug": {"asked": ask[:300], "queries": queries[:14]},
                    "tasks": []}
             for t in (data.get("tasks") or [])[:5]:
                 try:
@@ -3335,8 +3543,9 @@ def _chat_context(state):
                for k in ("trade", "provider", "status", "amount", "availability") if q.get(k)}
               for q in state.get("quotes", []) if q.get("homeId") == hid]
     return {"today": time.strftime("%Y-%m-%d"),
-            "home": {k: v for k, v in {"address": home.get("address"), "beds": home.get("beds"),
-                                       "baths": home.get("baths")}.items() if v},
+            # beds/baths were removed (unverifiable manual entry, unused downstream) —
+            # Ask no longer receives them, even if an older home record still has them.
+            "home": {k: v for k, v in {"address": home.get("address")}.items() if v},
             "assets": out_assets, "providers": out_provs, "quotes": quotes}
 
 # ---- manual grounding: the Ask chat can consult an asset's own manual ---------
@@ -4008,10 +4217,34 @@ def _sweep_job(job_id, home_id):
                 return _o["applied"]
             wrote = state_mutate(_mut) is not None
             if outcome["applied"] and wrote:
+                # Direct-PDF manual: vault it now (same fetch + %PDF gate as the
+                # asset page's "keep a copy") so link-rot can't take it before the
+                # user ever opens it. Best-effort; only when the url we found is
+                # the one actually on the asset (an existing manualUrl wins) —
+                # judged from a FRESH read, not the sweep-start snapshot: another
+                # device may have set its own link or vaulted a copy mid-lookup.
+                vaulted = False
+                ax = next((x for x in ((state_read().get("state") or {}).get("assets") or [])
+                           if x.get("id") == aid), None) or {}
+                if (manual and r.get("manualKind") == "pdf" and not ax.get("manualDoc")
+                        and ax.get("manualUrl") == manual):
+                    try:
+                        save_doc(aid, manual)
+
+                        def _flagm(s, _a=aid):
+                            x = next((x for x in s.get("assets", []) if x.get("id") == _a), None)
+                            if x and not x.get("manualDoc"):
+                                x["manualDoc"] = True
+                                return True
+                            return False
+                        state_mutate(_flagm)
+                        vaulted = True
+                    except Exception as e:
+                        print(f"[sweep] manual vault skipped for {name!r}: {e}")
                 nt = len(pending["tasks"])
                 log_line(f"✓ {name} — {nt} task{'s' if nt != 1 else ''} proposed"
                           + (f" · {pending['usageIntervalHours']}h interval" if pending.get("usageIntervalHours") else "")
-                          + (" · manual found" if pending.get("manualUrl") else ""))
+                          + (" · manual saved" if vaulted else (" · manual found" if pending.get("manualUrl") else "")))
             elif not outcome["applied"]:
                 log_line(f"— {name} — deleted elsewhere, discarded")
             else:
@@ -4351,12 +4584,52 @@ class Handler(SimpleHTTPRequestHandler):
                 return self._send_json({"error": "a valid recipient email is required"}, 400)
             if not subject or not body:
                 return self._send_json({"error": "subject and body are required"}, 400)
+            # Optional calendar invite (the "add to my calendar" booking option): the
+            # app supplies the raw booking facts, never a pre-built .ics — we build
+            # and escape it here so a malformed field 400s instead of reaching SMTP.
+            ics_req = payload.get("ics")
+            ics_kwargs = None
+            if ics_req is not None:
+                if not isinstance(ics_req, dict):
+                    return self._send_json({"error": "invalid ics payload"}, 400)
+                quote_id = str(ics_req.get("quoteId") or "").strip()
+                if not _re.fullmatch(r"[A-Za-z0-9_\-]{1,60}", quote_id):
+                    return self._send_json({"error": "invalid ics quoteId"}, 400)
+                start_date = str(ics_req.get("startDate") or "").strip()
+                try:
+                    import datetime as _dt
+                    y, mo, d = start_date.split("-")
+                    _dt.date(int(y), int(mo), int(d))
+                except Exception:
+                    return self._send_json({"error": "invalid ics startDate"}, 400)
+                try:
+                    duration = int(ics_req.get("durationMinutes") or ICS_DEFAULT_MINUTES)
+                    sequence = int(ics_req.get("sequence") or 0)
+                except (TypeError, ValueError):
+                    return self._send_json({"error": "invalid ics duration/sequence"}, 400)
+                ics_kwargs = dict(
+                    quote_id=quote_id,
+                    summary=str(ics_req.get("summary") or "").strip()[:200],
+                    description=str(ics_req.get("description") or "").strip()[:2000],
+                    location=str(ics_req.get("location") or "").strip()[:300],
+                    start_date=start_date,
+                    start_time=str(ics_req.get("startTime") or "").strip()[:40],
+                    duration_minutes=duration,
+                    sequence=sequence,
+                    attendee_email=to,
+                )
             if not gmail_available():
                 return self._send_json({"error": "email not configured", "configured": False}, 503)
             if token and ("[" + token + "]") not in subject and token not in subject:
                 subject = f"{subject} [{token}]"
             try:
-                msgid = send_email(to, subject, body, cc=cc or None)
+                ics_text = None
+                if ics_kwargs is not None:
+                    import datetime as _dt
+                    organizer, _pwd = _gmail_creds()
+                    tz = _ha_timezone() or _dt.datetime.now().astimezone().tzinfo
+                    ics_text = build_booking_ics(organizer_email=organizer, tz=tz, **ics_kwargs)
+                msgid = send_email(to, subject, body, cc=cc or None, ics_text=ics_text)
                 return self._send_json({"ok": True, "messageId": msgid, "subject": subject})
             except Exception as e:
                 print(f"[enquiry] send failed: {e}")

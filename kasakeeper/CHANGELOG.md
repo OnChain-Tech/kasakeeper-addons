@@ -1,8 +1,25 @@
+# 0.3.20
+
+- **Research now hunts the actual manual, not just a link to a page about it.** Looking up an asset strongly prefers the manufacturer's direct PDF — and when the first find is only a support page, it spends one more focused search hunting the PDF itself. Result: manuals Ask can actually read, instead of app-style pages with no readable text.
+- **A found PDF is saved to your house automatically.** No more remembering to tap ⤓ keep a copy — a direct-PDF manual is fetched onto your own box the moment research finds it (with the same safety checks as the manual button), so a dead link later can't take it from you.
+- **Never someone else's manual.** A manual for a near-identical sibling model (say, a TA60SS offered up for your TA90SS) is now rejected outright — both by the research itself and by a server-side check on the link — because a wrong manual is worse than none.
+- Honest labelling when only a page exists: the lookup now says whether it found the PDF or just the product page, so nothing pretends to be more than it is.
+
+# 0.3.19
+
+- **Confirm a booking without emailing anyone.** The booking screen now offers two clear actions · **✓ Confirm booking** records the job and sends nothing, and **✓ Confirm & send confirmation** also drafts the email for your approval. A job you agreed on the phone is now one honest tap; the send option only appears when there's actually an address to send to.
+- **Put it in your calendar.** Confirming can send you a real calendar invite (a proper iCalendar event, so Gmail offers "add to calendar" and it lands with the date, time, trade, address and agreed price). It goes to your own inbox, works with either confirm button, and re-confirming updates the same event instead of making a second one. All-day when no time was agreed, rather than inventing 9am.
+
+# 0.3.18
+
+- **Levels, beds and baths are gone.** They were manual entry nothing could verify and nothing downstream used · the research no longer asks for them, the home form no longer offers them, and Ask no longer receives them. Any values already saved are simply left alone and ignored; nothing is deleted from your data.
+
 # 0.3.17
 
 - **Ask now reads the manual before it answers.** Questions about an asset are grounded in its actual documentation: the saved copy in your vault wins, otherwise the asset's manual link is fetched — a PDF is consulted directly (and quietly saved to the vault for next time), a support page has its readable text extracted and cached for a week. Assets with a manual on file get a 📖 chip on grounded answers; assets without one get an honest "no manual on file" rather than a guess.
 - **Contact changes suggested in chat now wait for your ✓.** Because chat context can carry text from third parties, an Ask-suggested change to a provider's email, phone, or website is held as pending until you confirm it — same as sending an enquiry.
 - Under the hood: every URL the server is asked to fetch — stored manual links, saved documents, and the reachability probe behind order links on consumable faults — now goes through one hardened fetcher that refuses private and internal addresses even when a public-looking hostname points at them, re-checks every redirect, and bounds how much it reads.
+- **The user guide caught up.** It now covers the first-run key wizard, per-home Home Assistant modes, locations coming from HA, the quote loop as it actually works (including forwarding a trade's reply from your own inbox), device watch, and Ask's starter questions.
 
 # 0.3.16
 

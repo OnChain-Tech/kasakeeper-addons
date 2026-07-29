@@ -47,17 +47,27 @@
   <div><h1>KasaKeeper</h1><div class="sub">User guide · the maintenance brain for your house</div></div>
 </header>
 
-<p class="dim">KasaKeeper watches your home the way you'd want to: it knows every asset, when each one was last serviced, who services it, what it costs, and — where Home Assistant can measure it — how hard it's actually being used. It runs entirely on your own Home Assistant box. Your data never leaves the house.</p>
+<p class="dim">KasaKeeper watches your home the way you'd want to: it knows every asset, when each one was last serviced, who services it, what it costs, and — where Home Assistant can measure it — how hard it's actually being used. It runs on your own Home Assistant box and your data is stored there. Anthropic, Google Places and Gmail are only ever called for the specific things you switch on — research, find-a-service, quote emails — each with its own key, each optional except Anthropic.</p>
 
 <h2>Getting started</h2>
-<p>Open <span class="k">Settings → ＋ Add a home</span> and type your address. KasaKeeper researches the property (listings, photos, aerial imagery) and proposes the systems it detects — pool, aircon, solar, gutters. Tick what's real, and it builds each one's maintenance schedule from sensible defaults.</p>
+<p>The first time you open KasaKeeper, a short wizard walks you through the keys it can use — reach it again any time from <span class="k">Settings → 🔑 Manage API keys</span>:</p>
+<div class="card">
+<ul>
+  <li><b>Anthropic</b> <span class="chip">required</span> — powers research, 📷 Snap, Ask and recall checks. Without it, research still runs but on a generic starter profile, not real research on your home, and Snap, Ask and recall checks are unavailable.</li>
+  <li><b>Google Places</b> <span class="chip">optional</span> — richer find-a-service results (ratings, hours, photos). Without it, find-a-service still works, just as a plain Google search link.</li>
+  <li><b>Gmail</b> <span class="chip">optional</span> — quote request emails and reading trades' replies. Without it, KasaKeeper drafts every email for you to send yourself instead, and nothing gets read automatically.</li>
+</ul>
+<p class="dim" style="margin:6px 0 0">Each key is tested against the real service before it's saved, kept on the add-on's server only, and never shown back to you. Skip anything optional and add it later. If the add-on's own <span class="chip">Configuration</span> tab has a key set, that always wins over one entered here.</p>
+</div>
+<p>Once a key is sorted, open <span class="k">Settings → ＋ Add a home</span> and type your address. KasaKeeper researches the property (listings, photos, aerial imagery) and proposes the systems it detects — pool, aircon, solar, gutters. Tick what's real, and it builds each one's maintenance schedule from sensible defaults.</p>
 <p>If your services already have history, tap <span class="k">Start tracking</span> on the dashboard to mark everything serviced today — countdowns begin from there. Or set each task's <em>Last done</em> date by hand for accurate due dates from day one.</p>
+<p>Every home defaults to <b>this add-on's own Home Assistant</b> — nothing to set up. Running KasaKeeper for a home on a different box (a friend's place, a holiday home)? See <a href="#ha">Home Assistant per home</a> below.</p>
 
 <h2>The dashboard</h2>
 <div class="card">
 <ul>
   <li><b>Health gauge</b> — one score for the whole house, with a verdict line and a segmented bar showing the true proportions of <span class="r">overdue</span> · <span class="a">due soon</span> · <span class="g">on track</span>, plus your committed spend for the next 90 days.</li>
-  <li><b>Needs attention</b> — every job that wants action now. The <span class="k">✓</span> button logs it done (and its cost) in one tap; tapping the row opens the asset.</li>
+  <li><b>Needs attention</b> — every job that wants action now, including anything a watched device has just reported. The <span class="k">✓</span> button logs it done (and its cost) in one tap; tapping the row opens the asset.</li>
   <li><b>Quotes in flight</b> — chips for every open conversation with a trade. Tap through to manage them.</li>
   <li><b>Coming up</b> — the next few weeks on a date rail, with who's doing each job.</li>
   <li><b>Keeping watch</b> — weather-aware nudges (wind before gutter cleans, heat before pool care) from your own Home Assistant weather.</li>
@@ -72,10 +82,12 @@
 <h3>The asset page</h3>
 <ul>
   <li><b>Model intelligence</b> — for any asset with a make/model, <span class="k">🔎 Look up features</span> fetches specs, the maker's schedule and the manual. Nothing changes without your Apply.</li>
-  <li><b>The manual</b> — once found, tap <span class="k">⤓ keep a copy</span> and the PDF is stored on your own box: it opens on every device, forever, even if the manufacturer's site dies.</li>
+  <li><b>The manual</b> — research now hunts the maker's direct PDF, and when it finds one the copy is saved to your own box automatically: it opens on every device, forever, even if the manufacturer's site dies. If only a web page was found, tap <span class="k">⤓ keep a copy</span> once you've tracked down the PDF link yourself.</li>
   <li><b>Maker's intervals</b> — tasks tuned from the manual are marked <span style="color:var(--accent)">maker's interval</span> so you know which numbers are the manufacturer's and which are defaults.</li>
   <li><b>Usage tracking</b> — link a Home Assistant entity and jobs come due by <em>actual run-hours or kWh</em>, not just the calendar: "150 h since last service" beats "6 months". The readout shows <span class="chip">42 / 150 hrs · maker's</span>.</li>
+  <li><b>Location</b> — if the asset is linked to a Home Assistant device, its room shows straight from HA's own area, tagged <span class="chip dim">📍 via Home Assistant</span>; move the device to another room in HA and KasaKeeper follows, no editing needed. Things HA can't place (a wall, the gutters, a garden bed) keep a location you type yourself.</li>
   <li><b>Warranties</b> — set the date once; the Warranties tab (in Assets) tracks every expiry, soonest first.</li>
+  <li><b>Device watch</b> — for an HA-linked asset, pick its problem sensors (fault codes, bin full, filter life, a consumable running low) and a task lands the moment one trips, labelled "reported today". A consumable trip that has a real replacement part on the maker's site adds a tappable <span class="k">🛒 Order</span> link right on the task.</li>
   <li><b>DIY</b> — jobs you do yourself: tap <span class="k">🛠 DIY</span> on any task. It stays on the schedule but stops suggesting suppliers and will never auto-email anyone.</li>
 </ul>
 
@@ -83,16 +95,28 @@
 <p>The triage view: every active job grouped by who's on the hook — <span class="chip">Needs a supplier</span> <span class="chip">Awaiting a quote</span> <span class="chip">Assigned</span> <span class="chip">DIY · yours to do</span> — each row carrying exactly one next action: find, manage the quote, book, or call. Editing, snoozing and deleting live on the asset page (tap the row, then the task).</p>
 
 <h2>Trades &amp; quotes</h2>
-<p><span class="k">🔎 Find a service</span> searches the best-reviewed local businesses for <em>that specific asset</em> — ratings, reviews, photos, websites. From a result you can:</p>
+<p><span class="k">🔎 Find a service</span> searches the best-reviewed local businesses for <em>that specific asset</em> — ratings, reviews, photos, websites (with a Google Places key; otherwise a plain search link). From a result you can:</p>
 <ul>
-  <li><b>Request quote</b> — KasaKeeper drafts the enquiry email; <em>you review and approve every send</em>. Replies are read automatically (read-only) and the quote card fills itself in: amounts, offered dates. Pick a date and the confirmation email is drafted for your approval.</li>
+  <li><b>Request quote</b> — KasaKeeper drafts the enquiry email; <em>you review and approve every send</em>. Every reply is read automatically (checked roughly every two minutes, read-only — nothing is ever sent, deleted or moved without you), and the quote card fills itself in as the conversation goes: the amount, any dates offered, and any deposit the trade mentions already paid ("✓ $310 paid · receipt #4821 · $190 owing"). If a reply isn't a clean quote — a question, a dispute, "need to see it first" — the card shows it as <b>reply in</b> with a plain-language summary instead of guessing a price.</li>
+  <li><b>Pick a date</b> — tap an offered date and the confirmation email is drafted for your approval; nothing books until you approve it.</li>
+  <li><b>📌 Book</b> — confirmed the job by phone instead? Record the date and time, then choose <b>✓ Confirm booking</b> to save it with no email sent, or <b>✓ Confirm &amp; send confirmation</b> to also draft one to the trade for your approval. Either way, tick <b>Add to my calendar</b> to get a calendar invite (.ics) emailed to your own address — it books the slot in your calendar without telling the trade, and a re-send for the same booking updates the same calendar entry instead of duplicating it.</li>
+  <li><b>✉︎ Reply</b> — answer the trade in-thread without leaving the app or losing the tracked conversation.</li>
   <li><b>Save</b> — keep them as your provider for that asset; every job logged against them builds their history and lifetime spend.</li>
 </ul>
+<p><b>If a trade replies to your personal inbox</b> instead of the tracked thread, just forward that email to the KasaKeeper mailbox — the quote fills itself in on the next check, and the reply-to address stays the trade's, never yours.</p>
 <p><b>Auto-book</b> (per task, optional): when a job with a linked provider comes due, KasaKeeper emails them for dates from its own mailbox and pings you to confirm. It only ever acts inside business hours, one enquiry at a time, and nothing is booked without you.</p>
 <p><b>Service packs</b>: bought 10 pool cleans up front? Record the pack on the asset and every ✓ Done draws one down.</p>
 
 <h2>Ask</h2>
-<p>The house assistant. Ask anything about your own home — "what needs doing this month?", "who services the aircon and what do they cost a year?", "log the gutter clean as done" — it answers from your real data and can make the edits for you.</p>
+<p>The house assistant. The empty screen offers grouped starter questions — Right now, Money, Assets &amp; warranties, Trades &amp; quotes, Make changes, and (when a home is connected to live Home Assistant) Live house — chips that adapt to your actual data, so a quote question only shows up once you have a quote. Or just ask anything about your own home — "what needs doing this month?", "who services the aircon and what do they cost a year?", "log the gutter clean as done" — it answers from your real data, shows what it grounded the answer in, and any change it proposes waits for your confirmation before it touches anything.</p>
+
+<h2 id="ha">Home Assistant per home</h2>
+<p>Each home picks its own connection in <span class="k">Settings</span>:</p>
+<ul>
+  <li><b>This add-on</b> — the default. Zero setup, and it's what gives you live readings, usage tracking, device watch, weather nudges and the morning brief.</li>
+  <li><b>A different Home Assistant</b> — paste that instance's URL and a long-lived access token. The token is kept on the add-on's server only, never sent to any device, and the URL is checked before it's used (private, loopback and cloud-metadata addresses are refused).</li>
+  <li><b>Not connected</b> — no Home Assistant for this home. Schedules stay calendar-only: no live readings, no usage tracking, no weather nudges, no morning brief for that home, and nothing nags you about a connection that isn't there.</li>
+</ul>
 
 <h2>Themes &amp; devices</h2>
 <p>Two looks, one brand: <b>Night</b> (dark, made for the wall tablet) and <b>Paper</b> (warm light, lovely on a desktop). Each device keeps its own choice in <span class="k">Settings → Appearance</span>; "Match system" follows the device's light/dark setting.</p>
@@ -102,7 +126,7 @@
 <p>At 8am (your Home Assistant timezone), a push notification summarises what's overdue, what's due soon, and any weather nudges — via your Home Assistant companion app. Toggle it in <span class="k">Settings</span>.</p>
 
 <h2>Your data</h2>
-<p>Everything lives on your own Home Assistant box (<span class="chip">/data</span>, included in HA backups). API keys stay server-side and are set in the add-on's Configuration tab — never in the app. The email loop reads your dedicated mailbox read-only, and every outgoing email is approved by you first.</p>
+<p>Everything lives on your own Home Assistant box (<span class="chip">/data</span>, included in HA backups). API keys — whether set in the add-on's <span class="chip">Configuration</span> tab or entered through the key wizard — stay server-side and are never sent to the client or shown back to you. A remote home's Home Assistant token is stored the same way. The email loop reads your mailbox read-only, and every outgoing email is approved by you first.</p>
 
 <footer>KasaKeeper · self-hosted home maintenance · this guide ships with the add-on (<a href="./">back to the app</a>)</footer>
 </main>

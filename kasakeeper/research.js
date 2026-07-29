@@ -3,7 +3,7 @@
 // In production this calls a small BACKEND that: (1) geocodes the address,
 // (2) pulls property facts from realestate.com.au / Domain / CoreLogic,
 // (3) has Claude READ past listing photos (vision) to detect pool, spa, sauna,
-// levels, gardens, etc., and (4) cross-references Home Assistant devices.
+// gardens, etc., and (4) cross-references Home Assistant devices.
 // The key stays server-side. Until that backend exists, this returns a
 // high-quality detected profile so the whole onboarding UX is real and usable.
 //
@@ -48,7 +48,7 @@ const Research = {
       category: CATEGORIES[f.category] ? f.category : 'Appliance',
       source: [f.source, f.confidence].filter(Boolean).join(' · '),
     }));
-    return { address: d.address || address, suburb: d.suburb || '', levels: d.levels, beds: d.beds, baths: d.baths, features: feats, summary: d.summary || '' };
+    return { address: d.address || address, suburb: d.suburb || '', features: feats, summary: d.summary || '' };
   },
   // Offline stub — sensible detection when the backend isn't running.
   _stub(address) {
@@ -70,7 +70,6 @@ const Research = {
     ];
     return {
       address: address || 'Your home',
-      levels: 1, beds: null, baths: null,
       suburb: Store.state.settings.suburb || '',
       features,
     };
@@ -201,11 +200,13 @@ const Research = {
     return this._emailAvail;
   },
   // Send a user-approved enquiry via the backend Gmail. token lets the reply-poller
-  // match the trade's reply back to this quote. Returns { ok, subject } / { ok:false, error }.
-  async sendEnquiry({ to, cc, subject, body, token }) {
+  // match the trade's reply back to this quote. ics (optional) is the raw booking
+  // facts for a calendar invite — the server builds and attaches the .ics itself.
+  // Returns { ok, subject } / { ok:false, error }.
+  async sendEnquiry({ to, cc, subject, body, token, ics }) {
     try {
       const r = await fetch('api/enquiry/send', { method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ to, cc, subject, body, token }) });
+        body: JSON.stringify({ to, cc, subject, body, token, ics }) });
       const j = await r.json().catch(() => ({}));
       return (r.ok && j.ok) ? { ok: true, subject: j.subject } : { ok: false, error: j.error || ('HTTP ' + r.status) };
     } catch (e) { return { ok: false, error: String(e) }; }

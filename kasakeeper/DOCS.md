@@ -4,7 +4,7 @@ The maintenance brain for your house. Give it an address and it researches the p
 
 ## What it does
 
-- **Create a home from an address** · Claude reads public real-estate listings *and* inspects satellite imagery to detect pool, spa, solar, gardens, levels and more. Detected systems come pre-selected · the rest of the service catalogue is offered below to toggle on.
+- **Create a home from an address** · Claude reads public real-estate listings *and* inspects satellite imagery to detect pool, spa, solar, gardens and more. Detected systems come pre-selected · the rest of the service catalogue is offered below to toggle on.
 - **Automatic schedules** · every asset gets sensible maintenance tasks from a catalogue with variants (e.g. Hot water → Gas storage / Heat pump / Solar), each with its own cadence and cost.
 - **Snap an asset** · photograph an appliance's nameplate and KasaKeeper reads the make, model and serial, then researches that exact unit · real specs, the manufacturer's schedule and the manual. One tap applies the maker's own intervals.
 - **Dashboard** · a home-health score, what's overdue / due soon, upcoming cost, warranty status and weather-aware nudges from your own Home Assistant weather.

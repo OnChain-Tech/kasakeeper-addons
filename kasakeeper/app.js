@@ -588,7 +588,19 @@ function startLookup(id) {
     LOOKUP = { assetId: id, status: r && !r.error ? 'done' : 'error', result: r, applied: false };
     DBG.log('lookup-result', { asset: a.name, error: (r && r.error) || null, tasks: (r && r.tasks || []).length, ...((r && r.debug) || {}) });
     // The manual link is a fact about the asset, not this session — keep it.
-    if (r && r.manualUrl) { const aa = Store.asset(id); if (aa && !aa.manualUrl) { aa.manualUrl = r.manualUrl; Store.upsertAsset(aa); } }
+    if (r && r.manualUrl) {
+      const aa = Store.asset(id); if (aa && !aa.manualUrl) { aa.manualUrl = r.manualUrl; Store.upsertAsset(aa); }
+      // A direct-PDF manual is worth keeping now: vault it on the Green (same as
+      // the chip's "keep a copy") so link-rot never takes it. Best-effort; the
+      // server re-checks the %PDF magic before anything is stored.
+      const cur = Store.asset(id);
+      if (r.manualKind === 'pdf' && cur && !cur.manualDoc && cur.manualUrl === r.manualUrl)
+        fetch('api/doc', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ assetId: id, url: webUrl(r.manualUrl) }) })
+          .then(x => x.json()).then(j => {
+            if (j.error) return;
+            const b = Store.asset(id); if (b && !b.manualDoc) { b.manualDoc = true; Store.upsertAsset(b); if (route()[0] === 'asset') render(); }
+          }).catch(() => {});
+    }
     if (route()[0] === 'asset') render();
   });
 }
@@ -1412,7 +1424,7 @@ function viewSettings() {
   // Homes list in the instrument language: k-row per home, active one carries the
   // dot + a static tile (no tap target — nothing to switch to), the rest are
   // tap-to-switch rows (replaces the old explicit "Switch" button, same action).
-  const homeRow = h => { const meta = [h.levels && h.levels + ' levels', h.beds && h.beds + ' bed'].filter(Boolean).join(' · ');
+  const homeRow = h => { const meta = h.suburb || '';
     return `<div class="k-row"${h.id === cur ? ' style="cursor:default"' : ` data-action="switch-home" data-id="${h.id}"`}>
       <div class="k-tile">${h.photo ? `<img class="home-thumb" src="api/home-photo/${esc(h.id)}" alt="" onload="this.classList.add('on')" onerror="this.remove()">` : ''}<span class="em">${h.id === cur ? '🏠' : '🏘️'}</span></div>
       <div class="k-main"><div class="k-title">${esc(h.address || 'Home')}</div><div class="k-sub">${esc(meta) || (h.id === cur ? 'current home' : 'tap to switch')}${h.testMode ? ' · test home' : ''}</div></div>
@@ -1423,14 +1435,11 @@ function viewSettings() {
   // switch to a home to configure it.
   const curHomeCard = (() => { const h = homes.find(x => x.id === cur); if (!h) return '';
     // Everything researched or inferred about the home is correctable here —
-    // the address, the counts, the photo. Research proposes; the user disposes.
+    // the address, the photo. Research proposes; the user disposes. (levels/beds/baths
+    // were removed as unverifiable manual entry that nothing downstream used — any
+    // values a home already has just stop being read/shown, never wiped.)
     return `<div class="card">
       <label>Address</label><input id="eh_addr" value="${esc(h.address || '')}">
-      <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px">
-        <div><label>Levels</label><input id="eh_levels" type="number" value="${h.levels || ''}"></div>
-        <div><label>Beds</label><input id="eh_beds" type="number" value="${h.beds || ''}"></div>
-        <div><label>Baths</label><input id="eh_baths" type="number" value="${h.baths || ''}"></div>
-      </div>
       <label style="display:flex;align-items:center;gap:10px;cursor:pointer;margin-top:10px">
         <input type="checkbox" data-action-change="toggle-testmode" data-id="${h.id}" ${h.testMode ? 'checked' : ''} style="width:auto">
         Test home — skip Home Assistant (a friend's house, a demo)
@@ -1668,14 +1677,21 @@ function jobRow(l) {
     <div class="k-right">${l.cost ? `<span class="k-pill green">${money(l.cost)}</span>` : ''}</div>
   </div>`;
 }
-// Booking a quote: capture WHEN, record it as a scheduled job, and (if we can
-// email) draft a confirmation to the trade for approval. Nothing sends itself.
+// Booking a quote: capture WHEN, record it as a scheduled job, and let the user
+// pick whether that's local-only or also drafts a confirmation to the trade for
+// approval — both are explicit buttons, neither sends anything by itself.
 function bookQuote(quoteId) {
   const q = Store.quote(quoteId); if (!q) return viewDashboard();
   const a = Store.asset(q.assetId);
   const prov = (a && a.providerId) ? Store.provider(a.providerId)
              : Store.homeProviders().find(p => p.name === q.provider);
   const to = q.replyFrom || q.enquiryTo || (prov && prov.email) || '';
+  // Research._emailAvail is primed at boot (see the startup probe below) and
+  // cached from then on, so a synchronous view can read it directly — the
+  // click handlers still re-check with `await Research.emailAvailable()`.
+  const canSend = !!to && Research._emailAvail === true;
+  const ownerEmail = (Store.state.settings && Store.state.settings.emailCc) || Research._emailFrom || '';
+  const canInvite = Research._emailAvail === true && !!ownerEmail;
   return `<button class="back" data-action="back">‹ Cancel</button>
     <div class="hero"><div class="emoji">📅</div><div><h1>Book this job</h1>
       <div class="t-sub">${esc(q.trade || (a ? a.name : 'Service'))}${q.amount ? ' · ' + money(q.amount) : ''}</div></div></div>
@@ -1685,10 +1701,19 @@ function bookQuote(quoteId) {
       ${field('b_time','Time (optional)', q.bookedTime || '', 'text', 'e.g. 1:30 PM')}
       ${field('b_note','What they are doing', q.trade || '', 'text')}
       ${field('b_cost','Agreed price ($)', q.amount || '', 'number')}
-      <div class="kk-note">Saving adds this to the asset's Job history as <b>booked</b> — it won't count as spend until you mark it done.
-        ${to ? `A confirmation email to <b>${esc(to)}</b> will be drafted for you to approve before anything sends.`
+      <div class="kk-note">Saving adds this to the asset's Job history as <b>booked</b> · it won't count as spend until you mark it done.</div>
+      ${canInvite ? `<label style="display:flex;align-items:center;gap:10px;cursor:pointer;margin-top:10px">
+        <input type="checkbox" id="b_invite" checked style="width:auto">
+        Add to my calendar · sends an invite to <b>${esc(ownerEmail)}</b>
+      </label>` : ''}
+      <div class="kk-note">${canSend
+        ? `“Confirm &amp; send confirmation” drafts an email to <b>${esc(to)}</b> for you to approve before anything sends.`
+        : to ? `Email isn't set up, so nothing will be emailed to ${esc(to)}.`
              : `No email on file for this supplier, so nothing will be sent.`}</div>
-      <div class="btn-row"><button class="btn primary" data-action="save-booking" data-id="${q.id}">Confirm booking</button></div>
+      <div class="btn-row">
+        <button class="btn primary" data-action="save-booking" data-mode="local" data-id="${q.id}">✓ Confirm booking</button>
+        ${canSend ? `<button class="btn" data-action="save-booking" data-mode="send" data-id="${q.id}">✓ Confirm &amp; send confirmation</button>` : ''}
+      </div>
     </div>`;
 }
 function editJob(assetId, logId) {
@@ -1991,7 +2016,7 @@ function viewSetup() {
       : `<div class="banner ok">Detected ${d.features.length} things to maintain — from listings, photos & your Home Assistant. These are switched on; add anything else below, then create your home.</div>`;
     return `<button class="back" data-action="back">‹ Back</button>
       <div class="hero"><div class="emoji">🏠</div><div><h1>${esc(d.address)}</h1>
-      <div class="t-sub">${[d.levels && d.levels + ' level' + (d.levels > 1 ? 's' : ''), d.beds && d.beds + ' bed', d.baths && d.baths + ' bath'].filter(Boolean).join(' · ')}</div></div></div>
+      <div class="t-sub">${esc(d.suburb || '')}</div></div></div>
       ${banner}
       <div class="section-title">Detected — included <span class="pill">${onCount}/${d.features.length}</span></div>
       <div class="k-list">${d.features.map(featChip).join('')}</div>
@@ -2681,7 +2706,7 @@ const kkPrompt = (label, value = '', { okLabel = 'Save', type = 'text', hint = '
       i.addEventListener('keydown', e => { if (e.key === 'Enter') w.querySelector('[data-kk="ok"]').click(); }); },
     resolveOn: w => w.querySelector('#kk_p').value });
 
-function composeEnquiry({ quoteId, providerId, to, cc, subject, body, sendLabel, templates, onSent, draftKind }) {
+function composeEnquiry({ quoteId, providerId, to, cc, subject, body, sendLabel, templates, onSent, draftKind, ics }) {
   const wrap = document.createElement('div');
   wrap.className = 'kk-modal';
   wrap.innerHTML = `<div class="kk-modal-card" role="dialog" aria-modal="true">
@@ -2697,7 +2722,8 @@ function composeEnquiry({ quoteId, providerId, to, cc, subject, body, sendLabel,
       <input class="kk-i" id="cm_su" value="${esc(subject)}">
       <label class="kk-l">Message</label>
       <textarea class="kk-t" id="cm_bo" rows="9">${esc(body)}</textarea>
-      <div class="kk-note">Sends from your KasaKeeper mailbox. Replies are read automatically and the quote fills itself in.</div>
+      <div class="kk-note">${ics ? 'Sends from your KasaKeeper mailbox with a calendar invite attached — open it to add the job to your calendar app.'
+        : 'Sends from your KasaKeeper mailbox. Replies are read automatically and the quote fills itself in.'}</div>
       <div class="kk-modal-b">
         <button class="btn" data-cm="cancel">Cancel</button>
         <button class="btn primary" data-cm="send">✉︎ ${esc(sendLabel || 'Send')}</button>
@@ -2709,7 +2735,7 @@ function composeEnquiry({ quoteId, providerId, to, cc, subject, body, sendLabel,
   const draftOn = () => quoteId ? Store.quote(quoteId) : (providerId ? Store.provider(providerId) : null);
   const saveDraft = () => {
     const o = draftOn(); if (!o) return;
-    o.draft = { to: val('cm_to'), cc: val('cm_cc'), subject: val('cm_su'), body: val('cm_bo'), sendLabel: sendLabel || 'Send', kind: draftKind || '' };
+    o.draft = { to: val('cm_to'), cc: val('cm_cc'), subject: val('cm_su'), body: val('cm_bo'), sendLabel: sendLabel || 'Send', kind: draftKind || '', ics: ics || undefined };
     quoteId ? Store.upsertQuote(o) : Store.upsertProvider(o); Store.push && Store.push();
   };
   const clearDraft = () => { const o = draftOn(); if (!o || !o.draft) return;
@@ -2736,8 +2762,11 @@ function composeEnquiry({ quoteId, providerId, to, cc, subject, body, sendLabel,
     const btn = ev.target; btn.disabled = true; btn.textContent = 'Sending…';
     // No quote behind this email means nothing to track a reply back to — and the
     // backend stamps whatever it is given into the subject the trade actually reads.
+    // A calendar invite goes to the OWNER'S own inbox, not the trade thread — never
+    // stamp a [KK-...] tracking token onto it, or a reply from the owner could get
+    // read by the quote-reply poller.
     const res = await Research.sendEnquiry({ to: to2, cc: val('cm_cc'), subject: su, body: bo,
-      token: quoteId ? 'KK-' + quoteId : '' });
+      token: (quoteId && !ics) ? 'KK-' + quoteId : '', ics });
     if (res.ok) { clearDraft(); close(); onSent && onSent({ to: to2, subject: res.subject || su, body: bo }); }
     else { btn.disabled = false; btn.textContent = '✉︎ ' + (sendLabel || 'Send'); alert('Send failed: ' + res.error); }
   });
@@ -2865,6 +2894,13 @@ document.addEventListener('click', async e => {
     case 'open-draft': {
       const q = Store.quote(id); if (!q || !q.draft) return;
       const d = q.draft, aa = Store.asset(q.assetId);
+      // A calendar-invite draft isn't a trade-thread email: resuming it must not
+      // rewind the quote's status, log it as trade correspondence, or navigate
+      // like a quote send — just deliver the invite the owner already approved.
+      if (d.kind === 'invite') {
+        return composeEnquiry({ quoteId: q.id, to: d.to, cc: d.cc, subject: d.subject, body: d.body,
+          sendLabel: d.sendLabel, ics: d.ics, onSent: () => toast('Booked · invite sent to ' + d.to) });
+      }
       const prov = (aa && aa.providerId) ? Store.provider(aa.providerId)
                  : Store.homeProviders().find(p => p.name === q.provider);
       return composeEnquiry({ quoteId: q.id, to: d.to, cc: d.cc, subject: d.subject, body: d.body, sendLabel: d.sendLabel,
@@ -2936,7 +2972,7 @@ document.addEventListener('click', async e => {
     case 'create-home': {
       const d = SETUP.detected; if (!d) return;
       SETUP.detected = null;   // claim it NOW — the photo-vault await below opens a double-tap window otherwise
-      const home = Store.addHome({ address: d.address, levels: d.levels, beds: d.beds, baths: d.baths, testMode: !!SETUP.testMode });
+      const home = Store.addHome({ address: d.address, testMode: !!SETUP.testMode });
       if (d.suburb) { home.suburb = d.suburb; Store.save(); }   // the suburb belongs to THIS home — never the global settings
       const all = d.features.concat(SETUP.extras || []);   // detected + any extras the user turned on
       const variants = {};
@@ -2979,8 +3015,6 @@ document.addEventListener('click', async e => {
       const h = Store.state.homes.find(x => x.id === id); if (!h) return render();
       const addr = (val('eh_addr') || '').trim().slice(0, 200);
       if (addr) h.address = addr;
-      const num = fid => { const n = Number(val(fid)); return Number.isFinite(n) && n > 0 && n < 100 ? n : null; };
-      h.levels = num('eh_levels'); h.beds = num('eh_beds'); h.baths = num('eh_baths');
       Store.save(); toast('Home updated'); return render();
     }
     case 'switch-home': Store.switchHome(id); return go('/');
@@ -3171,17 +3205,41 @@ document.addEventListener('click', async e => {
       Store.upsertQuote(q);
       if (a) Store.addLog({ assetId: a.id, date, note: note + (time ? ' · ' + time : ''), cost,
                             providerId: prov ? prov.id : '', ref: q.ref || '', source: 'booked', pending: true });
+      const home = Store.home() || {};
+      const mode = node.getAttribute('data-mode') || 'local';
       const to = q.replyFrom || q.enquiryTo || (prov && prov.email) || '';
-      if (to && await Research.emailAvailable()) {
-        const home = Store.home() || {};
+      const inviteEl = document.getElementById('b_invite');
+      const wantInvite = !!(inviteEl && inviteEl.checked);
+      const ownerEmail = (Store.state.settings && Store.state.settings.emailCc) || Research._emailFrom || '';
+      // The calendar entry goes to the OWNER'S OWN inbox, so it's independent of
+      // whether a confirmation to the trade is also sent — applies to both
+      // buttons. Still a user-approved send like every other outgoing mail: a
+      // second pre-filled compose sheet, never a silent send.
+      const willInvite = wantInvite && !!ownerEmail && Research._emailAvail === true;
+      const sendInvite = () => {
+        if (!willInvite) return;
+        q.icsSeq = (q.icsSeq || 0) + 1; Store.upsertQuote(q);
+        const subject = `📅 ${note} · ${jobDate(date)}`;
+        const body = `Booked: ${note}${time ? ' at ' + time : ''} on ${jobDate(date)}`
+          + `${home.address ? ' — ' + home.address : ''}${cost ? ' · ' + money(cost) : ''}.\n\n`
+          + `This email carries a calendar invite — open it to add the job to your calendar.`;
+        const ics = { quoteId: q.id, summary: [note, q.provider].filter(Boolean).join(' · '),
+          description: [a ? a.name : '', cost ? money(cost) : ''].filter(Boolean).join(' · '),
+          location: home.address || '', startDate: date, startTime: time || '',
+          durationMinutes: 120, sequence: q.icsSeq };
+        composeEnquiry({ quoteId: q.id, to: ownerEmail, subject, body, sendLabel: 'Add to calendar', ics,
+          draftKind: 'invite', onSent: () => toast('Booked · invite sent to ' + ownerEmail) });
+      };
+      if (mode === 'send' && to && await Research.emailAvailable()) {
         const subject = `Booking confirmation — ${note}`;
         const body = `Hi${q.provider ? ' ' + q.provider : ''},\n\nConfirming ${note}`
           + `${cost ? ' at ' + money(cost) : ''} for ${jobDate(date)}${time ? ', ' + time : ''}`
           + `${home.address ? ' at ' + home.address : ''}.\n\nCould you please confirm that time works?\n\nThanks!`;
         return composeEnquiry({ quoteId: q.id, to, subject, body, sendLabel: 'Send confirmation',
-          onSent: () => { toast('Booked · confirmation sent to ' + (q.provider || to)); go('/asset/' + (a ? a.id : '')); } });
+          onSent: () => { toast('Booked · confirmation sent to ' + (q.provider || to)); sendInvite(); go('/asset/' + (a ? a.id : '')); } });
       }
-      toast(to ? 'Booked ✓ — mailbox off, so no email sent' : 'Booked ✓');
+      toast(willInvite ? 'Booked · saved, no email sent to the supplier' : 'Booked · saved, no email sent');
+      sendInvite();
       return go('/asset/' + (a ? a.id : ''));
     }
     case 'new-job': return go('/edit-job/' + id);
