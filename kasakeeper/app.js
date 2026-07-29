@@ -962,6 +962,14 @@ function chatSuggestionGroups() {
       'Set a reminder to test the smoke alarms',
     ]},
   ];
+  // Manuals group only when an asset actually has one — a chip that answers
+  // "no manual on file" every time is worse than no chip.
+  const withManual = Store.homeAssets().find(a => (a.manualDoc || a.manualUrl) && a.name);
+  if (withManual) groups.push({ label: 'Manuals', qs: [
+    `What does an error code on the ${withManual.name} mean?`,
+    `How do I reset the ${withManual.name}?`,
+    `What filter or part does the ${withManual.name} take?`,
+  ]});
   if (ha) groups.push({ label: 'Live house', qs: [
     'Which devices are usage-tracked, and how close to service are they?',
     'Does Home Assistant disagree with any of my assets?',
@@ -976,10 +984,14 @@ function viewChat() {
     const body = esc(m.content).replace(/\*\*([^*\n]+)\*\*/g, '<b>$1</b>').replace(/\n/g, '<br>');
     const chg = (m.changes && m.changes.length)
       ? `<div class="chat-changes">${m.changes.map(c => `✓ ${esc(c)}`).join('<br>')}</div>` : '';
-    // Grounding: what the reply was based on — the usage-tracked entities + their live state.
+    // Grounding: what the reply was based on — usage-tracked entities + their live
+    // state, and any manual the server consulted (linked when a vault copy exists).
     const grounded = (m.grounded && m.grounded.length)
-      ? `<div class="chat-grounded">${m.grounded.map(g =>
-          `<span class="chip ground">● ${esc(g.entity)}${g.state != null ? ' · ' + esc(g.state) : ''}</span>`).join('')}</div>`
+      ? `<div class="chat-grounded">${m.grounded.map(g => g.kind === 'manual'
+          ? (g.assetId
+              ? `<a class="chip ground" data-ext href="api/doc/${esc(g.assetId)}" target="_blank" rel="noopener"><svg class="ci"><use href="#i-doc"/></svg> ${esc(g.asset)} · ${esc(g.source)}</a>`
+              : `<span class="chip ground"><svg class="ci"><use href="#i-doc"/></svg> ${esc(g.asset)} · ${esc(g.source)}</span>`)
+          : `<span class="chip ground">● ${esc(g.entity)}${g.state != null ? ' · ' + esc(g.state) : ''}</span>`).join('')}</div>`
       : '';
     // Destructive tool calls land here as proposals, not done yet — the user confirms per-row.
     // applying lives on the proposal object itself (not a captured index or DOM flag) so a
@@ -1001,7 +1013,7 @@ function viewChat() {
   const empty = CHAT.messages.length ? '' : `<div class="chat-intro">
       <svg class="chat-hero"><use href="#kk-mark"/></svg>
       <div class="t-name">Ask me about the house</div>
-      <div class="t-sub">I know your assets, schedules, warranties, trades and quotes — and I can update them.</div>
+      <div class="t-sub">I know your assets, schedules, warranties, trades and quotes — I can update them, and look answers up in your manuals.</div>
       ${chatSuggestionGroups().map(g => `<div class="sugg-label">${esc(g.label)}</div>
       <div class="chat-sugg">${g.qs.map(s => `<button class="chip sugg" data-action="chat-suggest" data-q="${esc(s)}">${esc(s)}</button>`).join('')}</div>`).join('')}
     </div>`;
