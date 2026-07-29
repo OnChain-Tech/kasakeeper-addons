@@ -1,3 +1,12 @@
+# 0.3.21
+
+Four fixes from using the app on real bookings.
+
+- **A booked job's date can be changed.** A booked quote now offers 📌 Change date · the trade rings to move Thursday to the week after and you just re-confirm. The job history updates in place instead of gaining a second entry, and your calendar event moves rather than duplicating.
+- **Confirm a trade's offered date without emailing them.** Tapping an offered date books it locally; sending a confirmation is a separate, explicit choice. A date already agreed on the phone or in your own inbox no longer forces a redundant email at the trade.
+- **"Find suppliers" only shows when it's the next step** · it's gone from booked jobs and from quotes that already have a trade attached.
+- Outbound emails now use house punctuation throughout.
+
 # 0.3.20
 
 - **Research now hunts the actual manual, not just a link to a page about it.** Looking up an asset strongly prefers the manufacturer's direct PDF — and when the first find is only a support page, it spends one more focused search hunting the PDF itself. Result: manuals Ask can actually read, instead of app-style pages with no readable text.

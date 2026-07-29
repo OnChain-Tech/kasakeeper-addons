@@ -1355,11 +1355,25 @@ function viewProvider(id) {
             ${m.snippet ? `<div class="k-sub dim">${esc(m.snippet)}</div>` : ''}</div>
         </div>`).join('')}</div>`; })()}`;
 }
+// The trade's email for a quote/booking: an in-thread reply address wins over
+// the provider record, so a confirmation always goes back to whoever actually
+// emailed us. Shared by qCard, bookQuote and the save-booking/send-confirmation
+// actions so the "who do we email" lookup only lives in one place.
+function quoteContact(q, a) {
+  const prov = (a && a.providerId) ? Store.provider(a.providerId)
+             : Store.homeProviders().find(p => p.name === q.provider);
+  return { prov, to: q.replyFrom || q.enquiryTo || (prov && prov.email) || '' };
+}
 // One quote request, with its next action inline — shared by Trades and the dashboard.
 function qCard(q) {
     const a = Store.asset(q.assetId);
+    const { to: contactTo } = quoteContact(q, a);
     const waiting = q.status === 'enquiry_sent' && q.channel === 'email';   // sent via backend, poller is watching
     const draftBtn = q.draft ? `<button class="btn small primary" data-action="open-draft" data-id="${q.id}">✉︎ Review &amp; send</button>` : '';
+    // Once booked, a confirmation email is optional and separate from the booking
+    // itself (see 'confirm-date'/'send-confirmation') — only offer it while there's
+    // somewhere to send it and it hasn't already gone out.
+    const canSendConfirm = !!contactTo && Research._emailAvail === true && !q.bookingConfirmSent;
     const nextBtns = draftBtn + (q.status === 'to_contact' ? `<button class="btn small" data-action="quote-sent" data-id="${q.id}">✉︎ Mark enquiry sent</button>`
       : waiting ? `<span class="chip watching">⌁ awaiting reply</span><button class="btn small" data-action="quote-amount" data-id="${q.id}">💲 Log manually</button>`
       : q.status === 'replied' ? `<button class="btn small primary" data-action="quote-amount" data-id="${q.id}">💲 Log quote</button><button class="btn small" data-action="quote-book" data-id="${q.id}">📌 Book</button>${(q.replyFrom || q.enquiryTo) ? `<button class="btn small" data-action="quote-reply" data-id="${q.id}">✉︎ Reply</button>` : ''}`
@@ -1367,20 +1381,25 @@ function qCard(q) {
       : q.status === 'dates_offered' ? (q.offeredDates || []).map(d =>
           `<button class="btn small primary" data-action="confirm-date" data-id="${q.id}" data-date="${esc(d)}">✅ ${esc(d)}</button>`).join('')
           + `<button class="btn small" data-action="quote-amount" data-id="${q.id}">💲 Log quote</button>`
-      : q.status === 'quoted' ? `<button class="btn small primary" data-action="quote-book" data-id="${q.id}">✅ Book it${q.amount ? ' · ' + money(q.amount) : ''}</button><button class="btn small" data-action="quote-amount" data-id="${q.id}">✎ Change</button>${(q.replyFrom || q.enquiryTo) ? `<button class="btn small" data-action="quote-reply" data-id="${q.id}">✉︎ Reply</button>` : ''}` : '');
+      : q.status === 'quoted' ? `<button class="btn small primary" data-action="quote-book" data-id="${q.id}">✅ Book it${q.amount ? ' · ' + money(q.amount) : ''}</button><button class="btn small" data-action="quote-amount" data-id="${q.id}">✎ Change</button>${(q.replyFrom || q.enquiryTo) ? `<button class="btn small" data-action="quote-reply" data-id="${q.id}">✉︎ Reply</button>` : ''}`
+      : q.status === 'booked' ? `<button class="btn small" data-action="quote-book" data-id="${q.id}">📌 Change date</button>${canSendConfirm ? `<button class="btn small" data-action="send-confirmation" data-id="${q.id}">✉︎ Send confirmation</button>` : ''}`
+      : '');
     const meta = [
       q.bookedDate ? `📌 booked — ${esc(q.bookedDate)}` : (q.availability ? `📅 ${esc(q.availability)}` : ''),
       q.paidAmount ? `✓ ${money(q.paidAmount)} paid${q.paidReceipt ? ' · receipt ' + esc(q.paidReceipt) : ''}${q.balanceDue ? ' · ' + money(q.balanceDue) + ' owing' : ''}` : '',
       q.replyNote ? esc(q.replyNote) : (waiting && q.enquiryTo ? `enquiry sent to ${esc(q.enquiryTo)}` : ''),
     ].filter(Boolean).join(' · ');
     const cls = q.status === 'booked' ? 'green' : q.status === 'replied' ? 'blue' : 'amber';
+    // A "find suppliers" nudge only makes sense while nobody's lined up — once a
+    // provider is named on the quote (or it's booked/declined), it's noise.
+    const showSuppliers = a && !q.provider && q.status !== 'booked' && q.status !== 'declined';
     return `<div class="k-row ${cls}">
       <div class="k-tile"><span class="em">🧾</span></div>
       <div class="k-main"><div class="k-title">${esc((a && (!q.trade || q.trade === a.category)) ? a.name : (q.trade || 'Quote'))}${q.amount ? ' · ' + money(q.amount) : ''}${q.auto ? ' <span class="chip auto">🤖 auto</span>' : q.autoParsed ? ' <span class="chip auto">auto</span>' : ''}</div>
       <div class="k-sub">${a && q.trade && q.trade !== a.name && q.trade !== a.category ? esc(a.name) + ' · ' : ''}${esc(QSTATUS[q.status] || q.status)}${q.provider ? ' · ' + esc(q.provider) : ''}</div>
       ${meta ? `<div class="k-sub dim">${meta}</div>` : ''}
       <div class="btn-row" style="margin-top:8px">${nextBtns}
-        ${a ? `<button class="btn small" data-action="find" data-id="${a.id}">🔎 Suppliers</button>` : ''}
+        ${showSuppliers ? `<button class="btn small" data-action="find" data-id="${a.id}">🔎 Suppliers</button>` : ''}
         <button class="btn small" data-action="del-quote" data-id="${q.id}" style="color:var(--red)">Remove</button></div></div>
       <div class="k-right"><span class="k-pill ${cls}">${esc(QSTATUS[q.status] || q.status)}</span></div>
     </div>`;
@@ -1683,9 +1702,8 @@ function jobRow(l) {
 function bookQuote(quoteId) {
   const q = Store.quote(quoteId); if (!q) return viewDashboard();
   const a = Store.asset(q.assetId);
-  const prov = (a && a.providerId) ? Store.provider(a.providerId)
-             : Store.homeProviders().find(p => p.name === q.provider);
-  const to = q.replyFrom || q.enquiryTo || (prov && prov.email) || '';
+  const { to } = quoteContact(q, a);
+  const rebooking = q.status === 'booked';   // reopened from "📌 Change date" — update in place, don't duplicate
   // Research._emailAvail is primed at boot (see the startup probe below) and
   // cached from then on, so a synchronous view can read it directly — the
   // click handlers still re-check with `await Research.emailAvailable()`.
@@ -1693,7 +1711,7 @@ function bookQuote(quoteId) {
   const ownerEmail = (Store.state.settings && Store.state.settings.emailCc) || Research._emailFrom || '';
   const canInvite = Research._emailAvail === true && !!ownerEmail;
   return `<button class="back" data-action="back">‹ Cancel</button>
-    <div class="hero"><div class="emoji">📅</div><div><h1>Book this job</h1>
+    <div class="hero"><div class="emoji">📅</div><div><h1>${rebooking ? 'Change the date' : 'Book this job'}</h1>
       <div class="t-sub">${esc(q.trade || (a ? a.name : 'Service'))}${q.amount ? ' · ' + money(q.amount) : ''}</div></div></div>
     <div class="card">
       <div class="t-sub" style="margin-bottom:10px">${esc(q.provider || 'Supplier')}${a ? ' · ' + esc(a.name) : ''}</div>
@@ -1701,7 +1719,8 @@ function bookQuote(quoteId) {
       ${field('b_time','Time (optional)', q.bookedTime || '', 'text', 'e.g. 1:30 PM')}
       ${field('b_note','What they are doing', q.trade || '', 'text')}
       ${field('b_cost','Agreed price ($)', q.amount || '', 'number')}
-      <div class="kk-note">Saving adds this to the asset's Job history as <b>booked</b> · it won't count as spend until you mark it done.</div>
+      <div class="kk-note">${rebooking ? "Saving updates this job's existing history entry · it won't count as spend until you mark it done."
+        : "Saving adds this to the asset's Job history as <b>booked</b> · it won't count as spend until you mark it done."}</div>
       ${canInvite ? `<label style="display:flex;align-items:center;gap:10px;cursor:pointer;margin-top:10px">
         <input type="checkbox" id="b_invite" checked style="width:auto">
         Add to my calendar · sends an invite to <b>${esc(ownerEmail)}</b>
@@ -1711,7 +1730,7 @@ function bookQuote(quoteId) {
         : to ? `Email isn't set up, so nothing will be emailed to ${esc(to)}.`
              : `No email on file for this supplier, so nothing will be sent.`}</div>
       <div class="btn-row">
-        <button class="btn primary" data-action="save-booking" data-mode="local" data-id="${q.id}">✓ Confirm booking</button>
+        <button class="btn primary" data-action="save-booking" data-mode="local" data-id="${q.id}">✓ ${rebooking ? 'Save new date' : 'Confirm booking'}</button>
         ${canSend ? `<button class="btn" data-action="save-booking" data-mode="send" data-id="${q.id}">✓ Confirm &amp; send confirmation</button>` : ''}
       </div>
     </div>`;
@@ -2573,12 +2592,12 @@ function bookingEmail(prov, focusAsset, focusTask) {
     const ts = Store.tasksFor(a2.id).filter(t2 => !t2.snoozed && !isDiy(t2, a2) && mine(t2, a2));
     if (!ts.length) return;
     const mm = [a2.make, a2.model].filter(Boolean).join(' ');
-    lines.push(`• ${a2.name}${mm ? ` — ${mm}` : ''}`);
+    lines.push(`• ${a2.name}${mm ? ` · ${mm}` : ''}`);
     ts.forEach(t2 => lines.push(`    - ${t2.title}${t2.note ? ` (${t2.note})` : ''}`));
   });
   const home = Store.home() || {};
   return {
-    subject: `Booking request — ${focusTask ? focusTask.title : focusAsset.name}`,
+    subject: `Booking request · ${focusTask ? focusTask.title : focusAsset.name}`,
     body: `Hi ${prov.name},\n\nWe'd like to book a service${home.address ? ` at ${home.address}` : ''}. `
       + `Could you quote for the following and offer a couple of dates that suit?\n\n${lines.join('\n')}\n\n`
       + signOff(),
@@ -2596,10 +2615,10 @@ function faultEmail(prov, asset, task) {
   const reading = f.kind === 'consumable' && f.value !== undefined ? ` (reading ${f.value}%)` : '';
   const flap = (f.cycles || 1) > 1 ? ` It has come and gone ${f.cycles} times, so it may be intermittent.` : '';
   return {
-    subject: `${asset.name} — ${f.label || task.title} (reported by the unit)`,
+    subject: `${asset.name} · ${f.label || task.title} (reported by the unit)`,
     body: `Hi ${prov.name},\n\nOur ${asset.name.toLowerCase()}${mm ? ` (${mm})` : ''}${home.address ? ` at ${home.address}` : ''} `
       + `is reporting a problem: ${f.label || task.title}${reading}, first seen ${firstSeen}`
-      + `${age > 0 ? ` — ${age} day${age === 1 ? '' : 's'} ago` : ''}.${flap}\n\n`
+      + `${age > 0 ? ` (${age} day${age === 1 ? '' : 's'} ago)` : ''}.${flap}\n\n`
       + `Could you quote to take a look, and offer a couple of dates that would suit?\n\n`
       + signOff(),
   };
@@ -2636,22 +2655,22 @@ function tradeTemplates(p) {
     .filter(x => x.d !== null && !x.t.autopilot).sort((x, y) => x.d - y.d)[0];
 
   const out = [];
-  if (due) out.push({ label: due.d < 0 ? 'Book — overdue' : 'Book a service',
-    subject: `Booking — ${due.t.title} (${due.a.name})`,
+  if (due) out.push({ label: due.d < 0 ? 'Book · overdue' : 'Book a service',
+    subject: `Booking · ${due.t.title} (${due.a.name})`,
     body: `${hi}\n\nI'd like to book the ${due.t.title.toLowerCase()} on our ${due.a.name.toLowerCase()}${at}.\n\n`
         + `What dates does your team have available over the next few weeks?\n\nThanks!` });
   out.push({ label: 'Ask for a quote',
-    subject: `Quote request — ${assets.length === 1 ? assets[0].name : (TRADES[p.trade] || p.trade || 'work')}`,
+    subject: `Quote request · ${assets.length === 1 ? assets[0].name : (TRADES[p.trade] || p.trade || 'work')}`,
     body: `${hi}\n\nCould you please quote me for work on the ${thing}${at}?\n\n`
-        + `Happy to send photos or have someone take a look first — whatever is easiest.\n\nThanks!` });
+        + `Happy to send photos, or have someone take a look first, whatever is easiest.\n\nThanks!` });
   if (last) {
     out.push({ label: 'About that last job',
-      subject: `Follow-up — ${last.note || 'your last visit'}${last.ref ? ' (' + last.ref + ')' : ''}`,
+      subject: `Follow-up · ${last.note || 'your last visit'}${last.ref ? ' (' + last.ref + ')' : ''}`,
       body: `${hi}\n\nYou looked at our ${thing}${at} on ${jobDate(last.date)}`
           + `${last.ref ? ` (${last.ref})` : ''}.\n\nSince then I have noticed `
           + `[describe what it is doing]. Could you take a look?\n\nThanks!` });
     out.push({ label: 'Copy of the invoice',
-      subject: `Copy of invoice — ${jobDate(last.date)}${last.ref ? ' (' + last.ref + ')' : ''}`,
+      subject: `Copy of invoice · ${jobDate(last.date)}${last.ref ? ' (' + last.ref + ')' : ''}`,
       body: `${hi}\n\nCould you send me a copy of the invoice for the work on ${jobDate(last.date)}`
           + `${last.ref ? ` (${last.ref})` : ''}${at ? ',' + at : ''}?\n\nThanks!` });
   }
@@ -2856,7 +2875,7 @@ document.addEventListener('click', async e => {
       const q = ensureQuote(id, 'to_contact'); if (q) { q.provider = p.name; Store.upsertQuote(q); }
       const home = (Store.state.settings && Store.state.settings.home) || {};
       const where = home.address || homeSuburb() || 'my home';
-      const subject = `Enquiry — ${a.name}`;
+      const subject = `Enquiry · ${a.name}`;
       // Lead with the actual JOB, never a category-derived trade guess — this sentence
       // goes to a real business, and "gutter cleaning" about a limestone wall is nonsense.
       const body = `Hi${p.name ? ' ' + p.name : ''},\n\nI'm looking for help with our ${a.name.toLowerCase()} near ${where}.\n\nAre you available, and what are your rates?\n\nThanks!`;
@@ -2927,32 +2946,36 @@ document.addEventListener('click', async e => {
         onSent: () => { toast('Reply sent · watching for their answer'); render(); } });
     }
     case 'quote-amount': { const q = Store.quote(id); if (!q) return; const amt = await kkPrompt('Quoted amount ($)', q.amount || '', { type: 'number' }); if (amt === null) return; q.amount = Number(amt) || 0; q.status = 'quoted'; Store.upsertQuote(q); return render(); }
-    case 'quote-book': return go('/book/' + id);   // capture the date, log it, draft the confirmation
-    case 'confirm-date': {  // auto-book: user picks one of the offered dates -> approved confirmation email
+    case 'quote-book': return go('/book/' + id);   // capture the date, log it, draft the confirmation (or change an existing booking's date)
+    // Picking one of the trade's offered dates books it straight away, locally —
+    // the trade already told us these dates work, so re-emailing them back isn't
+    // the common case and must never block the booking from sticking. Telling the
+    // trade it's locked in is a separate, explicit tap: see 'send-confirmation'.
+    case 'confirm-date': {
       const q = Store.quote(id); if (!q) return;
       const date = node.getAttribute('data-date') || '';
       const a = Store.asset(q.assetId);
-      const home = Store.home() || {};
-      const to = q.replyFrom || q.enquiryTo;
-      const subject = `Booking confirmation — ${q.trade || (a ? a.name : 'service')}${q.token ? ` [${q.token}]` : ''}`;
-      const body = `Hi${q.provider ? ' ' + q.provider : ''},\n\nThanks for the dates — ${date} works for us. `
-        + `Please consider it confirmed${home.address ? ` for ${home.address}` : ''}${q.amount ? ` at ${money(q.amount)}` : ''}.`
-        + `\n\nSee you then!`;
-      const finalize = () => {
-        q.status = 'booked'; q.bookedDate = date; q.confirmedAt = todayISO(); Store.upsertQuote(q);
-        if (a && q.provider && !a.providerId) {
-          const p = Store.upsertProvider({ name: q.provider, trade: q.trade || a.category, email: to || '', notes: 'Auto-booked' });
-          a.providerId = p.id; Store.upsertAsset(a);
-        }
-      };
-      if (to && await Research.emailAvailable()) {
-        return composeEnquiry({ quoteId: q.id, to, subject, body, sendLabel: 'Confirm booking', onSent: () => {
-          finalize(); toast('Booked — ' + date); blinkMark(); render(); } });
+      const { to } = quoteContact(q, a);
+      q.status = 'booked'; q.bookedDate = date; q.confirmedAt = todayISO(); Store.upsertQuote(q);
+      if (a && q.provider && !a.providerId) {
+        const p = Store.upsertProvider({ name: q.provider, trade: q.trade || a.category, email: to || '', notes: 'Auto-booked' });
+        a.providerId = p.id; Store.upsertAsset(a);
       }
-      // No add-on mailbox: hand the confirmation to the device's mail app (same
-      // fallback as every other enquiry flow) — never book silently without telling the trade.
-      if (to) location.href = `mailto:${to}?subject=${encodeURIComponent(subject)}&body=${encodeURIComponent(body)}`;
-      finalize(); toast('Booked — ' + date); return render();
+      toast(to && Research._emailAvail === true ? `Booked · ${date}. Tap ✉︎ Send confirmation to let them know` : `Booked · ${date}`);
+      blinkMark(); return render();
+    }
+    case 'send-confirmation': {   // explicit, separate tap — never sent automatically by booking a date
+      const q = Store.quote(id); if (!q) return;
+      const a = Store.asset(q.assetId);
+      const home = Store.home() || {};
+      const { to } = quoteContact(q, a);
+      if (!to || !await Research.emailAvailable()) return;
+      const subject = `Booking confirmation · ${q.trade || (a ? a.name : 'service')}${q.token ? ` [${q.token}]` : ''}`;
+      const body = `Hi${q.provider ? ' ' + q.provider : ''},\n\nThanks for the dates. ${q.bookedDate || 'The date'} works for us and is locked in`
+        + `${home.address ? ` for ${home.address}` : ''}${q.amount ? ` at ${money(q.amount)}` : ''}.`
+        + `\n\nSee you then!`;
+      return composeEnquiry({ quoteId: q.id, to, subject, body, sendLabel: 'Send confirmation', onSent: () => {
+        q.bookingConfirmSent = true; Store.upsertQuote(q); toast('Confirmation sent to ' + (q.provider || to)); render(); } });
     }
     case 'del-quote': if (await kkConfirm('Remove this quote request?', { okLabel: 'Remove', danger: true })) { Store.deleteQuote(id); return render(); } return;
     case 'setup': SETUP = { step:1, address:'', msg:'', detected:null, selected:new Set(), extras:[], testMode:false, selectedImage:null }; delete IMAGERY.setup; return go('/setup');
@@ -3099,7 +3122,7 @@ document.addEventListener('click', async e => {
       const to = prov && prov.email ? prov.email : '';
       const mm = [a.make, a.model].filter(Boolean).join(' ');
       const home = Store.home() || {};
-      const subject = `Warranty claim — ${mm || a.name} (purchased ${a.installedOn || 'date unknown'})`;
+      const subject = `Warranty claim · ${mm || a.name} (purchased ${a.installedOn || 'date unknown'})`;
       const body = `Hi,\n\nI'd like to make a warranty claim for our ${a.name.toLowerCase()}${mm ? ` (${mm})` : ''}${home.address ? ` at ${home.address}` : ''}.\n\n`
         + `Make/model: ${mm || '—'}\nSerial: ${a.serial || '—'}\nInstalled/purchased: ${a.installedOn || '—'}\nWarranty until: ${a.warrantyUntil || '—'}\n\n`
         + `Fault: <describe the issue>\n\nCould you let me know the next steps to have this looked at under warranty?\n\n` + signOff();
@@ -3195,19 +3218,33 @@ document.addEventListener('click', async e => {
     case 'save-booking': {
       const q = Store.quote(id); if (!q) return;
       const a = Store.asset(q.assetId);
-      const prov = (a && a.providerId) ? Store.provider(a.providerId)
-                 : Store.homeProviders().find(p => p.name === q.provider);
+      const { prov, to } = quoteContact(q, a);
       const date = val('b_date') || todayISO();
       const time = val('b_time');
       const note = val('b_note') || q.trade || 'Booked job';
       const cost = Number(val('b_cost')) || q.amount || 0;
       q.status = 'booked'; q.bookedDate = date; q.bookedTime = time; q.amount = cost;
       Store.upsertQuote(q);
-      if (a) Store.addLog({ assetId: a.id, date, note: note + (time ? ' · ' + time : ''), cost,
-                            providerId: prov ? prov.id : '', ref: q.ref || '', source: 'booked', pending: true });
+      if (a) {
+        // Re-opening "📌 Change date" on an already-booked quote must UPDATE the
+        // job history entry it made the first time, not add a second one. Match on
+        // quoteId (set below on every new booking log); a single pending 'booked'
+        // log with no quoteId (written before this field existed) is the one
+        // unambiguous legacy case worth updating too.
+        let existing = Store.state.logs.find(l => l.assetId === a.id && l.quoteId === q.id && l.source === 'booked');
+        if (!existing) {
+          const legacy = Store.state.logs.filter(l => l.assetId === a.id && l.source === 'booked' && l.pending && !l.quoteId);
+          if (legacy.length === 1) existing = legacy[0];
+        }
+        // Always stamp quoteId on write (including a legacy log matched by the
+        // fallback above) so a THIRD re-confirm finds it directly next time,
+        // even if another quote on this same asset gets booked in the meantime.
+        const patch = { date, note: note + (time ? ' · ' + time : ''), cost, providerId: prov ? prov.id : '', ref: q.ref || '', quoteId: q.id };
+        if (existing) Store.updateLog(existing.id, patch);
+        else Store.addLog({ assetId: a.id, ...patch, source: 'booked', pending: true });
+      }
       const home = Store.home() || {};
       const mode = node.getAttribute('data-mode') || 'local';
-      const to = q.replyFrom || q.enquiryTo || (prov && prov.email) || '';
       const inviteEl = document.getElementById('b_invite');
       const wantInvite = !!(inviteEl && inviteEl.checked);
       const ownerEmail = (Store.state.settings && Store.state.settings.emailCc) || Research._emailFrom || '';
@@ -3218,11 +3255,15 @@ document.addEventListener('click', async e => {
       const willInvite = wantInvite && !!ownerEmail && Research._emailAvail === true;
       const sendInvite = () => {
         if (!willInvite) return;
+        // UID is derived from the quote id (see build_booking_ics), so bumping
+        // icsSeq and re-sending UPDATES the existing calendar entry rather than
+        // creating a second one — holds whether this is the first booking or a
+        // re-confirm from "📌 Change date".
         q.icsSeq = (q.icsSeq || 0) + 1; Store.upsertQuote(q);
         const subject = `📅 ${note} · ${jobDate(date)}`;
         const body = `Booked: ${note}${time ? ' at ' + time : ''} on ${jobDate(date)}`
-          + `${home.address ? ' — ' + home.address : ''}${cost ? ' · ' + money(cost) : ''}.\n\n`
-          + `This email carries a calendar invite — open it to add the job to your calendar.`;
+          + `${home.address ? ' · ' + home.address : ''}${cost ? ' · ' + money(cost) : ''}.\n\n`
+          + `This email carries a calendar invite. Open it to add the job to your calendar.`;
         const ics = { quoteId: q.id, summary: [note, q.provider].filter(Boolean).join(' · '),
           description: [a ? a.name : '', cost ? money(cost) : ''].filter(Boolean).join(' · '),
           location: home.address || '', startDate: date, startTime: time || '',
@@ -3231,12 +3272,12 @@ document.addEventListener('click', async e => {
           draftKind: 'invite', onSent: () => toast('Booked · invite sent to ' + ownerEmail) });
       };
       if (mode === 'send' && to && await Research.emailAvailable()) {
-        const subject = `Booking confirmation — ${note}`;
+        const subject = `Booking confirmation · ${note}`;
         const body = `Hi${q.provider ? ' ' + q.provider : ''},\n\nConfirming ${note}`
           + `${cost ? ' at ' + money(cost) : ''} for ${jobDate(date)}${time ? ', ' + time : ''}`
           + `${home.address ? ' at ' + home.address : ''}.\n\nCould you please confirm that time works?\n\nThanks!`;
         return composeEnquiry({ quoteId: q.id, to, subject, body, sendLabel: 'Send confirmation',
-          onSent: () => { toast('Booked · confirmation sent to ' + (q.provider || to)); sendInvite(); go('/asset/' + (a ? a.id : '')); } });
+          onSent: () => { q.bookingConfirmSent = true; Store.upsertQuote(q); toast('Booked · confirmation sent to ' + (q.provider || to)); sendInvite(); go('/asset/' + (a ? a.id : '')); } });
       }
       toast(willInvite ? 'Booked · saved, no email sent to the supplier' : 'Booked · saved, no email sent');
       sendInvite();
@@ -3320,7 +3361,7 @@ document.addEventListener('click', async e => {
       const unit = p.unit || 'visit';
       const first = (prov && prov.contact) ? String(prov.contact).split(' ')[0] : '';
       const to = (prov && prov.email) || '';
-      const subject = `Maintenance booking — ${a.name}${home.address ? ' · ' + home.address : ''}`;
+      const subject = `Maintenance booking · ${a.name}${home.address ? ' · ' + home.address : ''}`;
       const body = `Hi${first ? ' ' + first : ''},\n\n`
         + `I'd like to book the next maintenance ${unit} for our ${a.name.toLowerCase()}`
         + `${home.address ? ` at ${home.address}` : ''}.\n\n`

@@ -402,7 +402,8 @@ const Store = {
                 cost: Number(e.cost) || 0, note: e.note || '',
                 providerId: e.providerId || '', ref: e.ref || '',
                 pending: !!e.pending,          // booked, not done yet
-                source: e.source || 'manual' };
+                source: e.source || 'manual',
+                quoteId: e.quoteId || '' };    // links a 'booked' log back to its quote, so re-confirming updates it instead of duplicating
     Store.state.logs.push(l); Store.save(); return l;
   },
   updateLog(id, patch) {

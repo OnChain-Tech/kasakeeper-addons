@@ -2184,14 +2184,14 @@ def autobook_scan():
         qid = _uid("q")
         token = "KK-" + qid
         when = "is due now" if d <= 0 else f"comes due in about {d} days"
-        subject = f"Booking request — {t.get('title')} ({a.get('name')}) [{token}]"
+        subject = f"Booking request · {t.get('title')} ({a.get('name')}) [{token}]"
         body = (f"Hi {p.get('name')},\n\n"
-                f"We'd like to book you in for: {t.get('title')} — {a.get('name')}"
+                f"We'd like to book you in for: {t.get('title')} · {a.get('name')}"
                 + (f" at {addr}" if addr else "")
                 + f". It {when}.\n\n"
                 "Could you reply with a quote and two or three dates/times that would suit you? "
                 "We'll confirm one by reply.\n\nThanks!\n"
-                "(Sent by KasaKeeper, our home-maintenance assistant — just reply to this email.)")
+                "(Sent by KasaKeeper, our home-maintenance assistant. Just reply to this email.)")
         # Persist the quote BEFORE sending: if the email went first and the contended
         # store write then gave up, nothing recorded the send and the next scan would
         # email the same trade again. Unattended outbound mail must never double-fire —
