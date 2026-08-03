@@ -39,12 +39,49 @@ const tradeFor = a => (a && (a.trade || '').trim()) || TRADES[(a || {}).category
 // maintenance" finds stonemasons; "Ducted aircon repair and maintenance" finds
 // aircon techs. An explicit "Trade to call" override always wins verbatim.
 const searchQueryFor = a => (a && (a.trade || '').trim()) || (a && a.name ? `${a.name} repair and maintenance` : tradeFor(a));
+// What to search when the search STARTS FROM A TASK: lead with the task's own
+// title ("Clean solar panels" finds panel cleaners), not the asset's name
+// ("Solar + battery" finds installers) — the whole reason a per-task search
+// exists (a garden's mower vs its tree lopper; solar's cleaner vs its install/
+// repair pro). An explicit asset-level "Trade to call" override still wins
+// verbatim — if the owner told us exactly who to search for, that beats any
+// task-title guess. Falls back to the asset-based query with no task at all.
+function searchQueryForTask(t, a) {
+  if (a && (a.trade || '').trim()) return a.trade.trim();
+  if (t && t.title && t.title.trim()) return t.title.trim();
+  return searchQueryFor(a);
+}
 // Suburb is a fact about the CURRENT home, not the app — two homes in two cities
 // must not share one search location. settings.suburb stays as legacy fallback.
 const homeSuburb = () => { const h = Store.home(); return (h && h.suburb) || Store.state.settings.suburb || ''; };
 let FIND = { assetId: null, loading: false, providers: null, msg: '' };  // live find-a-service state
 let LOOKUP = { assetId: null, status: 'idle', result: null };            // feature-lookup state (per asset)
 let RECALL = { assetId: null, status: 'idle', result: null };            // recall-check state (per asset)
+// Transient hand-off to the /book form: when 'confirm-date' can't resolve the
+// trade's free-text offered date (DEFECT D), it routes here instead of
+// stamping today — this carries the raw text through so the form can show
+// what the trade actually said. Never persisted; cleared whenever /book is
+// reached the normal way (see 'quote-book').
+let BOOK_HINT = { quoteId: '', text: '' };
+
+// Assets/Trades filter box: what's typed, per screen. Device-local UI state,
+// not household data — never touches Store, never syncs to another device.
+// Kept as a plain module var (same shelf as FIND/SNAP/CHAT) so a render() for
+// any OTHER reason (mutation, shared-store adopt) still shows the same
+// narrowed list instead of forgetting it.
+let FILTER = { assets: '', trades: '' };
+// Pure matcher: case-insensitive, trims the ends, substring-anywhere. A
+// multi-word query requires every word to appear SOMEWHERE in the haystack
+// (not adjacent) — "bosch dish" finds "Bosch Dishwasher". Empty/blank query
+// matches everything; a missing haystack (no fields set) never throws.
+// Covered directly in tools/test-filter.py (a Python port — see that file's
+// header for why, same convention as asset_location() in test-asset-location.py).
+function matchesFilter(query, haystack) {
+  const words = String(query == null ? '' : query).trim().toLowerCase().split(/\s+/).filter(Boolean);
+  if (!words.length) return true;
+  const hay = String(haystack == null ? '' : haystack).toLowerCase();
+  return words.every(w => hay.includes(w));
+}
 
 // ---- first-run key wizard — which server-side keys are live (booleans only,
 // never the values), and the guided setup content for each. checked=false
@@ -163,6 +200,7 @@ function goBack() {
     'book': '/providers', 'catalog': r[1] !== undefined && r[1] !== '' ? '/catalog' : '/assets',
     'snap': '/assets', 'gmail-import': '/settings', 'triage': '/',
     'wizard': Store.state.currentHomeId ? '/settings' : '/setup',
+    'confirm-house': '/settings',
   }[r[0]];
   go(parent || '/');
 }
@@ -379,9 +417,13 @@ async function hydrateGmail() {
 }
 function viewGmailImport() {
   const g = GMSCAN;
-  if (g.status === 'scanning') return `<button class="back" data-action="back">‹ Cancel</button>
-    <div class="hero"><div class="emoji">📬</div><div><h1>Reading your tradie mail…</h1><div class="t-sub">Quotes, invoices and bookings from the last 3 years.</div></div></div>
+  if (g.status === 'scanning') {
+    const preview = g.mode !== 'full';
+    return `<button class="back" data-action="back">‹ Cancel</button>
+    <div class="hero"><div class="emoji">📬</div><div><h1>${preview ? 'Checking your mail…' : 'Reading your tradie mail…'}</h1><div class="t-sub">${preview ? 'Counting matches only · nothing is read or imported yet.' : 'Quotes, invoices and bookings from the last 3 years.'}</div></div></div>
     <div class="banner ok">◍ ${esc(g.msg || 'Scanning…')}</div>`;
+  }
+  if (g.status === 'preview' && g.result) return viewGmailPreview(g.result);
   if (g.status !== 'done' || !g.result) return viewDashboard();
   const r = g.result;
   const provNames = new Set(Store.homeProviders().map(p => p.name.toLowerCase()));
@@ -406,6 +448,27 @@ function viewGmailImport() {
     <div class="section-title">The mail proves you have <span class="pill">${(r.inferredAssets || []).length}</span></div>
     ${aRows || '<div class="empty">Nothing new inferred.</div>'}
     <div class="btn-row"><button class="btn primary wide" data-action="gmail-import">Import ${g.picked.s.size + g.picked.a.size} selected →</button></div>`;
+}
+// Default first step for a scan — a dry run that only counts matches, never reads a
+// body or writes anything. Tolerant of an older/partial result shape (no mailbox,
+// queries, candidates, dedupedTotal or capped) so it renders rather than throwing.
+function viewGmailPreview(r) {
+  const mailbox = r.mailbox || 'your mailbox';
+  const since = r.since || '';
+  const queries = Array.isArray(r.queries) ? r.queries : [];
+  const candidates = Array.isArray(r.candidates) ? r.candidates : [];
+  const dedupedTotal = r.dedupedTotal != null ? r.dedupedTotal : (r.scanned || 0);
+  const wouldScan = r.wouldScan != null ? r.wouldScan : (r.scanned || 0);
+  const qRows = queries.map(q => `<div class="meta"><div class="k">${esc(q.query || '')}</div><div class="v">${q.hits || 0}</div></div>`).join('');
+  const cRows = candidates.map(c => `<div class="t-sub" style="white-space:normal">${esc(c.subject || '(no subject)')} · ${esc(c.from || '')}</div>`).join('');
+  return `<button class="back" data-action="back">‹ Back</button>
+    <div class="hero"><div class="emoji">📬</div><div><h1>Preview · nothing imported yet</h1><div class="t-sub">${esc(mailbox)}${since ? ' · mail since ' + esc(since) : ''}</div></div></div>
+    ${r.capped ? `<div class="banner">Only the newest ${esc(String(wouldScan))} of ${esc(String(dedupedTotal))} matches will be read · the oldest ${esc(String(dedupedTotal - wouldScan))} fall outside this scan's cap.</div>` : ''}
+    <div class="section-title">Matches per search <span class="pill">${dedupedTotal}</span></div>
+    ${qRows ? `<div class="meta-grid">${qRows}</div>` : '<div class="empty">No matches in this mailbox yet.</div>'}
+    <div class="section-title">Sample of what it found <span class="pill">${candidates.length}</span></div>
+    ${cRows || '<div class="empty">Nothing to sample.</div>'}
+    <div class="btn-row"><button class="btn primary wide" data-action="gmail-scan-real">📥 Import for real (reads ${wouldScan} email${wouldScan !== 1 ? 's' : ''}) →</button></div>`;
 }
 
 /* ---------- Home Assistant device import + auto-link (mirrors Gmail import) ---------- */
@@ -737,12 +800,12 @@ function taskCard(t, { showAsset = true } = {}) {
   // A provider with an email gets "Book service" (drafts the quoting email); an open
   // quote means booking is already in flight, so fall back to the call button.
   const findBtn = prov
-    ? (prov.email && !Store.quoteForAsset(a.id)
+    ? (prov.email && !Store.quoteForTask(t)
         ? `<button class="btn small" data-action="book-service" data-id="${t.id}">✉︎ Book service</button>`
         : `<button class="btn small" data-action="call" data-id="${a.id}">📞 ${esc(prov.name)}</button>`)
     : isDiy(t, a)
       ? `<button class="btn small" data-action="${t.diy ? 'toggle-diy' : 'toggle-asset-diy'}" data-id="${t.diy ? t.id : a.id}" title="You do this yourself · tap to change">🛠 DIY ✓</button>`
-      : `<button class="btn small" data-action="find" data-id="${a.id}">🔎 Find a service</button><button class="btn small" data-action="toggle-diy" data-id="${t.id}" title="No tradie needed · I do this myself">🛠 DIY</button>`;
+      : `<button class="btn small" data-action="find" data-id="${a.id}" data-task="${t.id}">🔎 Find a service</button><button class="btn small" data-action="toggle-diy" data-id="${t.id}" title="No tradie needed · I do this myself">🛠 DIY</button>`;
   return `<div class="card" data-action="open-asset" data-id="${a.id}">
     <div class="row">
       ${assetTile(a, 'emoji')}
@@ -837,37 +900,184 @@ function recallBanner(a) {
   return '';   // 'unknown' — nothing durable worth showing once the live banner's gone
 }
 
+// Pure — a task that already has a pending booking covering it (per
+// Store.bookingCovers — same asset, and matched by taskId, the booking's own
+// quote.taskId, a note/title overlap, or the sole-taskless-booking fallback,
+// NOT l.taskId alone) must not ALSO render its own schedule-based
+// overdue/soon row: same job, same commitment, one row. This used to key on
+// l.taskId only (DEFECT A), which a quote born from Find-a-service or the
+// enquiry email never sets — the common path, not an edge case — so that
+// booking's task rendered twice and the "Needs attention" pill over-counted
+// while costOverdue() (store.js), which now shares this same bookingCovers()
+// matcher, priced it once. `pendingBookings` must be EVERY pending booking
+// (not just overdue ones — see viewDashboard) so a future-dated booking
+// drops its task's row here exactly like Store.overdueTasks() drops it from
+// the money side; the caller is responsible for giving that task a home
+// under Coming up instead, or it silently disappears (DEFECT B(ii)). No
+// DOM/cache read, so this is unit-testable like locFieldState.
+// The coverage window mirrors Store.overdueTasks() exactly (same
+// ATTENTION_WINDOW_DAYS bound, same "undated booking does NOT count as
+// covering" rule) — this list feeds the same hero/segbar counts that
+// function's own numbers drive, so the two must agree on which bookings
+// suppress which tasks or the hero and the rows underneath it disagree.
+function dedupeAttentionTasks(overdueAndSoon, pendingBookings) {
+  return overdueAndSoon.filter(t => !pendingBookings.some(l => {
+    if (!Store.bookingCovers(l, t)) return false;
+    const d = Store._dayDelta(l.date);
+    return d !== null && d <= ATTENTION_WINDOW_DAYS;
+  }));
+}
+
+// Pure — the default the ✓ Done prompt pre-fills. A task with a PENDING
+// booking already has a real agreed price sitting on that booking log; if
+// the dialog defaulted to the task's own rough estCost instead (as it used
+// to, unconditionally), a user who accepts the pre-filled value without
+// editing it — the common case — has markDone() (store.js) silently
+// overwrite the booking's correct cost with the task's generic estimate.
+// Defaulting to the booking's own cost here means leaving the field alone
+// keeps the real price; only a value the user actually typed overrides it.
+// Uses Store.bookingSettles() (post-369cb0f review), NOT the heuristic
+// Store.bookingCovers() — markDone() itself now only ever SETTLES a booking
+// under the same strict linkage, so defaulting this field from a merely
+// heuristic guess (note/title overlap, or "the only other booking on this
+// asset") could pre-fill an unrelated booking's price; accepting it unedited
+// would then log the WRONG amount against this task while the real booking
+// stays untouched and pending. Matching the two keeps the prompt honest
+// about what markDone() is actually about to do.
+//
+// DEFECT 1 (2026-07 verifier round): checks Store._doneToday(t.id) FIRST —
+// once a booking has been settled by an earlier ✓ Done today, it is no
+// longer PENDING, so the old code's booking search found nothing and fell
+// all the way through to t.estCost. A re-tap ("did that register?", or a
+// typo fix) then showed the ROUGH ESTIMATE as the default, and accepting it
+// unedited silently overwrote a real recorded price (e.g. $450) with the
+// estimate (e.g. $180) — proven end-to-end: booked $450 -> ✓ Done (correctly
+// prefills 450) -> Log it -> ✓ Done again (prefilled 180, pre-fix) -> confirm
+// -> the job's real cost is gone, no undo. _doneToday() is the exact same
+// question markDone() itself asks to find the row a re-tap must land on, so
+// the prefill and the write can never again disagree about what "already
+// done today" means.
+function doneDialogDefaultCost(t) {
+  const doneToday = Store._doneToday(t.id);
+  if (doneToday) return doneToday.cost || 0;
+  const booking = Store._pendingBookings().find(l => Store.bookingSettles(l, t));
+  return booking ? (booking.cost || 0) : (t.estCost || 0);
+}
+
+// Pure — whether the ✓ Done handler's "a job just finished" side effects
+// (Store.resetUsage, Store.usePack) should fire for THIS tap. Only a
+// genuinely NEW completion earns them; a price-correction re-tap must not
+// repeat them. Self-review finding on the DEFECT 1 fix above: Store.usePack()
+// has no idempotence of its own (it unconditionally increments a.pack.used,
+// clamped only at the pack's total), so before this existed, tapping ✓ Done
+// twice for ONE job — the exact re-tap flow that fix's new dialog copy
+// ("Already logged today — update the price?") explicitly invites — silently
+// burned a SECOND prepaid visit off the pack for a mere price edit, with no
+// second log row to show for it (proven against the real store.js: pack.used
+// 3->4 on a same-day price-only re-tap). Takes the SAME Store._doneToday(t.id)
+// read the prompt copy and the price prefill already use, evaluated once
+// before Store.markDone() runs (a fresh completion hasn't happened yet at
+// that point; a re-tap's prior row already has).
+function isFreshCompletion(t) { return !Store._doneToday(t.id); }
+
 // An asset that hit its usage threshold but has no overdue/soon task to carry it.
 /* ---------- views ---------- */
 function viewDashboard() {
   const tasks = Store.homeTasks().slice().sort((a,b) => (Store.daysUntil(a)??1e9) - (Store.daysUntil(b)??1e9));
+  // Every pending booking for the home, not just overdue ones — dedupeAttentionTasks
+  // and the ok-status "Coming up" filter below both need the full set so a
+  // future-dated booking can drop its task's row exactly like Store.overdueTasks()
+  // drops it from the overdue money (DEFECT B(ii)); see that function's comment.
+  // Store._pendingBookings() (not an open-coded homeLogs().filter(l=>l.pending))
+  // so this sits inside the SAME "a non-pending log is never offered to the
+  // matcher" guarantee the rest of store.js relies on, instead of a second
+  // hand-rolled copy that could silently drift from it.
+  const pendingBookings = Store._pendingBookings();
   const overdue = tasks.filter(t => Store.status(t)==='overdue');
-  const soon    = tasks.filter(t => Store.status(t)==='soon');
-  const upcoming= tasks.filter(t => Store.status(t)==='ok' && Store.daysUntil(t)!==null).slice(0,4);
+  // soon-status tasks a pending booking already covers belong to that
+  // booking's own row (an overdue-dated booking covering a soon task, say) —
+  // same coverage rule as `upcoming`/`okCount` below, so this list, the
+  // segbar's amber count and okCount's green count never double a job the
+  // red count (or a Coming-up row) already carries.
+  const soon = tasks.filter(t => Store.status(t)==='soon' && !pendingBookings.some(l => Store.bookingCovers(l, t)));
   // Usage-due assets (last known HA telemetry) lead the attention list: their own
   // tasks float to the front, and one with no due task gets a card of its own.
   const uDue = usageDueAssets();
   const uDueIds = new Set(uDue.map(a => a.id));
-  const attention = overdue.concat(soon)
+  // Booked jobs whose date has passed: a commitment nobody nagged about
+  // before (the schedule only reads tasks) — surfaced here so it isn't
+  // invisible, with the same ✓ Done a normal history entry gets. Computed
+  // before `attention` so dedupeAttentionTasks can strip out any task it
+  // already covers (see that function's comment).
+  const obooked = Store.overdueBookings();
+  const attention = dedupeAttentionTasks(overdue.concat(soon), pendingBookings)
     .sort((x, y) => (uDueIds.has(y.assetId) ? 1 : 0) - (uDueIds.has(x.assetId) ? 1 : 0));
   const uCards = uDue.filter(a => !attention.some(t => t.assetId === a.id));
-  const attnCount = attention.length + uCards.length;
+  const attnCount = attention.length + uCards.length + obooked.length;
   USAGE.rendered = uDue.map(a => a.id).sort().join();
-  const openQuotes = Store.homeQuotes().filter(q => q.status !== 'booked');  // in-flight asks belong on the front page
+  const openQuotes = Store.homeQuotes().filter(q => q.status !== 'booked' && q.status !== 'done');  // in-flight asks belong on the front page
   const h = Store.homeHealth();
-  const next = Store.nextTask();
+  // The "Nothing to see, next up: X" empty-state line only fires when attnCount
+  // is 0 — but a task a pending booking covers can now leave attnCount at 0
+  // while the task itself is still wildly overdue by its own schedule (its row
+  // moved to its booking, per dedupeAttentionTasks above). Store.nextTask()
+  // doesn't know about coverage, so without this filter it could pick exactly
+  // that task and print "Nothing to see. Next up: HVAC service · 9678d
+  // overdue" — technically true and completely contradictory. Same coverage
+  // rule as `upcoming`/`attention` above, applied here too.
+  const next = Store.homeTasks().filter(t => Store.daysUntil(t) !== null && !pendingBookings.some(l => Store.bookingCovers(l, t)))
+    .sort((a, b) => Store.daysUntil(a) - Store.daysUntil(b))[0] || null;
   const unsched = Store.unscheduled();
-  const notSetUp = tasks.length > 0 && !next && unsched.length > 0;  // tasks exist but none scheduled
-  const okCount = tasks.filter(t => Store.status(t) === 'ok' && Store.daysUntil(t) !== null).length;
+  // notSetUp asks "is anything genuinely scheduled at all", which must stay
+  // coverage-BLIND: Store.nextTask() (not the coverage-aware `next` above) —
+  // otherwise a home with one fully set-up, fully-booked task and one never-
+  // touched task would read as "nothing scheduled yet" and bury its real
+  // hero counts and booking under the bulk "Start tracking" CTA.
+  const notSetUp = tasks.length > 0 && !Store.nextTask() && unsched.length > 0;  // tasks exist but none scheduled
+  // Same coverage rule as `soon` above and `upcoming` below — an ok-status
+  // task a pending booking already covers belongs to that booking's row, not
+  // its own, or the green count double-counts a job the booking already carries.
+  const okCount = tasks.filter(t => Store.status(t) === 'ok' && Store.daysUntil(t) !== null
+    && !pendingBookings.some(l => Store.bookingCovers(l, t))).length;
+  // Coming up: ok-status tasks not already covered by a pending booking (a
+  // covered task's row belongs to its booking instead — same rule dedupeAttentionTasks
+  // applies above, so a booked-ahead task never renders twice), plus every
+  // pending booking dated today or later. Without the latter, a future-dated
+  // booking that suppresses its task's OVERDUE row (DEFECT B(ii)) had nowhere
+  // left to render at all — silently disappearing rather than moving here.
+  const upcoming = tasks.filter(t => Store.status(t) === 'ok' && Store.daysUntil(t) !== null
+    && !pendingBookings.some(l => Store.bookingCovers(l, t))).slice(0, 4);
+  const upcomingBookings = pendingBookings.filter(l => {
+    // 'T00:00:00' forces local-midnight parsing, matching overdueBookings() in store.js.
+    const d = new Date(l.date + 'T00:00:00');
+    return !isNaN(d) && Math.round((d - Store.today()) / 86400000) >= 0;
+  });
   const R = 34, C = 2 * Math.PI * R, off = C * (1 - h.score / 100);
   // Instrument hero: tick-ring gauge, verdict, segmented status bar, counts.
   const ticks = [0,45,90,135,180,225,270,315].map(a => { const r1=46, r2=50, rad=a*Math.PI/180;
     return `<line x1="${(52+r1*Math.cos(rad)).toFixed(1)}" y1="${(52+r1*Math.sin(rad)).toFixed(1)}" x2="${(52+r2*Math.cos(rad)).toFixed(1)}" y2="${(52+r2*Math.sin(rad)).toFixed(1)}"/>`; }).join('');
-  const segTotal = overdue.length + soon.length + okCount;
+  // The canonical overdue count — Store.overdueCount(), not a raw task-status
+  // filter — so the hero badge and the segbar's red segment agree with
+  // costOverdue()'s money on how many jobs are actually overdue: a taskless
+  // slipped booking counts here even though it isn't in `overdue` (DEFECT
+  // B(i)), and a task a pending booking already covers does NOT double it
+  // (DEFECT B(ii)/A) — see Store.overdueCount()'s own comment in store.js.
+  const overdueN = Store.overdueCount();
+  const segTotal = overdueN + soon.length + okCount;
   const segbar = segTotal
-    ? `<div class="segbar">${overdue.length ? `<i class="seg-red" style="flex:${overdue.length}"></i>` : ''}${soon.length ? `<i class="seg-amber" style="flex:${soon.length}"></i>` : ''}${okCount ? `<i class="seg-green" style="flex:${okCount}"></i>` : ''}</div>`
+    ? `<div class="segbar">${overdueN ? `<i class="seg-red" style="flex:${overdueN}"></i>` : ''}${soon.length ? `<i class="seg-amber" style="flex:${soon.length}"></i>` : ''}${okCount ? `<i class="seg-green" style="flex:${okCount}"></i>` : ''}</div>`
     : `<div class="segbar"><i class="seg-dim" style="flex:1"></i></div>`;
   const next90 = Store.costUpcoming(90);
+  const overdueCost = Store.costOverdue();
+  // DEFECT 3 (2026-07 verifier round): Store.costThisYear() had been dead code
+  // since it shipped — nothing in app.js or server.py ever called it, only
+  // tools/test-store-js.py did. Wiring it up here (rather than deleting it) is
+  // the "give it a real caller" half of that defect's fix; the other half
+  // (settling a stale booking no longer files its cost under a past calendar
+  // year) is what makes this number honest in the first place — see markDone()
+  // in store.js. Same "only render if non-zero" pattern as next90/overdueCost,
+  // so a fresh home with nothing logged yet shows nothing extra here.
+  const ytdCost = Store.costThisYear();
   // Compact rail-row for an attention task: rail + pill carry status, one-tap ✓ stays.
   const kRow = t => { const a = Store.asset(t.assetId); if (!a) return '';
     const st = Store.status(t), prov = Store.provider(a.providerId);
@@ -886,6 +1096,17 @@ function viewDashboard() {
       <div class="k-right"><span class="k-pill red">by usage</span></div>
       <button class="k-done" data-action="reset-usage" data-id="${a.id}" title="Serviced — reset the counter"><svg><use href="#i-check"/></svg></button>
     </div>`; };
+  const oRow = l => { const a = Store.asset(l.assetId); if (!a) return '';
+    // 'T00:00:00' forces local-midnight parsing — see overdueBookings() in
+    // store.js for why a bare `new Date(l.date)` skews a day in some zones.
+    const days = Math.round((Store.today() - new Date(l.date + 'T00:00:00')) / 86400000);
+    return `<div class="k-row red" data-action="open-asset" data-id="${a.id}">
+      ${assetTile(a, 'k-tile')}
+      <div class="k-main"><div class="k-title">${esc(l.note || 'Booked job')} <span class="chip watching">booked</span></div>
+        <div class="k-sub">${esc(a.name)} · ${days > 0 ? `${days}d overdue` : 'due today'}</div></div>
+      <div class="k-right">${l.cost ? `<span class="k-pill red">${money(l.cost)}</span>` : ''}</div>
+      <button class="k-done" data-action="job-done" data-id="${l.id}" data-asset="${a.id}" title="Mark done"><svg><use href="#i-check"/></svg></button>
+    </div>`; };
   const tlRow = t => { const a = Store.asset(t.assetId); if (!a) return '';
     const nd = Store.nextDue(t), prov = Store.provider(a.providerId);
     const date = nd ? `${MONTHS[nd.getMonth()]} ${nd.getDate()}` : '—';
@@ -895,6 +1116,28 @@ function viewDashboard() {
       <div class="tl-main"><div class="tl-title">${esc(t.title)}</div><div class="tl-sub">${esc(sub)}</div></div>
       ${t.estCost ? `<div class="tl-cost">${money(t.estCost)}</div>` : ''}
     </div>`; };
+  // A pending booking under "Coming up" — same tl-row markup as tlRow above,
+  // status carried by the 'booked' word (no colour, no new tokens).
+  const tlRowBooking = l => { const a = Store.asset(l.assetId); if (!a) return '';
+    const nd = new Date(l.date + 'T00:00:00');
+    const date = isNaN(nd) ? '—' : `${MONTHS[nd.getMonth()]} ${nd.getDate()}`;
+    // The providerId recorded ON the log (bookQuote() writes it — store.js:630),
+    // falling back to the asset's default only when the log has none — same
+    // rule as histRow (app.js) and jobRow (app.js) and Store.jobsForProvider
+    // (store.js). The asset's default provider may not be who was actually booked.
+    const prov = l.providerId ? Store.provider(l.providerId) : Store.provider(a.providerId);
+    const sub = [a.name, prov ? prov.name : null, 'booked'].filter(Boolean).join(' · ');
+    return `<div class="tl-row" data-action="open-asset" data-id="${a.id}">
+      <div class="tl-date">${date}</div>
+      <div class="tl-main"><div class="tl-title">${esc(l.note || 'Booked job')}</div><div class="tl-sub">${esc(sub)}</div></div>
+      ${l.cost ? `<div class="tl-cost">${money(l.cost)}</div>` : ''}
+    </div>`; };
+  // Tasks and bookings interleaved chronologically — a booking whose task
+  // just got dropped from "Coming up"'s own filter above still lands here in
+  // the right place, not tacked on the end out of date order.
+  const upcomingItems = upcoming.map(t => ({ d: Store.nextDue(t), html: tlRow(t) }))
+    .concat(upcomingBookings.map(l => ({ d: new Date(l.date + 'T00:00:00'), html: tlRowBooking(l) })))
+    .sort((x, y) => (x.d && !isNaN(x.d) ? x.d : new Date(8.64e15)) - (y.d && !isNaN(y.d) ? y.d : new Date(8.64e15)));
   const qDot = q => (q.status === 'dates_offered' || q.status === 'quoted') ? 'var(--green)' : 'var(--amber)';
   return topbar('KasaKeeper', '⚙︎', 'settings', true) + `
     <div class="hero2 ${h.color}">
@@ -910,11 +1153,13 @@ function viewDashboard() {
         <div class="h-line">${healthHeadline(h, notSetUp)}</div>
         ${segbar}
         <div class="h-counts">${notSetUp ? `<span>${unsched.length} service${unsched.length>1?'s':''} ready to track</span>`
-          : `<span><span class="cdot" style="background:var(--red)"></span><b>${overdue.length}</b> overdue</span>
+          : `<span><span class="cdot" style="background:var(--red)"></span><b>${overdueN}</b> overdue</span>
              ${uDue.length ? `<span><span class="cdot" style="background:var(--red)"></span><b>${uDue.length}</b> by usage</span>` : ''}
              <span><span class="cdot" style="background:var(--amber)"></span><b>${soon.length}</b> soon</span>
              <span><span class="cdot" style="background:var(--green)"></span><b>${okCount}</b> ok</span>
-             ${next90 ? `<span><b>${money(next90)}</b> next 90d</span>` : ''}`}</div>
+             ${next90 ? `<span><b>${money(next90)}</b> next 90d</span>` : ''}
+             ${overdueCost ? `<span><b>${money(overdueCost)}</b> overdue</span>` : ''}
+             ${ytdCost ? `<span><b>${money(ytdCost)}</b> this year</span>` : ''}`}</div>
       </div>
     </div>
     ${notSetUp ? `<div class="setup-cta" data-action="start-tracking"><b>Start tracking · mark everything serviced today ↦</b><div>Your ${unsched.length} services will begin counting down to their next due dates.</div></div>` : ''}
@@ -922,17 +1167,21 @@ function viewDashboard() {
     <div class="card triage-cta" data-action="triage-open"><div class="row"><div class="emoji">🛟</div>
       <div class="grow"><div class="t-name">Something's wrong?</div><div class="t-sub">Describe it · I'll triage and find who you need</div></div><span class="chip">›</span></div></div>
     <div class="section-title">Needs attention <span class="pill">${attnCount}</span></div>
-    ${attnCount ? `<div class="k-list">${uCards.map(uRow).join('') + attention.map(kRow).join('')}</div>`
+    ${attnCount ? `<div class="k-list">${uCards.map(uRow).join('') + obooked.map(oRow).join('') + attention.map(kRow).join('')}</div>`
       : (next ? `<div class="eye-scene" data-eye-scene></div>
              <div class="banner ok allclear"><svg class="kk-shut"><use href="#kk-blink"/></svg><span>Nothing to see. Next up: <b>${esc(next.title)}</b> ${esc(Store.dueLabel(next))}.</span></div>`
              : notSetUp ? ''
+             // `next` is null but tasks DO exist: every one of them is covered by a
+             // pending booking (Coming up already carries them) — not an empty home,
+             // so the "Add your first service" CTA below would be flatly wrong.
+             : tasks.length ? ''
              : `<div class="setup-cta" data-action="catalog"><b>Add your first service to track</b><div>Pick a system — hot water, aircon, gutters — and KasaKeeper builds the schedule.</div></div>`)}
     ${openQuotes.length ? `<div class="section-title">Quotes in flight <span class="pill">${openQuotes.length}</span></div>
       <div class="qchips">${openQuotes.map(q => { const a = Store.asset(q.assetId);
         return `<div class="qchip" data-action="open-quote" data-id="${q.id}">
           <div class="qn"><span class="cdot" style="background:${qDot(q)}"></span>${esc(q.provider || q.trade || (a ? a.name : 'Quote'))}</div>
           <div class="qs">${esc(QSTATUS[q.status] || q.status)}</div></div>`; }).join('')}</div>` : ''}
-    ${upcoming.length ? `<div class="section-title">Coming up</div><div class="k-list" style="padding:2px 12px">${upcoming.map(tlRow).join('')}</div>` : ''}
+    ${upcomingItems.length ? `<div class="section-title">Coming up</div><div class="k-list" style="padding:2px 12px">${upcomingItems.map(x => x.html).join('')}</div>` : ''}
     <button class="fab" data-action="catalog">＋</button>` + nav('');
 }
 
@@ -1055,60 +1304,127 @@ async function chatSend(text) {
   const log = document.querySelector('.chat-log'); if (log) window.scrollTo(0, document.body.scrollHeight);
 }
 
+/* ---------- Assets/Trades filter — one compact box, shared by both screens ----------
+   Placement: directly under the topbar, above tabs/section-titles — a single
+   44px row, never a second hero, never pushes headings down more than a
+   normal row would ("out of the way" per the owner's words).
+   Typing must survive both a keystroke and the 3-min background sync
+   render() without losing focus/cursor. The setInterval sync already skips
+   render() while an input is focused (see the activeElement guard near the
+   bottom of this file), so the risk is only OUR OWN typing handler — so it
+   never calls the full render(): it patches ONLY the filtered body container
+   (a sibling of the input, never the input itself), same trick as
+   renderAddrSuggest() patching #wz_suggest instead of re-rendering the wizard. */
+const assetHaystack = a => [a.name, a.category, a.variant, a.make, a.model, assetLocation(a).text,
+  a.providerId && (Store.provider(a.providerId) || {}).name].filter(Boolean).join(' ');
+const providerHaystack = p => [p.name, p.trade, p.phone, p.email, p.notes].filter(Boolean).join(' ');
+const quoteHaystack = q => { const a = Store.asset(q.assetId);
+  return [q.trade, q.provider, a && a.name, QSTATUS[q.status] || q.status].filter(Boolean).join(' '); };
+function filterBox(key, placeholder) {
+  const q = FILTER[key] || '';
+  return `<div class="filter-box">
+    <span class="filter-ic">🔎</span>
+    <input type="text" class="filter-input" data-filter-input="${key}" placeholder="${esc(placeholder)}" value="${esc(q)}" autocomplete="off" spellcheck="false">
+    <button class="filter-clear" data-action="clear-filter" data-filter="${key}" ${q ? '' : 'hidden'} title="Clear filter" aria-label="Clear filter">✕</button>
+  </div>`;
+}
+// Honest empty state (design rule 8: no dead ends) — names the query back and
+// offers the one-tap way out, rather than a blank screen under a heading.
+const filterEmpty = key => `<div class="empty">No matches for "${esc(FILTER[key])}". <b class="klink" data-action="clear-filter" data-filter="${key}">✕ Clear filter</b></div>`;
+// Re-renders ONLY the filtered body (never $app, never the input) so the box
+// keeps focus and cursor position while the list narrows on every keystroke.
+function refreshFilterBody(key) {
+  const host = document.querySelector(`[data-filter-body="${key}"]`); if (!host) return;
+  host.innerHTML = key === 'assets' ? viewAssetsBody(route()[1]) : viewProvidersBody();
+  // The Assets body carries the HA-import banner host (data-ha-banner) — it just got
+  // rebuilt empty, so re-hydrate it. HABANNER is client-cached (5min TTL), so this is
+  // a synchronous re-paint from cache, not a fresh network probe on every keystroke.
+  if (key === 'assets') hydrateHaBanner();
+}
+function clearFilter(key) {
+  FILTER[key] = '';
+  const input = document.querySelector(`[data-filter-input="${key}"]`); if (input) input.value = '';
+  const btn = document.querySelector(`[data-action="clear-filter"][data-filter="${key}"]`); if (btn) btn.hidden = true;
+  refreshFilterBody(key);
+  if (input) input.focus();
+}
+
 function viewAssets(sub) {
+  return topbar('Assets', '＋', 'catalog') + filterBox('assets', 'Filter assets…') +
+    `<div data-filter-body="assets">${viewAssetsBody(sub)}</div>` +
+    `<button class="fab" data-action="catalog">＋</button>` + nav('assets');
+}
+function viewAssetsBody(sub) {
   const onWarranty = sub === 'warranty';
+  const query = FILTER.assets, filtering = !!query.trim();
+  const allAssets = Store.homeAssets();
+  const assets = allAssets.filter(a => matchesFilter(query, assetHaystack(a)));
   // Warranties live here (not on the dashboard): every asset with a warranty date,
   // soonest-expiring first. The pill counts what's expired or ending within 60 days.
-  const warr = Store.homeAssets().map(a => ({ a, d: Store.warrantyDays(a) }))
+  // Both the pill and the list are built off the FILTERED set, so a heading never
+  // claims a count the rows underneath it don't back up.
+  const warrAll = allAssets.map(a => ({ a, d: Store.warrantyDays(a) })).filter(x => x.d !== null);
+  const warr = assets.map(a => ({ a, d: Store.warrantyDays(a) }))
     .filter(x => x.d !== null).sort((x, y) => x.d - y.d);
   const watch = warr.filter(x => x.d <= 60).length;
   const tabs = `<div class="tabs">
-    <a class="tab ${onWarranty ? '' : 'on'}" href="#/assets">Assets <span class="pill">${Store.homeAssets().length}</span></a>
+    <a class="tab ${onWarranty ? '' : 'on'}" href="#/assets">Assets <span class="pill">${assets.length}</span></a>
     <a class="tab ${onWarranty ? 'on' : ''}" href="#/assets/warranty">Warranties${watch ? ` <span class="pill warn">${watch}</span>` : ''}</a>
   </div>`;
 
   let body;
   if (onWarranty) {
-    body = warr.length ? `<div class="k-list">${warr.map(({ a, d }) => {
-      const mm = [a.make, a.model].filter(Boolean).join(' ');
-      const loc = assetLocation(a);
-      const cls = d < 0 ? 'red' : d <= 60 ? 'amber' : 'green';
-      return `<div class="k-row ${cls}" data-action="open-asset" data-id="${a.id}">
-        ${assetTile(a, 'k-tile')}
-        <div class="k-main"><div class="k-title">${esc(a.name)}</div>
-          <div class="k-sub">${esc(mm || loc.text || a.category)}${a.warrantyUntil ? ' · until ' + esc(a.warrantyUntil) : ''}</div></div>
-        <div class="k-right"><span class="k-pill ${cls}">${d < 0 ? `expired ${-d}d ago` : d === 0 ? 'ends today' : `${d}d left`}</span></div>
-      </div>`;
-    }).join('')}</div>` : `<div class="empty">No warranty dates yet — add one when you edit an asset. ${Store.homeAssets().length
-      ? `<a href="#/assets" style="color:var(--accent)">→ Open an asset to add one</a>`
-      : `<b data-action="catalog" style="color:var(--accent);cursor:pointer">＋ Add your first asset →</b>`}</div>`;
+    if (warr.length) {
+      body = `<div class="k-list">${warr.map(({ a, d }) => {
+        const mm = [a.make, a.model].filter(Boolean).join(' ');
+        const loc = assetLocation(a);
+        const cls = d < 0 ? 'red' : d <= 60 ? 'amber' : 'green';
+        return `<div class="k-row ${cls}" data-action="open-asset" data-id="${a.id}">
+          ${assetTile(a, 'k-tile')}
+          <div class="k-main"><div class="k-title">${esc(a.name)}</div>
+            <div class="k-sub">${esc(mm || loc.text || a.category)}${a.warrantyUntil ? ' · until ' + esc(a.warrantyUntil) : ''}</div></div>
+          <div class="k-right"><span class="k-pill ${cls}">${d < 0 ? `expired ${-d}d ago` : d === 0 ? 'ends today' : `${d}d left`}</span></div>
+        </div>`;
+      }).join('')}</div>`;
+    } else if (filtering && warrAll.length) {
+      body = filterEmpty('assets');
+    } else {
+      body = `<div class="empty">No warranty dates yet — add one when you edit an asset. ${allAssets.length
+        ? `<a href="#/assets" style="color:var(--accent)">→ Open an asset to add one</a>`
+        : `<b data-action="catalog" style="color:var(--accent);cursor:pointer">＋ Add your first asset →</b>`}</div>`;
+    }
   } else {
     const byCat = {};
-    Store.homeAssets().forEach(a => (byCat[a.category] = byCat[a.category] || []).push(a));
-    body = Object.keys(byCat).sort().map(cat => `
-      <div class="section-title">${Store.icon(cat)} ${esc(cat)} <span class="pill">${byCat[cat].length}</span></div>
-      <div class="k-list">${byCat[cat].map(a => {
-        const ts = Store.tasksFor(a.id).filter(t => !t.snoozed);
-        // A never-serviced task has no due date: that is "not tracked", not "healthy" —
-        // it must not wear the same green pill as an asset that's genuinely on schedule.
-        // Device-fault tasks are event-driven, not scheduled: active ones read
-        // through status() as overdue; a cleared/done one must not drag the whole
-        // asset to "not tracked".
-        const withStat = ts.map(t => ({ t, d: Store.daysUntil(t), s: Store.daysUntil(t) === null ? (t.fault ? 'ok' : 'unsched') : Store.status(t) }));
-        const rank = { overdue:0, soon:1, unsched:2, ok:3 };
-        withStat.sort((x,y) => rank[x.s]-rank[y.s] || (x.d??1e9)-(y.d??1e9));
-        const worst = withStat.length ? withStat[0].s : 'unsched';
-        const label = worst === 'unsched' ? 'not tracked' : worst === 'ok' ? 'ok' : Store.dueLabel(withStat[0].t);
-        const loc = assetLocation(a);
-        return `<div class="k-row ${worst==='unsched' ? '' : COLOR[worst]}" data-action="open-asset" data-id="${a.id}">
-          ${assetTile(a, 'k-tile')}
-          <div class="k-main"><div class="k-title">${esc(a.name)}</div><div class="k-sub">${loc.text ? esc(loc.text) + ' · ' : ''}${worst==='unsched' ? 'not tracked yet' : ts.length + ' task' + (ts.length!==1?'s':'')}${a.lookupPending ? ' · <b style="color:var(--accent)">✦ research ready</b>' : ''}</div></div>
-          <div class="k-right"><span class="k-pill ${worst==='unsched' ? 'dim' : COLOR[worst]}">${esc(label)}</span></div>
-        </div>`;
-      }).join('')}</div>`).join('') || `<div class="empty">No assets yet. <b data-action="catalog" style="color:var(--accent);cursor:pointer">＋ Add your first asset →</b></div>`;
+    assets.forEach(a => (byCat[a.category] = byCat[a.category] || []).push(a));
+    if (Object.keys(byCat).length) {
+      body = Object.keys(byCat).sort().map(cat => `
+        <div class="section-title">${Store.icon(cat)} ${esc(cat)} <span class="pill">${byCat[cat].length}</span></div>
+        <div class="k-list">${byCat[cat].map(a => {
+          const ts = Store.tasksFor(a.id).filter(t => !t.snoozed);
+          // A never-serviced task has no due date: that is "not tracked", not "healthy" —
+          // it must not wear the same green pill as an asset that's genuinely on schedule.
+          // Device-fault tasks are event-driven, not scheduled: active ones read
+          // through status() as overdue; a cleared/done one must not drag the whole
+          // asset to "not tracked".
+          const withStat = ts.map(t => ({ t, d: Store.daysUntil(t), s: Store.daysUntil(t) === null ? (t.fault ? 'ok' : 'unsched') : Store.status(t) }));
+          const rank = { overdue:0, soon:1, unsched:2, ok:3 };
+          withStat.sort((x,y) => rank[x.s]-rank[y.s] || (x.d??1e9)-(y.d??1e9));
+          const worst = withStat.length ? withStat[0].s : 'unsched';
+          const label = worst === 'unsched' ? 'not tracked' : worst === 'ok' ? 'ok' : Store.dueLabel(withStat[0].t);
+          const loc = assetLocation(a);
+          return `<div class="k-row ${worst==='unsched' ? '' : COLOR[worst]}" data-action="open-asset" data-id="${a.id}">
+            ${assetTile(a, 'k-tile')}
+            <div class="k-main"><div class="k-title">${esc(a.name)}</div><div class="k-sub">${loc.text ? esc(loc.text) + ' · ' : ''}${worst==='unsched' ? 'not tracked yet' : ts.length + ' task' + (ts.length!==1?'s':'')}${a.lookupPending ? ' · <b style="color:var(--accent)">✦ research ready</b>' : ''}</div></div>
+            <div class="k-right"><span class="k-pill ${worst==='unsched' ? 'dim' : COLOR[worst]}">${esc(label)}</span></div>
+          </div>`;
+        }).join('')}</div>`).join('');
+    } else if (filtering && allAssets.length) {
+      body = filterEmpty('assets');
+    } else {
+      body = `<div class="empty">No assets yet. <b data-action="catalog" style="color:var(--accent);cursor:pointer">＋ Add your first asset →</b></div>`;
+    }
   }
-  return topbar('Assets','＋','catalog') + tabs + (onWarranty ? '' : `<div data-ha-banner></div>`) + body +
-    `<button class="fab" data-action="catalog">＋</button>` + nav('assets');
+  return tabs + (onWarranty ? '' : `<div data-ha-banner></div>`) + body;
 }
 
 // Prepaid maintenance: what you bought, what you've used, what's left.
@@ -1150,16 +1466,16 @@ function viewAsset(id) {
   const liveChip = (a.haEntity && !Store.isTestHome()) ? `<span class="chip live" data-ha="${esc(a.haEntity)}">● live: …</span>` : '';
   const wd = Store.warrantyDays(a);
   const warrChip = wd !== null ? `<span class="chip ${wd < 0 ? 'expired' : wd <= 90 ? 'cost' : 'live'}">🛡 ${esc(Store.warrantyLabel(a))}</span>` : '';
-  const provCard = prov ? `<div class="section-title">Service provider</div>
+  const provCard = prov ? `<div class="section-title">Default provider</div>
     <div class="card" data-action="open-provider" data-id="${prov.id}"><div class="row"><div class="emoji">👷</div>
       <div class="grow"><div class="t-name">${esc(prov.name)}</div>
-      <div class="t-sub">${esc(prov.trade)}${prov.contact?' · '+esc(prov.contact):''}${prov.phone?' · '+esc(prov.phone):''}</div></div>
+      <div class="t-sub">${esc(prov.trade)}${prov.contact?' · '+esc(prov.contact):''}${prov.phone?' · '+esc(prov.phone):''} · used when a job doesn't name its own</div></div>
       ${prov.website?`<a class="btn small" data-ext href="${esc(webUrl(prov.website))}" target="_blank" rel="noopener">🔗</a>`:''}
       ${prov.phone?`<a class="btn small" data-ext href="tel:${esc(prov.phone.replace(/\s/g,''))}">📞</a>`:''}</div></div>`
     : (() => { const active = Store.tasksFor(a.id).filter(t => !t.snoozed);   // all-DIY asset: don't nag for a supplier nobody needs
         return a.diy || (active.length && active.every(t => t.diy))
           ? `<div class="banner ok">🛠 You handle this one yourself — no supplier needed.${a.diy ? ` <b class="klink" data-action="toggle-asset-diy" data-id="${a.id}">Use a pro instead →</b>` : ''}</div>`
-          : `<div class="banner">No service provider linked. <b class="klink" data-action="find" data-id="${a.id}">Find one →</b> · or <b class="klink" data-action="toggle-asset-diy" data-id="${a.id}">🛠 mark it DIY</b></div>`; })();
+          : `<div class="banner">No default provider set. <b class="klink" data-action="find" data-id="${a.id}" title="Searches for “${esc(searchQueryFor(a))}” near you">Find one →</b> · or <b class="klink" data-action="toggle-asset-diy" data-id="${a.id}">🛠 mark it DIY</b></div>`; })();
   // The manual chip is the document-vault seed: real link when we have one, an
   // honest "find it" affordance when we could, nothing when we couldn't.
   const manualChip = a.manualDoc
@@ -1172,12 +1488,25 @@ function viewAsset(id) {
   const cadLabel = t => !(t.cadenceDays > 0) ? 'not scheduled'
     : t.cadenceDays >= 360 ? `every ${Math.round(t.cadenceDays / 365)}y`
     : t.cadenceDays >= 28 ? `every ${Math.round(t.cadenceDays / 30)}mo` : `every ${t.cadenceDays}d`;
-  const mRow = t => { const st = Store.status(t), tp = taskProv(t, a);
-    const sub = [cadLabel(t), isDiy(t, a) ? '🛠 DIY' : (tp ? tp.name : null)].filter(Boolean).join(' · ');
+  // Who's on the hook, per task: the task's OWN provider reads plain (it IS
+  // the trade for this job — a garden's tree lopper, solar's panel cleaner);
+  // one falling back to the asset's default gets a quiet "(default)" note so
+  // it never reads as though it were set specifically for this job; nothing
+  // set at all offers the quick-pick straight from the row instead of a dead
+  // end. Plain muted text, not a .chip — k-sub truncates to one line
+  // (styles.css), and a chip's own padding/border would eat the width budget
+  // that keeps this qualifier from being the first thing clipped off. Leads
+  // the sub line (before cadence) for the same reason — this feature exists
+  // so "who does this job" reads at a glance, and that must survive
+  // truncation before the recurrence text does (the due status alongside
+  // the row already carries the "is it overdue" signal on its own).
+  const mRow = t => { const st = Store.status(t), tp = taskProv(t, a), ownProv = !!t.providerId;
+    const whoHtml = isDiy(t, a) ? '🛠 DIY'
+      : `<b class="klink" data-action="quick-prov" data-id="${t.id}">${tp ? esc(tp.name) : 'who does this? →'}</b>${(tp && !ownProv) ? ' <span style="color:var(--faint)">(default)</span>' : ''}`;
     const provenance = t.src === 'maker' ? ` · <b style="color:var(--accent);font-weight:600">maker's interval</b>` : t.src === 'research' ? ` · <b style="color:var(--accent);font-weight:600">researched</b>` : '';
     return `<div class="k-row ${COLOR[st]}" data-action="edit-task" data-id="${t.id}" data-asset="${a.id}">
       <div class="k-main" style="padding-left:4px"><div class="k-title">${esc(t.title)}${t.autoBook ? ' <span class="chip auto">🤖 auto</span>' : ''}${faultChip(t)}${t.autopilot ? ' <span class="chip pilot">⟳ autopilot</span>' : ''}${seasonChip(t.season)}</div>
-        <div class="k-sub">${esc(sub)}${provenance}${t.note ? ` · 📌 ${esc(t.note)}` : ''}</div></div>
+        <div class="k-sub">${whoHtml} · ${esc(cadLabel(t))}${provenance}${t.note ? ` · 📌 ${esc(t.note)}` : ''}</div></div>
       <div class="k-right"><span class="k-pill ${COLOR[st]}">${esc(Store.dueLabel(t))}</span>${t.estCost ? `<div class="k-cost">est ${money(t.estCost)}</div>` : ''}</div>
       <button class="k-done" data-action="done" data-id="${t.id}" title="Mark done"><svg><use href="#i-check"/></svg></button>
     </div>`; };
@@ -1228,8 +1557,10 @@ function viewAsset(id) {
       return `<div class="section-title">Maintenance <span class="pill">${act.length}</span></div>
         ${act.length ? `<div class="k-list">${act.map(mRow).join('')}</div>` : `<div class="empty">No active tasks.</div>`}
         ${snz.length ? `<div class="section-title">Snoozed <span class="pill">${snz.length}</span></div><div class="k-list">${snz.map(t => taskCard(t, { showAsset:false })).join('')}</div>` : ''}`; })()}
-    ${(() => { const q = Store.quoteForAsset(a.id);   // what's in flight for THIS asset belongs on its page, not just in Trades
-      return q ? `<div class="section-title">Quote request</div><div class="k-list">${qCard(q)}</div>` : ''; })()}
+    ${(() => { const qs = Store.quotesForAsset(a.id);   // what's in flight for THIS asset belongs on its page, not just in Trades
+      // ALL of them: an asset with several trades can have a quote per job, and
+      // showing only the first would hide the second job's entirely.
+      return qs.length ? `<div class="section-title">Quote request${qs.length > 1 ? `s <span class="pill">${qs.length}</span>` : ''}</div><div class="k-list">${qs.map(qCard).join('')}</div>` : ''; })()}
     <div class="btn-row">
       <button class="btn primary small" data-action="suggest" data-id="${a.id}">✨ Suggest schedule</button>
       <button class="btn small" data-action="new-task" data-id="${a.id}">＋ Add task</button>
@@ -1239,23 +1570,27 @@ function viewAsset(id) {
       ${(a.purchaseUrl || a.make || a.model) ? `<button class="btn small" data-action="buy" data-id="${a.id}">🛒 Buy replacements</button>` : ''}
     </div>
     ${(() => { const jobs = Store.logsFor(a.id);
+      // Pending (booked, not yet done) commitments get their own labelled,
+      // counted group — folding them under "History" made that header's pill
+      // undercount the rows actually rendered beneath it (3 above 4).
       const pending = jobs.filter(l => l.pending), done = jobs.filter(l => !l.pending);
       const spent = done.reduce((s, l) => s + (l.cost || 0), 0);
-      return `<div class="section-title">History <span class="pill">${done.length}</span>${spent ? `<span class="pill">${money(spent)} total</span>` : ''}</div>
-        ${pending.length ? `<div class="k-list">${pending.map(jobRow).join('')}</div>` : ''}
+      return `${pending.length ? `<div class="section-title">Booked <span class="pill">${pending.length}</span></div>
+        <div class="k-list">${pending.map(jobRow).join('')}</div>` : ''}
+        <div class="section-title">History <span class="pill">${done.length}</span>${spent ? `<span class="pill">${money(spent)} total</span>` : ''}</div>
         ${done.length ? `<div class="k-list" style="padding:2px 12px">${done.map(histRow).join('')}</div>` : `<div class="empty">No jobs logged yet — every ✓ Done lands here.</div>`}
         <div class="btn-row"><button class="btn small" data-action="new-job" data-id="${a.id}">＋ Log a past job</button></div>`; })()}
     ${provCard}
     <div class="btn-row"><button class="btn small" data-action="del-asset" data-id="${a.id}" style="color:var(--red)">Delete asset</button></div>`;
 }
 
-const QSTATUS = { to_contact: 'needs a supplier', enquiry_sent: 'enquiry sent', replied: 'reply in', quoted: 'quote in', dates_offered: 'pick a date', booked: 'booked' };
+const QSTATUS = { to_contact: 'needs a supplier', enquiry_sent: 'enquiry sent', replied: 'reply in', quoted: 'quote in', dates_offered: 'pick a date', booked: 'booked', done: 'done' };
 // Schedule row in the instrument language: rail+pill carry status, the sub names
 // the asset and who does it, and ONE context action drives the triage — everything
 // else (edit/snooze/delete) lives one tap away on the asset page.
 function scheduleRow(t) {
   const a = Store.asset(t.assetId); if (!a) return '';
-  const st = Store.status(t), prov = taskProv(t, a), q = Store.quoteForAsset(a.id);
+  const st = Store.status(t), prov = taskProv(t, a), q = Store.quoteForTask(t);   // THIS task's quote, never a sibling job's
   let action;
   if (isDiy(t, a)) action = `<button class="btn small" data-action="${t.diy ? 'toggle-diy' : 'toggle-asset-diy'}" data-id="${t.diy ? t.id : a.id}" title="You do this yourself · tap to change">🛠 DIY ✓</button>`;
   else if (prov) action = prov.email && !q
@@ -1264,7 +1599,7 @@ function scheduleRow(t) {
         : `<button class="btn small" data-action="book-service" data-id="${t.id}">✉︎ Book service</button>`)
     : `<button class="btn small" data-action="call" data-id="${a.id}">📞 ${esc(prov.name)}</button>`;
   else if (q) action = `<span class="chip cost">${esc(QSTATUS[q.status] || q.status)}${q.amount ? ' · ' + money(q.amount) : ''}</span> <button class="btn small" data-action="open-quote" data-id="${q.id}">manage</button>`;
-  else action = `<button class="btn small primary" data-action="find" data-id="${a.id}">🔎 Find a supplier</button>`;
+  else action = `<button class="btn small primary" data-action="find" data-id="${a.id}" data-task="${t.id}">🔎 Find a supplier</button>`;
   if (t.fault && t.fault.state === 'active') action += faultOrder(t, 'btn small', 'Order part');
   const sub = [a.name, isDiy(t, a) ? null : (prov ? prov.name : null)].filter(Boolean).join(' · ');
   return `<div class="k-row ${COLOR[st]}" data-action="open-asset" data-id="${a.id}">
@@ -1281,7 +1616,7 @@ function viewSchedule() {
   // "Needs a supplier" must not contradict reality: a task whose asset already has
   // an open quote is mid-conversation with one, not still looking. to_contact stays
   // in "needs" though — that status means intent captured, no supplier engaged yet.
-  tasks.forEach(t => { const a = Store.asset(t.assetId); const q = Store.quoteForAsset(t.assetId);
+  tasks.forEach(t => { const a = Store.asset(t.assetId); const q = Store.quoteForTask(t);
     (isDiy(t, a) ? diy : a && a.providerId ? assigned : q && q.status !== 'to_contact' ? waiting : need).push(t); });
   const snoozed = Store.snoozedTasks();
   const group = list => `<div class="k-list">${list.map(scheduleRow).join('')}</div>`;
@@ -1303,8 +1638,15 @@ function viewProvider(id) {
   const p = Store.provider(id); if (!p) return viewProviders();
   const jobs = Store.jobsForProvider(id);
   const spent = jobs.filter(l => !l.pending).reduce((s, l) => s + (l.cost || 0), 0);
-  const assets = Store.homeAssets().filter(a => a.providerId === id);
-  const quotes = Store.homeQuotes().filter(q => q.provider === p.name && q.status !== 'booked' && q.status !== 'declined');
+  // Assets they're the default for, PLUS assets they're on the hook for through
+  // a single job — a trade used only for a garden's tree lopping showed "nothing
+  // yet" here while the schedule row plainly named them.
+  const links = Store.providerLinks(id);
+  const assets = links.assets.concat(
+    links.tasks.map(t => Store.asset(t.assetId))
+      .filter(a => a && !links.assets.some(x => x.id === a.id))
+      .filter((a, i, arr) => arr.indexOf(a) === i));   // one row per asset, however many of its jobs they do
+  const quotes = Store.homeQuotes().filter(q => q.provider === p.name && q.status !== 'booked' && q.status !== 'declined' && q.status !== 'done');
   const sub = [p.trade, p.contact].filter(Boolean).join(' · ');
   return `<button class="back" data-action="back">‹ Back</button>
     <div class="hero"><div class="emoji">👷</div><div><h1>${esc(p.name)}</h1>
@@ -1385,27 +1727,35 @@ function qCard(q) {
       : q.status === 'booked' ? `<button class="btn small" data-action="quote-book" data-id="${q.id}">📌 Change date</button>${canSendConfirm ? `<button class="btn small" data-action="send-confirmation" data-id="${q.id}">✉︎ Send confirmation</button>` : ''}`
       : '');
     const meta = [
-      q.bookedDate ? `📌 booked — ${esc(q.bookedDate)}` : (q.availability ? `📅 ${esc(q.availability)}` : ''),
+      // Legacy quotes booked via confirm-date before bookQuote existed hold the
+      // trade's raw free text, not an ISO date — only format it as one when it
+      // actually is one, or jobDate mangles it (sliced as if ISO).
+      q.bookedDate ? `📌 booked — ${esc(/^\d{4}-\d{2}-\d{2}$/.test(q.bookedDate) ? jobDate(q.bookedDate) : q.bookedDate)}` : (q.availability ? `📅 ${esc(q.availability)}` : ''),
       q.paidAmount ? `✓ ${money(q.paidAmount)} paid${q.paidReceipt ? ' · receipt ' + esc(q.paidReceipt) : ''}${q.balanceDue ? ' · ' + money(q.balanceDue) + ' owing' : ''}` : '',
       q.replyNote ? esc(q.replyNote) : (waiting && q.enquiryTo ? `enquiry sent to ${esc(q.enquiryTo)}` : ''),
     ].filter(Boolean).join(' · ');
-    const cls = q.status === 'booked' ? 'green' : q.status === 'replied' ? 'blue' : 'amber';
+    const cls = (q.status === 'booked' || q.status === 'done') ? 'green' : q.status === 'replied' ? 'blue' : 'amber';
     // A "find suppliers" nudge only makes sense while nobody's lined up — once a
-    // provider is named on the quote (or it's booked/declined), it's noise.
-    const showSuppliers = a && !q.provider && q.status !== 'booked' && q.status !== 'declined';
+    // provider is named on the quote (or it's booked/declined/done), it's noise.
+    const showSuppliers = a && !q.provider && q.status !== 'booked' && q.status !== 'declined' && q.status !== 'done';
     return `<div class="k-row ${cls}">
       <div class="k-tile"><span class="em">🧾</span></div>
       <div class="k-main"><div class="k-title">${esc((a && (!q.trade || q.trade === a.category)) ? a.name : (q.trade || 'Quote'))}${q.amount ? ' · ' + money(q.amount) : ''}${q.auto ? ' <span class="chip auto">🤖 auto</span>' : q.autoParsed ? ' <span class="chip auto">auto</span>' : ''}</div>
       <div class="k-sub">${a && q.trade && q.trade !== a.name && q.trade !== a.category ? esc(a.name) + ' · ' : ''}${esc(QSTATUS[q.status] || q.status)}${q.provider ? ' · ' + esc(q.provider) : ''}</div>
       ${meta ? `<div class="k-sub dim">${meta}</div>` : ''}
       <div class="btn-row" style="margin-top:8px">${nextBtns}
-        ${showSuppliers ? `<button class="btn small" data-action="find" data-id="${a.id}">🔎 Suppliers</button>` : ''}
+        ${showSuppliers ? `<button class="btn small" data-action="find" data-id="${a.id}" title="Searches for “${esc(searchQueryFor(a))}” near you">🔎 Suppliers</button>` : ''}
         <button class="btn small" data-action="del-quote" data-id="${q.id}" style="color:var(--red)">Remove</button></div></div>
       <div class="k-right"><span class="k-pill ${cls}">${esc(QSTATUS[q.status] || q.status)}</span></div>
     </div>`;
 }
 function viewProviders() {
-  const quotes = Store.homeQuotes();
+  return topbar('Trades', '＋', 'new-provider') + filterBox('trades', 'Filter trades…') +
+    `<div data-filter-body="trades">${viewProvidersBody()}</div>` +
+    `<button class="fab" data-action="new-provider">＋</button>` + nav('providers');
+}
+function viewProvidersBody() {
+  const query = FILTER.trades, filtering = !!query.trim();
   // One row per technician: logo/tile, name + trade·phone, and — on the right —
   // what they've cost us to date, or a job count when nothing's been logged yet.
   const pRow = p => {
@@ -1423,18 +1773,36 @@ function viewProviders() {
       <div class="k-right">${spent ? `<div class="k-cost">${money(spent)}</div>` : `<span class="k-pill dim">${jobs.length} job${jobs.length!==1?'s':''}</span>`}</div>
     </div>`;
   };
-  const active = Store.activeProviders();
-  const past = Store.pastProviders().slice()
+  const allQuotes = Store.homeQuotes();
+  const quotes = allQuotes.filter(q => matchesFilter(query, quoteHaystack(q)));
+  const allActive = Store.activeProviders();
+  const active = allActive.filter(p => matchesFilter(query, providerHaystack(p)));
+  const allPast = Store.pastProviders();
+  const past = allPast.filter(p => matchesFilter(query, providerHaystack(p))).slice()
     .sort((x, y) => Store.lastJobDate(y.id).localeCompare(Store.lastJobDate(x.id)));
-  return topbar('Trades', '＋', 'new-provider') +
-    `<div class="section-title">Quote requests <span class="pill">${quotes.length}</span></div>` +
-    (quotes.length ? `<div class="k-list">${quotes.map(qCard).join('')}</div>` : `<div class="banner">No open quotes. On the Schedule, tap "Find a supplier" on any job to request one.</div>`) +
-    `<div class="section-title">Your technicians <span class="pill">${active.length}</span>${(() => { const t = Store.homeLogs().reduce((s2, l) => s2 + (l.cost || 0), 0); return t ? `<span class="pill">${money(t)} all-time</span>` : ''; })()}</div>` +
-    (active.length ? `<div class="k-list">${active.map(pRow).join('')}</div>` : `<div class="empty">No active technicians yet.</div>`) +
-    (past.length ? `<div class="section-title dim">Past providers <span class="pill">${past.length}</span></div>`
+
+  // Everything on screen filtered to nothing — one honest empty state for the
+  // whole screen beats three collapsed headings and a wall of dead space.
+  if (filtering && (allQuotes.length + allActive.length + allPast.length) > 0
+      && (quotes.length + active.length + past.length) === 0) return filterEmpty('trades');
+
+  // A section that filtered to zero hides entirely (heading and all) rather than
+  // showing its normal "nothing here yet" CTA banner over a query that just
+  // doesn't apply to it — that banner is only honest when there's genuinely
+  // nothing, not when a filter is hiding real rows elsewhere on the screen.
+  const hideQuotes = filtering && allQuotes.length > 0 && quotes.length === 0;
+  const hideActive = filtering && allActive.length > 0 && active.length === 0;
+  const hidePast = filtering && allPast.length > 0 && past.length === 0;
+
+  return (hideQuotes ? '' :
+      `<div class="section-title">Quote requests <span class="pill">${quotes.length}</span></div>` +
+      (quotes.length ? `<div class="k-list">${quotes.map(qCard).join('')}</div>` : `<div class="banner">No open quotes. On the Schedule, tap "Find a supplier" on any job to request one.</div>`)) +
+    (hideActive ? '' :
+      `<div class="section-title">Your technicians <span class="pill">${active.length}</span>${(() => { const t = Store.homeLogs().reduce((s2, l) => s2 + (l.cost || 0), 0); return t ? `<span class="pill">${money(t)} all-time</span>` : ''; })()}</div>` +
+      (active.length ? `<div class="k-list">${active.map(pRow).join('')}</div>` : `<div class="empty">No active technicians yet.</div>`)) +
+    (hidePast ? '' : (past.length ? `<div class="section-title dim">Past providers <span class="pill">${past.length}</span></div>`
       + `<div class="t-sub dim" style="margin:-4px 4px 8px">No longer used — history kept.</div>`
-      + `<div class="k-list">${past.map(pRow).join('')}</div>` : '') +
-    `<button class="fab" data-action="new-provider">＋</button>` + nav('providers');
+      + `<div class="k-list">${past.map(pRow).join('')}</div>` : ''));
 }
 
 function viewSettings() {
@@ -1464,9 +1832,11 @@ function viewSettings() {
         Test home — skip Home Assistant (a friend's house, a demo)
       </label>
       <div class="imagery-strip" data-imagery="${h.id}" data-address="${esc(h.address || '')}"></div>
+      <div class="kk-note">${h.geo && h.geo.source === 'user' ? '📍 House location confirmed — aerial research centres on the exact roofline you picked.' : "📍 House location not confirmed yet — aerial research uses this address's plain map geocode, which can land on a neighbour's roof."}</div>
       <div class="btn-row">
         <button class="btn primary small" data-action="save-home" data-id="${h.id}">Save</button>
         <button class="btn small" data-action="toggle-imagery" data-id="${h.id}">📷 ${h.photo ? 'Change' : 'Choose'} photo</button>
+        <button class="btn small" data-action="confirm-house-retrofit" data-id="${h.id}">📍 ${h.geo && h.geo.source === 'user' ? 'Re-confirm which house is mine' : 'Confirm which house is mine'}</button>
       </div>
     </div>`; })();
   // Per-home prefs that used to be global (suburb was always per-home; soonDays and
@@ -1568,12 +1938,13 @@ function viewSettings() {
       <label style="display:flex;gap:10px;align-items:flex-start;cursor:pointer;margin-top:10px">
         <input type="radio" name="gmailMode" value="onetime" style="width:auto;margin-top:3px" ${s.gmailMode === 'onetime' ? 'checked' : ''} data-action-change="gmail-mode">
         <span><b>One-time import</b><br>
-        <span class="t-sub" style="white-space:normal">Scan your existing inbox once to find your trades and history, then remove the credentials if you like.</span></span>
+        <span class="t-sub" style="white-space:normal">Scans your inbox once, read-only, to find your trades and history, then remove the credentials if you like.</span></span>
       </label>
       <div class="banner" data-gmail-status style="margin-top:12px">Checking Gmail…</div>
       <div class="btn-row">
         <button class="btn primary small" data-action="gmail-scan">🔎 Scan for my trades</button>
       </div>
+      <p class="t-sub" style="white-space:normal;margin-top:10px">Scans your inbox and is always read-only for the scan itself · nothing is sent, deleted or moved. Shows a preview of what it found first; nothing is imported until you approve it on a second screen.</p>
       <p class="t-sub" style="white-space:normal;margin-top:10px">Setup: ${s.gmailMode === 'onetime' ? 'use your existing Gmail:' : 'create the dedicated Gmail, then in your main account add a filter forwarding tradie mail (from servicem8.com, invoices, quotes) to it. On the dedicated account:'} turn on 2-Step Verification, create an <b>App Password</b> (myaccount.google.com → Security → App passwords), then paste the address + app password below via <b data-action="wizard" style="color:var(--accent);cursor:pointer">🔑 API key setup</b> · active immediately, no restart needed. ${s.gmailMode === 'onetime' ? 'Read-only: KasaKeeper never sends, deletes or moves mail in this mode.' : 'KasaKeeper sends enquiries and booking confirmations from this mailbox (each one approved by you, or via 🤖 Auto-book) and reads the replies. It never deletes or moves mail.'}</p>
     </div>
     <div class="section-title">Auto-book</div>
@@ -1704,6 +2075,15 @@ function bookQuote(quoteId) {
   const a = Store.asset(q.assetId);
   const { to } = quoteContact(q, a);
   const rebooking = q.status === 'booked';   // reopened from "📌 Change date" — update in place, don't duplicate
+  // DEFECT E: a home-level/orphaned quote (assetId doesn't resolve to a live
+  // asset) has nothing to file the booking under. Store.bookQuote refuses
+  // that outright rather than half-booking it — offer a picker so the user
+  // attaches a real asset before saving (see 'save-booking').
+  const needsAsset = !a;
+  const assetOpts = [{ v: '', l: '— choose an asset —' }].concat(Store.homeAssets().map(x => ({ v: x.id, l: x.name })));
+  // DEFECT D: set only when 'confirm-date' couldn't parse the trade's offered
+  // text — carries it through so the user can see what they actually said.
+  const dateHint = (BOOK_HINT.quoteId === q.id) ? BOOK_HINT.text : '';
   // Research._emailAvail is primed at boot (see the startup probe below) and
   // cached from then on, so a synchronous view can read it directly — the
   // click handlers still re-check with `await Research.emailAvailable()`.
@@ -1715,10 +2095,14 @@ function bookQuote(quoteId) {
       <div class="t-sub">${esc(q.trade || (a ? a.name : 'Service'))}${q.amount ? ' · ' + money(q.amount) : ''}</div></div></div>
     <div class="card">
       <div class="t-sub" style="margin-bottom:10px">${esc(q.provider || 'Supplier')}${a ? ' · ' + esc(a.name) : ''}</div>
-      ${field('b_date','Date booked', q.bookedDate || todayISO(), 'date')}
+      ${needsAsset ? `<div class="kk-note">This quote isn't linked to an asset yet — pick one to book it against.</div>
+      ${selectField('b_asset', 'Asset', '', assetOpts)}` : ''}
+      ${dateHint ? `<div class="kk-note">They offered <b>${esc(dateHint)}</b> — enter the matching date below.</div>` : ''}
+      ${field('b_date','Date booked', q.bookedDate || (dateHint ? '' : todayISO()), 'date')}
       ${field('b_time','Time (optional)', q.bookedTime || '', 'text', 'e.g. 1:30 PM')}
       ${field('b_note','What they are doing', q.trade || '', 'text')}
       ${field('b_cost','Agreed price ($)', q.amount || '', 'number')}
+      <div class="kk-note">Leave as-is to keep this price · clear it if there was no charge.</div>
       <div class="kk-note">${rebooking ? "Saving updates this job's existing history entry · it won't count as spend until you mark it done."
         : "Saving adds this to the asset's Job history as <b>booked</b> · it won't count as spend until you mark it done."}</div>
       ${canInvite ? `<label style="display:flex;align-items:center;gap:10px;cursor:pointer;margin-top:10px">
@@ -1777,7 +2161,7 @@ function editAsset(id) {
       ${field('f_trade','Trade to call (optional)',a.trade,'text','e.g. stonemason — overrides the category default')}
       ${field('f_installed','Installed on',a.installedOn,'date')}
       ${field('f_warranty','Warranty until (optional)',a.warrantyUntil,'date')}
-      ${selectField('f_prov','Service provider',a.providerId||'',provs)}
+      ${selectField('f_prov',"Default provider · used when a job doesn't name its own",a.providerId||'',provs)}
       ${field('f_make','Make (optional)',a.make,'text','e.g. Daikin')}
       ${field('f_model','Model (optional)',a.model,'text','e.g. FDYAN160')}
       ${field('f_purchase','Where to buy (optional)',a.purchaseUrl,'text','supplier product page URL')}
@@ -1945,15 +2329,21 @@ function editProvider(id) {
 }
 
 /* ---------- Create-a-Home wizard ---------- */
-let SETUP = { step: 1, address: '', msg: '', detected: null, selected: new Set(), testMode: false, selectedImage: null };
+let SETUP = { step: 1, address: '', msg: '', detected: null, selected: new Set(), testMode: false, selectedImage: null, geo: null };
 const existsCat = cat => Store.homeAssets().some(a => a.category === cat);
 const existsLabel = l => Store.homeAssets().some(a => a.name.toLowerCase() === l.toLowerCase());
 
 let RESEARCH_RUN = 0;   // run token: a rerun bumps it, so a slow earlier run's callbacks land dead
-function runResearch(addr) {
+// geo (optional) = the USER-CONFIRMED {lat,lon,source:'user',...} from the
+// "which house is mine" picker (see startConfirmHouse below). Passed straight
+// through to Research.run so the server's aerial pass centres on the roofline
+// the owner actually tapped, not a raw street-level geocode — omit it (or
+// pass a plain geocode-sourced geo) and behaviour is unchanged from before
+// this feature existed.
+function runResearch(addr, geo) {
   const run = ++RESEARCH_RUN;
-  SETUP.address = addr || 'Your home'; SETUP.step = 2; SETUP.msg = 'Starting…'; render();
-  Research.run(SETUP.address, m => { if (run !== RESEARCH_RUN) return; SETUP.msg = m; const el = document.querySelector('.wz-live'); if (el) el.textContent = '◍ ' + m; })
+  SETUP.address = addr || 'Your home'; SETUP.step = 2; SETUP.msg = 'Starting…'; SETUP.geo = geo || null; render();
+  Research.run(SETUP.address, m => { if (run !== RESEARCH_RUN) return; SETUP.msg = m; const el = document.querySelector('.wz-live'); if (el) el.textContent = '◍ ' + m; }, geo)
     .then(d => {
       if (run !== RESEARCH_RUN) return;   // a newer run owns SETUP now — drop this stale result
       SETUP.detected = d;
@@ -1963,6 +2353,87 @@ function runResearch(addr) {
       render();
     });
 }
+
+/* ---------- "Which one is your house?" confirm-house picker ---------- */
+// Shared by TWO entry points: the create-a-home wizard (SETUP.step === 1.5,
+// between the address and the research run — so the FIRST aerial pass gets
+// the confirmed point, not a retroactive one) and a standalone retrofit route
+// (#/confirm-house/<homeId>, reachable from Settings) for a home that already
+// exists but was geocoded onto the wrong lot — the owner's own real defect.
+// One picker, one PARCEL state object, one set of data-actions; only what
+// happens on confirm/skip differs by PARCEL.mode.
+let PARCEL_RUN = 0;
+let PARCEL = null;   // null when no confirm-house flow is open
+const PARCEL_SPAN_ORDER = ['close', 'medium', 'wide'];   // must match server._PARCEL_SPAN_MODES' keys
+
+function startConfirmHouse(mode, address, homeId) {
+  const addr = (address || '').trim() || 'Your home';
+  const run = ++PARCEL_RUN;
+  PARCEL = { mode, homeId: homeId || null, address: addr, run, loading: true, error: null,
+             data: null, span: 'medium', picked: null, pinArmed: false };
+  if (mode === 'wizard') { SETUP.address = addr; SETUP.step = 1.5; }
+  render();
+  fetchParcels(run, addr, 'medium');
+}
+
+function fetchParcels(run, address, span) {
+  fetch('api/parcels?address=' + encodeURIComponent(address) + '&span=' + encodeURIComponent(span))
+    .then(async r => {
+      const j = await r.json().catch(() => ({}));
+      if (run !== PARCEL_RUN || !PARCEL) return;   // a newer request (or the flow was closed) owns PARCEL now
+      PARCEL.loading = false;
+      // A 200 doesn't guarantee the full parcels_for shape — the route's own catch-all
+      // fallback (server.py) answers 200 with just {center, buildings:[], source:'none'}
+      // on an unexpected error, no size/frame/imageUrl. Treat anything short of that
+      // shape as an error rather than let renderParcelPanel destructure undefined.
+      const shapeOk = r.ok && j && Array.isArray(j.size) && j.size.length === 2 && j.frame && Array.isArray(j.buildings);
+      if (!shapeOk) { PARCEL.error = (j && j.error) || 'Could not load property imagery'; PARCEL.data = null; }
+      else { PARCEL.error = null; PARCEL.data = j; PARCEL.span = span; PARCEL.picked = null; }
+      render();
+    })
+    .catch(() => {
+      if (run !== PARCEL_RUN || !PARCEL) return;
+      PARCEL.loading = false; PARCEL.error = 'Could not load property imagery'; PARCEL.data = null;
+      render();
+    });
+}
+// Mirrors server._frame_px_to_lonlat (server.py) — Web Mercator's inverse,
+// expressed only in the frame's lat/lon corners + pixel size (the same shape
+// GET /api/parcels actually hands the client; the raw metres never leave the
+// server). tools/test-geo.py's test_pin_roundtrip round-trips the Python twin
+// against server._project_px — the function that produced the buildings'
+// OWN pixel coordinates — so a drift in either side's math fails loudly.
+function pxToLonLat(px, py, frame, size) {
+  const mercY = lat => Math.log(Math.tan(Math.PI / 4 + lat * Math.PI / 360));
+  const mercYInv = y => (2 * Math.atan(Math.exp(y)) - Math.PI / 2) * 180 / Math.PI;
+  const lon = frame.w + (px / size[0]) * (frame.e - frame.w);
+  const y = mercY(frame.n) + (py / size[1]) * (mercY(frame.s) - mercY(frame.n));
+  return [mercYInv(y), lon];
+}
+// PARCEL.picked -> a geo ready for Store.setHomeGeo/Research.run, or null.
+function parcelPickedGeo(p) {
+  if (!p || !p.picked || !p.data) return null;
+  if (p.picked.type === 'building') {
+    const b = (p.data.buildings || [])[p.picked.i]; if (!b) return null;
+    return { lat: b.lat, lon: b.lon, source: 'user', label: b.label || '' };
+  }
+  if (p.picked.type === 'pin') return { lat: p.picked.lat, lon: p.picked.lon, source: 'user' };
+  return null;
+}
+// >=44px effective tap target (design rule 5) on every screen: the SVG's
+// viewBox width is fixed at the image's own pixel size (640), so the ratio
+// between that and the IMG's actual on-screen CSS width gives the scale
+// factor to turn a 22px on-screen half-size into SVG user units. Re-run on
+// load and on resize/orientation-change — see hydrateConfirmHouse below.
+function sizeParcelHitCircles() {
+  const img = document.querySelector('.parcel-img'), svg = document.querySelector('.parcel-svg');
+  if (!img || !svg || !PARCEL || !PARCEL.data) return;
+  const w = img.clientWidth; if (!w) return;
+  const scale = PARCEL.data.size[0] / w;
+  const r = Math.max(22 * scale, 8).toFixed(1);
+  svg.querySelectorAll('.parcel-hit').forEach(c => c.setAttribute('r', r));
+}
+window.addEventListener('resize', () => { if (PARCEL) sizeParcelHitCircles(); });
 // Remaining catalog services the research did NOT detect — offered below the detected ones.
 function buildExtras(detected) {
   const norm = x => (x || '').toLowerCase().replace(/[^a-z0-9]/g, '');
@@ -2002,8 +2473,107 @@ function guessCategory(text) {
   for (const c of Object.keys(CATEGORIES)) { if (n.includes(c.toLowerCase().split('/')[0])) return c; }
   return 'Appliance';
 }
+function parcelImgFailed() { if (PARCEL) { PARCEL.imgFailed = true; render(); } }
+// The core "which house is mine" picker UI — one aerial crop, an absolutely-
+// positioned SVG overlay of building footprints, and the fallback controls.
+// Shared verbatim by the wizard (SETUP.step===1.5) and the Settings retrofit
+// route; only the surrounding header/labels differ by PARCEL.mode.
+function renderParcelPanel(p) {
+  if (p.loading) return `<div class="card"><div class="spinner">◍ Locating your property…</div></div>`;
+  const skipLabel = p.mode === 'wizard' ? 'Skip · use the address →' : 'Cancel';
+  if (p.error) {
+    return `<div class="banner">Couldn’t place that address on the map (${esc(p.error)}). `
+      + `${p.mode === 'wizard' ? 'Research will still run on the address text alone — you can confirm the exact house later from Settings.' : 'Nothing changed — this home keeps its current location.'}</div>
+      <div class="btn-row"><button class="btn primary wide" data-action="skip-confirm">${esc(skipLabel)}</button></div>`;
+  }
+  const d = p.data; if (!d) return '';
+  if (p.imgFailed) {
+    return `<div class="banner">Couldn’t load the aerial image for this address. `
+      + `${p.mode === 'wizard' ? 'Research will still run on the address text alone.' : 'Nothing changed — this home keeps its current location.'}</div>
+      <div class="btn-row"><button class="btn primary wide" data-action="skip-confirm">${esc(skipLabel)}</button></div>`;
+  }
+  const [imgW, imgH] = d.size;
+  const buildings = d.buildings || [];
+  const picked = p.picked;
+  const buildingSvg = (b, i) => {
+    const isPicked = picked && picked.type === 'building' && picked.i === i;
+    const pts = (b.ring || []).map(pt => pt.join(',')).join(' ');
+    const label = isPicked ? (b.label ? `✓ #${esc(b.label)}` : '✓ your house') : (b.label ? '#' + esc(b.label) : '');
+    return `<g class="parcel-hot${isPicked ? ' picked' : ''}" data-action="pick-parcel" data-i="${i}">
+      <polygon class="parcel-poly" points="${pts}"></polygon>
+      <circle class="parcel-hit" cx="${b.centroid[0]}" cy="${b.centroid[1]}" r="20"></circle>
+      ${label ? `<text class="parcel-label${isPicked ? ' picked' : ''}" x="${b.centroid[0]}" y="${Math.max(12, b.centroid[1] - 14)}" text-anchor="middle">${label}</text>` : ''}
+    </g>`;
+  };
+  // Buildings arrive nearest-centroid-first (server.py sorts by distance to the
+  // query centre). SVG hit-testing takes the topmost painted element, so painting
+  // in that order puts every FARTHER building's hit circle on top of the nearest
+  // one's — on tightly-packed terraces the nearest building (the one the user is
+  // actually tapping) can become unpickable. Paint farthest-first so the nearest
+  // building's polygon/circle always wins, while data-i (and the picked check)
+  // still refer to the real, unreversed index.
+  const paintOrder = buildings.map((_, i) => i).reverse();
+  const pinSvg = (picked && picked.type === 'pin')
+    ? `<g class="parcel-pin picked">
+        <circle class="parcel-pin-dot" cx="${picked.px}" cy="${picked.py}" r="9"></circle>
+        <text class="parcel-label picked" x="${picked.px}" y="${Math.max(12, picked.py - 15)}" text-anchor="middle">✓ your house</text>
+      </g>` : '';
+  const catchSvg = p.pinArmed
+    ? `<rect class="parcel-pin-catch" data-action="pin-house" data-tap="1" x="0" y="0" width="${imgW}" height="${imgH}"></rect>` : '';
+  const pickedInfo = !picked ? ''
+    : picked.type === 'building'
+      ? `<div class="banner ok">✓ You picked ${(buildings[picked.i] || {}).label ? `<b>#${esc(buildings[picked.i].label)}</b>` : '<b>this one</b>'} — ${buildings.length > 1 ? 'the outlined lot above' : 'the highlighted lot above'}.</div>`
+      : `<div class="banner ok">✓ Pinned your house on the image above.</div>`;
+  const noBuildingsNote = (!buildings.length && !picked)
+    ? `<div class="banner">No building outlines found here yet — tap “None of these · tap your house” below and mark it on the image.</div>` : '';
+  const spanIdx = PARCEL_SPAN_ORDER.indexOf(p.span);
+  const confirmLabel = p.mode === 'wizard' ? '✓ Confirm & research →' : '✓ Confirm this house';
+  return `<div class="parcel-frame" style="aspect-ratio:${imgW}/${imgH}">
+      <img class="parcel-img" src="${esc(d.imageUrl)}" alt="Aerial view near ${esc(p.address)}" onload="sizeParcelHitCircles()" onerror="parcelImgFailed()">
+      <svg class="parcel-svg${p.pinArmed ? ' pin-armed' : ''}" viewBox="0 0 ${imgW} ${imgH}" preserveAspectRatio="xMidYMid meet">
+        ${paintOrder.map(i => buildingSvg(buildings[i], i)).join('')}
+        ${pinSvg}
+        ${catchSvg}
+      </svg>
+    </div>
+    ${pickedInfo}${noBuildingsNote}
+    ${picked ? `<div class="btn-row"><button class="btn primary wide" data-action="confirm-house">${confirmLabel}</button></div>` : ''}
+    <div class="btn-row">
+      ${spanIdx >= 0 && spanIdx < PARCEL_SPAN_ORDER.length - 1 ? `<button class="btn small" data-action="wider-view">Show a wider view</button>` : ''}
+      <button class="btn small${p.pinArmed ? ' primary' : ''}" data-action="pin-house">${p.pinArmed ? '↑ tap your house on the image above' : 'None of these · tap your house'}</button>
+      <button class="btn small" data-action="skip-confirm">${esc(skipLabel)}</button>
+    </div>`;
+}
+// Retrofit entry point (#/confirm-house/<homeId>) — the owner's home already
+// exists and was geocoded onto a neighbour's lot; this route re-opens the
+// SAME picker against it. hydrateConfirmHouse (below) kicks off the fetch
+// once the loading shell above has been painted.
+function viewConfirmHouse(homeId) {
+  const h = Store.state.homes.find(x => x.id === homeId);
+  if (!h) return `<button class="back" data-action="back">‹ Back</button><div class="card">That home no longer exists.</div>`;
+  if (!PARCEL || PARCEL.mode !== 'retrofit' || PARCEL.homeId !== homeId) {
+    PARCEL = { mode: 'retrofit', homeId, address: h.address || '', run: ++PARCEL_RUN, loading: true,
+               error: null, data: null, span: 'medium', picked: null, pinArmed: false };
+  }
+  return `<button class="back" data-action="back">‹ Back</button>
+    <div class="hero"><div class="emoji">📍</div><div><h1>Which one is your house?</h1><div class="t-sub">${esc(h.address || '')}</div></div></div>
+    ${renderParcelPanel(PARCEL)}`;
+}
+function hydrateConfirmHouse() {
+  if (PARCEL) sizeParcelHitCircles();   // (re)size the tap targets against the just-painted <img>, both entry points
+  if (route()[0] !== 'confirm-house') return;
+  if (PARCEL && PARCEL.mode === 'retrofit' && PARCEL.loading && !PARCEL._fetching) {
+    PARCEL._fetching = true;
+    fetchParcels(PARCEL.run, PARCEL.address, PARCEL.span);
+  }
+}
 function viewSetup() {
   const s = SETUP;
+  if (s.step === 1.5 && PARCEL) {
+    return `<button class="back" data-action="back">‹ Back</button>
+      <div class="hero"><div class="emoji">📍</div><div><h1>Which one is your house?</h1><div class="t-sub">${esc(s.address)}</div></div></div>
+      ${renderParcelPanel(PARCEL)}`;
+  }
   if (s.step === 2) {
     return `<div class="hero"><div class="emoji">🔎</div><h1>Researching your home…</h1></div>
       <p class="t-sub" style="margin-left:2px">${esc(s.address)}</p>
@@ -2114,17 +2684,18 @@ function viewSetup() {
 }
 
 /* ---------- Find a service ---------- */
-function runFind(id) {
+function runFind(id, taskId) {
   const a = Store.asset(id); if (!a) return;
   const s = Store.state.settings, home = Store.home();
-  const trade = searchQueryFor(a);
+  const t = taskId ? Store.state.tasks.find(x => x.id === taskId) : null;
+  const trade = t ? searchQueryForTask(t, a) : searchQueryFor(a);
   // Search near the ASSET's home, not whichever home happens to be current —
   // a deep link to another home's asset must not inherit this home's suburb.
   const ah = Store.state.homes.find(x => x.id === a.homeId) || home;
   const suburb = (ah && ah.suburb) || homeSuburb();
   const address = (ah && ah.address) || suburb;
-  FIND = { assetId: id, loading: true, providers: null, query: trade, debug: null, msg: 'Searching local providers…' };
-  DBG.log('find-service', { asset: a.name, query: trade, suburb, address });
+  FIND = { assetId: id, taskId: taskId || '', loading: true, providers: null, query: trade, debug: null, msg: 'Searching local providers…' };
+  DBG.log('find-service', { asset: a.name, task: t ? t.title : null, query: trade, suburb, address });
   Research.findServices(trade, suburb, address, m => {
     if (FIND.assetId !== id) return;
     FIND.msg = m;
@@ -2170,21 +2741,24 @@ function providerCard(a, p, i) {
     </div>
   </div></div>`;
 }
-function viewFind(id) {
+function viewFind(id, taskId) {
   const a = Store.asset(id); if (!a) return viewDashboard();
   const s = Store.state.settings;
+  const t = taskId ? Store.state.tasks.find(x => x.id === taskId) : null;
   const findSuburb = ((Store.state.homes.find(x => x.id === a.homeId) || {}).suburb) || homeSuburb();   // the ASSET's home
-  if (!FIND || FIND.assetId !== id) setTimeout(() => runFind(id), 0);  // kick off (also handles direct nav)
+  // Kick off (also handles direct nav) whenever the asset OR the task we're searching for changes —
+  // navigating from one task's search straight into another's must not reuse the first task's results.
+  if (!FIND || FIND.assetId !== id || (FIND.taskId || '') !== (taskId || '')) setTimeout(() => runFind(id, taskId), 0);
   const header = `<button class="back" data-action="back">‹ Back</button>
-    <div class="hero">${assetTile(a, 'emoji')}<div><h1>Find a service</h1><div class="t-sub">${esc(a.name)}${findSuburb ? ' · ' + esc(findSuburb) : ''}</div></div></div>`;
+    <div class="hero">${assetTile(a, 'emoji')}<div><h1>Find a service</h1><div class="t-sub">${esc(a.name)}${t ? ' · ' + esc(t.title) : ''}${findSuburb ? ' · ' + esc(findSuburb) : ''}</div></div></div>`;
   // Always show the query that runs — the user can only tell us it's wrong if they can see it.
   const queryLine = q => `<div class="kk-note" style="margin:6px 0 10px">Searching for <b style="color:var(--text)">“${esc(q)}”</b>${findSuburb ? ` near ${esc(findSuburb)}` : ''} · <b data-action="edit-asset" data-id="${a.id}" style="color:var(--accent);cursor:pointer">wrong? edit the asset →</b></div>`;
-  if (!FIND || FIND.assetId !== id || FIND.loading) {
-    return header + queryLine((FIND && FIND.query) || searchQueryFor(a)) + searchingEye() +
+  if (!FIND || FIND.assetId !== id || (FIND.taskId || '') !== (taskId || '') || FIND.loading) {
+    return header + queryLine((FIND && FIND.query) || (t ? searchQueryForTask(t, a) : searchQueryFor(a))) + searchingEye() +
       `<div class="banner ok" id="find-msg">${esc((FIND && FIND.msg) || 'Searching local providers…')}</div>`;
   }
   const provs = FIND.providers || [];
-  const ranQuery = (FIND.debug && FIND.debug.query) || FIND.query || searchQueryFor(a);
+  const ranQuery = (FIND.debug && FIND.debug.query) || FIND.query || (t ? searchQueryForTask(t, a) : searchQueryFor(a));
   let body;
   if (provs.length) {
     body = `<div class="section-title">Top rated near you <span class="pill">${provs.length}</span></div>
@@ -2242,8 +2816,23 @@ function viewCatalog(i) {
 }
 
 /* ---------- render + live HA ---------- */
+let LAST_ROUTE_HASH = null;   // see the filter-focus guard just below
 function render() {
   const r = route();
+  // Never repaint the SAME screen out from under the Assets/Trades filter while
+  // it's mid-type — same "never under someone's fingers" discipline as
+  // hydrateAreas() and the 3-min sync guard further down. This only skips a
+  // REDUNDANT repaint (route unchanged — e.g. a shared-store adopt landing
+  // while the user is typing); an actual navigation always proceeds even with
+  // the filter focused, same as clicking any other link would. render() always
+  // rebuilds $app from scratch, so it cannot preserve DOM focus/cursor the way
+  // refreshFilterBody() does — skipping the redundant case loses nothing, since
+  // FILTER already holds the query and the next real render() reflects it.
+  const hash = r.join('/');
+  const filterFocused = document.activeElement && document.activeElement.getAttribute
+    && document.activeElement.getAttribute('data-filter-input');
+  if (filterFocused && hash === LAST_ROUTE_HASH) return;
+  LAST_ROUTE_HASH = hash;
   if (!Store.state.currentHomeId && r[0] !== 'setup' && r[0] !== 'wizard') { location.hash = '#/setup'; return; }
   let html;
   if (r[0] === 'assets') html = viewAssets(r[1]);
@@ -2261,13 +2850,14 @@ function render() {
   else if (r[0] === 'edit-provider') html = editProvider(r[1]);
   else if (r[0] === 'schedule') html = viewSchedule();
   else if (r[0] === 'setup') html = viewSetup();
+  else if (r[0] === 'confirm-house') html = viewConfirmHouse(r[1]);
   else if (r[0] === 'catalog') html = viewCatalog(r[1]);
   else if (r[0] === 'snap') html = viewSnap();
   else if (r[0] === 'inspect') html = viewInspect();
   else if (r[0] === 'gmail-import') html = viewGmailImport();
   else if (r[0] === 'ha-import') html = viewHaImport();
   else if (r[0] === 'triage') html = viewTriage();
-  else if (r[0] === 'find') html = viewFind(r[1]);
+  else if (r[0] === 'find') html = viewFind(r[1], r[2]);
   else if (r[0] === 'wizard') html = viewWizard();
   else html = viewDashboard();
   $app.innerHTML = html;
@@ -2283,6 +2873,7 @@ function render() {
   hydrateAreas();
   hydrateImagery();
   hydrateUsagePicker();
+  hydrateConfirmHouse();
   updateEye(); // the mark reflects live status: watch / glance-at-badge / sleep
   if (typeof EyeScene !== 'undefined') EyeScene.mountAll(); // brand motion where a [data-eye-scene] host exists
 }
@@ -2362,18 +2953,63 @@ function assetLocation(a) {
   if (a && a.location) return { text: a.location, source: 'manual' };
   return { text: '', source: '' };
 }
+// Pure decision for what the edit-asset Location field should be — no DOM or
+// cache read inside it, so it's unit-testable and is the ONE place both
+// locFieldHTML() (render) and save-asset (write) go through. Before this,
+// save-asset re-derived "is HA governing this?" from the live AREAS cache at
+// click time, which can resolve/flip between render and click and silently
+// discard whatever the user had just typed (DEFECT 6) — now the decision is
+// made once, at render, and stamped into the DOM (see f_loc_state marker in
+// locFieldHTML) for save-asset to read back verbatim.
+//   'ha'         — linked, HA reachable, has an area: field disabled, HA text shown.
+//   'ha-no-area' — linked, HA reachable, no area yet: editable, says so.
+//   'ha-unknown' — linked, HA NOT reachable right now: editable — we don't
+//                  know whether an area exists, so this must never claim
+//                  there isn't one (that's a different, false diagnosis).
+//   'manual'     — unlinked: always editable, no hint.
+function locFieldState(a, { haReachable, areaKnown }) {
+  const linked = !!(a && a.ha && a.ha.deviceId);
+  if (!linked) return 'manual';
+  if (!haReachable) return 'ha-unknown';
+  return areaKnown ? 'ha' : 'ha-no-area';
+}
+// Whether the field AS RENDERED (carrying this state) was the real editable
+// one — everything except 'ha'. save-asset drives off this, not off AREAS.
+function locFieldWasEditable(state) { return state !== 'ha'; }
 // Builds the edit-asset Location field: a locked, HA-fed display when the
 // asset is linked and HA currently reports an area for it (with a note on
 // where to actually change it), otherwise a normal editable field — still
-// available as the fallback for anything unlinked, or linked-but-area-less.
+// available as the fallback for anything unlinked, linked-but-area-less, or
+// linked-but-HA-is-down-right-now. The rendered state is stamped into a
+// hidden f_loc_state marker so save-asset can honour exactly what was
+// rendered, not whatever AREAS says by the time Save is clicked.
 function locFieldHTML(a) {
   const linked = !!(a.ha && a.ha.deviceId);
-  const loc = assetLocation(a);
-  if (linked && loc.source === 'ha') {
-    return `<label>Location</label><input type="text" value="${esc(loc.text)}" disabled>
+  const haReachable = HA.ready() && AREAS.homeId === a.homeId && AREAS.t > 0;
+  const areaKnown = haReachable && !!AREAS.map[a.ha && a.ha.deviceId];
+  const state = locFieldState(a, { haReachable, areaKnown });
+  const marker = `<input type="hidden" id="f_loc_state" value="${state}">`;
+  if (state === 'ha') {
+    const loc = assetLocation(a);
+    return marker + `<label>Location</label><input type="text" value="${esc(loc.text)}" disabled>
       <div class="t-sub dim" style="margin-top:2px">From Home Assistant · to change it, edit this device's area in Home Assistant</div>`;
   }
-  return field('f_loc', 'Location', a.location, 'text', linked ? 'no area set in Home Assistant yet · type one here' : '');
+  const hint = state === 'ha-no-area' ? 'no area set in Home Assistant yet · type one here'
+    : state === 'ha-unknown' ? "Home Assistant isn't reachable right now · this value is stored on the asset"
+    : '';
+  return marker + field('f_loc', 'Location', a.location, 'text', hint);
+}
+// Pure decision for whether hydrateAreas should force a full render() over
+// the edit-asset screen. `dirty` means the live #f_loc input's text differs
+// from the stored asset's location — a full render() repaints the whole
+// screen from the store, which would silently discard that typed-but-
+// unsaved text (SD-7 — this used to be checked on the same-home patch branch
+// only; blurring the field without focusing another input isn't "typing" by
+// the focus test below, so the full-render branch sailed straight over a
+// dirty field and clobbered it). Dirty always wins, regardless of `typing`
+// or `changed` — you never render over someone's unsaved edit.
+function shouldRerenderAreas({ changed, typing, dirty }) {
+  return !!changed && !typing && !dirty;
 }
 async function hydrateAreas() {
   if (Store.isTestHome()) return;
@@ -2392,13 +3028,23 @@ async function hydrateAreas() {
   const changed = (!!home && prevHomeId !== home.id) || (!wasResolved && !!AREAS.t);
   const ae = document.activeElement;
   const typing = ae && (ae.tagName === 'INPUT' || ae.tagName === 'TEXTAREA' || ae.tagName === 'SELECT' || ae.isContentEditable);
-  if (changed && !typing) return render();
+  // Dirty check lives here, ahead of both branches, so a typed-but-not-yet-
+  // saved Location survives whichever path fires — the full render() below
+  // AND the same-home patch further down (see locFieldHTML/f_loc_state note
+  // above: this is the one other place a store-driven repaint can happen to
+  // that field).
+  const lf = document.querySelector('[data-loc-field]');
+  const lfAsset = lf && Store.asset(lf.getAttribute('data-loc-field'));
+  const liveInput = lf && lf.querySelector('#f_loc');
+  const dirty = !!(liveInput && lfAsset && liveInput.value !== (lfAsset.location || ''));
+  if (shouldRerenderAreas({ changed, typing, dirty })) return render();
   // Same-home refresh (the 5-min cache just rolled): patch the one place a
   // stale value would otherwise sit until the next navigation.
-  const lf = document.querySelector('[data-loc-field]');
   if (lf && (!ae || !lf.contains(ae))) {
-    const a = Store.asset(lf.getAttribute('data-loc-field'));
-    if (a) lf.innerHTML = locFieldHTML(a);
+    // Focus can have moved off the field (e.g. tabbed into the next input)
+    // while still carrying an unsaved edit — don't clobber typed-but-not-yet-
+    // focused input just because AREAS resolved in the background.
+    if (lfAsset && !dirty) lf.innerHTML = locFieldHTML(lfAsset);
   }
 }
 // Live strip on an ha-linked asset page: 2–4 headline readings, hydrated async
@@ -2572,7 +3218,10 @@ async function hydrateUsage() {
 /* ---------- actions ---------- */
 function findService(assetId) {
   const a = Store.asset(assetId); const s = Store.state.settings;
-  const trade = searchQueryFor(a);
+  // Mirrors whatever's actually on screen in the /find view: task-scoped query
+  // when we got here via a task's search (FIND.taskId), asset-scoped otherwise.
+  const t = (FIND.assetId === assetId && FIND.taskId) ? Store.state.tasks.find(x => x.id === FIND.taskId) : null;
+  const trade = t ? searchQueryForTask(t, a) : searchQueryFor(a);
   const q = encodeURIComponent(`${trade} near ${homeSuburb()}`);
   window.open('https://www.google.com/search?q=' + q, '_blank');
 }
@@ -2724,6 +3373,15 @@ const kkPrompt = (label, value = '', { okLabel = 'Save', type = 'text', hint = '
   { onOpen: w => { const i = w.querySelector('#kk_p'); i.focus(); i.select();
       i.addEventListener('keydown', e => { if (e.key === 'Enter') w.querySelector('[data-kk="ok"]').click(); }); },
     resolveOn: w => w.querySelector('#kk_p').value });
+// The picked option's value, or null if cancelled — same shape as kkPrompt but
+// for "choose from a short list" instead of free text (e.g. the per-task
+// "who does this?" quick-pick, without a trip through the full edit-task form).
+const kkSelect = (label, value = '', opts = [], { okLabel = 'Save' } = {}) => kkModal(
+  `<div class="kk-modal-h">${esc(label)}</div>
+   <select class="kk-i" id="kk_s">${opts.map(o => `<option value="${esc(o.v)}" ${o.v===value?'selected':''}>${esc(o.l)}</option>`).join('')}</select>
+   <div class="kk-modal-b"><button class="btn" data-kk="cancel">Cancel</button>
+     <button class="btn primary" data-kk="ok">${esc(okLabel)}</button></div>`,
+  { resolveOn: w => w.querySelector('#kk_s').value });
 
 function composeEnquiry({ quoteId, providerId, to, cc, subject, body, sendLabel, templates, onSent, draftKind, ics }) {
   const wrap = document.createElement('div');
@@ -2792,12 +3450,44 @@ function composeEnquiry({ quoteId, providerId, to, cc, subject, body, sendLabel,
 }
 
 const QORDER = { to_contact: 0, enquiry_sent: 1, quoted: 2, booked: 3 };
-function ensureQuote(assetId, status) {
+// taskId scopes BOTH halves: which open quote may be reused (Store.quoteForScope
+// — never another job's, see its comment) and what a freshly raised one is
+// stamped with. A task-scoped search that finds no quote of its own raises a
+// second quote on the asset, which is correct: two trades on one asset are two
+// jobs, and the card headline still names the asset with the task alongside it.
+function ensureQuote(assetId, status, taskId) {
   const a = Store.asset(assetId); if (!a) return null;
-  let q = Store.quoteForAsset(assetId);
-  if (!q) return Store.upsertQuote({ assetId, trade: a.name, status: status || 'to_contact' });  // the card headline: the JOB (asset), never the category bucket
+  let q = Store.quoteForScope(assetId, taskId);
+  // The card headline: the JOB (asset), never the category bucket — plus the
+  // task's own title when this quote is for one specific job, so two quotes on
+  // the same asset are told apart at a glance.
+  if (!q) { const t = taskId ? Store.state.tasks.find(x => x.id === taskId) : null;
+    return Store.upsertQuote({ assetId, trade: t && t.title ? `${a.name} · ${t.title}` : a.name,
+                               status: status || 'to_contact', ...(taskId ? { taskId } : {}) }); }
   if (status && QORDER[status] > QORDER[q.status]) { q.status = status; Store.upsertQuote(q); }
   return q;
+}
+// Which record actually gets a provider "found" via search: normally the
+// ASSET (a.providerId, the default every task without its own falls back
+// to), but when the search that found them started from a TASK (FIND.taskId)
+// it must land on the TASK instead — or picking a solar-panel cleaner from a
+// task-scoped search would silently overwrite the asset's real installer as
+// though they were the same job. Falls back to the asset if the task's gone
+// (deleted from under us mid-search). Shared by every "found a provider"
+// action (save-found, quote-provider, email-provider) so they can't drift.
+function linkFoundProvider(prov, a, taskId) {
+  const t = taskId ? Store.state.tasks.find(x => x.id === taskId) : null;
+  if (t) { t.providerId = prov.id; Store.upsertTask(t); return; }
+  a.providerId = prov.id; Store.upsertAsset(a);
+}
+// The fields a "found a provider" action stamps onto its quote: taskId only
+// appears (and so only ever gets written) when the search that found this
+// provider was TASK-scoped — Store.bookingCovers/bookingSettles and the asset
+// page's own quote card key off exactly this. An asset-scoped pick never
+// invents one, and Object.assign-ing the result at the call site never
+// carries a blank taskId that could erase one a quote already had.
+function quoteStampFor(providerName, taskId) {
+  return taskId ? { provider: providerName, taskId } : { provider: providerName };
 }
 
 document.addEventListener('click', async e => {
@@ -2807,9 +3497,10 @@ document.addEventListener('click', async e => {
   const act = node.getAttribute('data-action'), id = node.getAttribute('data-id');
   switch (act) {
     case 'settings': return go('/settings');
+    case 'clear-filter': return clearFilter(node.getAttribute('data-filter'));
     case 'open-asset': return go('/asset/' + id);
     case 'open-provider': return go('/provider/' + id);
-    case 'back': return goBack();
+    case 'back': PARCEL = null; return goBack();
     case 'new-asset': return go('/edit-asset/new');
     case 'catalog': return go('/catalog');
     case 'cat-open': return go('/catalog/' + node.getAttribute('data-i'));
@@ -2831,17 +3522,40 @@ document.addEventListener('click', async e => {
     case 'edit-asset': return go('/edit-asset/' + id);
     case 'new-task': return go('/edit-task/' + id);
     case 'edit-task': return go('/edit-task/' + node.getAttribute('data-asset') + '/' + id);
+    case 'quick-prov': {   // "who does this job" without the full edit-task form — same field, one tap away
+      const t0 = Store.state.tasks.find(x => x.id === id); if (!t0) return render();
+      const a = Store.asset(t0.assetId); if (!a) return render();
+      const opts = [{ v:'', l:"— the asset's provider —" }].concat(Store.homeProviders().map(p => ({ v: p.id, l: p.name })));
+      const val = await kkSelect(`Who does “${t0.title}”?`, t0.providerId || '', opts);
+      if (val === null) return;
+      // Re-fetch rather than reuse t0: the picker can sit open for as long as the
+      // user takes to decide, and a periodic/visibility-change Store.syncRemote()
+      // (store.js) can adopt a fresh server state in that window — _adopt() does
+      // `this.state = state`, a wholesale replacement, so t0 would be a stale,
+      // detached object by the time Save is tapped. Writing it back would silently
+      // revert whatever another device changed on this task meanwhile (same
+      // read-fresh-at-write-time discipline 'save-task' already follows).
+      const t = Store.state.tasks.find(x => x.id === id); if (!t) return render();
+      t.providerId = val; Store.upsertTask(t);
+      return render();
+    }
     case 'new-provider': return go('/edit-provider/new');
     case 'edit-provider': return go('/edit-provider/' + id);
-    case 'find': return go('/find/' + id);   // browsing suppliers is NOT a quote request — no silent quote record
-    case 'refind': FIND = { assetId: null }; runFind(id); return render();
+    case 'find': {   // browsing suppliers is NOT a quote request — no silent quote record
+      const tid = node.getAttribute('data-task');
+      return go('/find/' + id + (tid ? '/' + tid : ''));
+    }
+    case 'refind': { const tid = FIND.taskId; FIND = { assetId: null }; runFind(id, tid); return render(); }
     case 'save-found': {
       const p = (FIND.providers || [])[+node.getAttribute('data-i')], a = Store.asset(id);
       if (!p || !a) return;
       const prov = Store.upsertProvider({ name: p.name, trade: tradeFor(a), phone: p.phone || '', email: p.email || '', website: p.website || '',
         notes: [p.rating != null ? `${p.rating}★ ${p.reviews || ''} reviews` : ''].filter(Boolean).join(' · ') });
-      a.providerId = prov.id; Store.upsertAsset(a);
-      const q = Store.quoteForAsset(a.id); if (q) { q.provider = p.name; Store.upsertQuote(q); }
+      linkFoundProvider(prov, a, FIND.taskId);
+      // Scope-matched: this action never RAISES a quote (browsing suppliers
+      // isn't a quote request), so with no quote of its own scope there's
+      // simply nothing to stamp — better than repointing another job's.
+      const q = Store.quoteForScope(a.id, FIND.taskId); if (q) { Object.assign(q, quoteStampFor(p.name, FIND.taskId)); Store.upsertQuote(q); }
       return go('/asset/' + id);
     }
     case 'quote-provider': {
@@ -2849,8 +3563,8 @@ document.addEventListener('click', async e => {
       if (!p || !a) return;
       const prov = Store.upsertProvider({ name: p.name, trade: tradeFor(a), phone: p.phone || '', email: p.email || '', website: p.website || '',
         notes: [p.rating != null ? `${p.rating}★ ${p.reviews || ''} reviews` : '', p.blurb].filter(Boolean).join(' · ') });
-      a.providerId = prov.id; Store.upsertAsset(a);
-      const q = ensureQuote(id, 'to_contact'); if (q) { q.provider = p.name; Store.upsertQuote(q); }
+      linkFoundProvider(prov, a, FIND.taskId);
+      const q = ensureQuote(id, 'to_contact', FIND.taskId); if (q) { Object.assign(q, quoteStampFor(p.name, FIND.taskId)); Store.upsertQuote(q); }
       const { subject, body } = Research.enquiryEmail(a);
       // Backend Gmail available + we have their email -> draft-for-approval, send & auto-track the reply.
       if (p.email && await Research.emailAvailable()) {
@@ -2871,8 +3585,8 @@ document.addEventListener('click', async e => {
       if (!p || !a || !p.email) return;
       const prov = Store.upsertProvider({ name: p.name, trade: tradeFor(a), phone: p.phone || '', email: p.email, website: p.website || '',
         notes: [p.rating != null ? `${p.rating}★ ${p.reviews || ''} reviews` : '', p.blurb].filter(Boolean).join(' · ') });
-      a.providerId = prov.id; Store.upsertAsset(a);
-      const q = ensureQuote(id, 'to_contact'); if (q) { q.provider = p.name; Store.upsertQuote(q); }
+      linkFoundProvider(prov, a, FIND.taskId);
+      const q = ensureQuote(id, 'to_contact', FIND.taskId); if (q) { Object.assign(q, quoteStampFor(p.name, FIND.taskId)); Store.upsertQuote(q); }
       const home = (Store.state.settings && Store.state.settings.home) || {};
       const where = home.address || homeSuburb() || 'my home';
       const subject = `Enquiry · ${a.name}`;
@@ -2946,7 +3660,7 @@ document.addEventListener('click', async e => {
         onSent: () => { toast('Reply sent · watching for their answer'); render(); } });
     }
     case 'quote-amount': { const q = Store.quote(id); if (!q) return; const amt = await kkPrompt('Quoted amount ($)', q.amount || '', { type: 'number' }); if (amt === null) return; q.amount = Number(amt) || 0; q.status = 'quoted'; Store.upsertQuote(q); return render(); }
-    case 'quote-book': return go('/book/' + id);   // capture the date, log it, draft the confirmation (or change an existing booking's date)
+    case 'quote-book': BOOK_HINT = { quoteId: '', text: '' }; return go('/book/' + id);   // capture the date, log it, draft the confirmation (or change an existing booking's date)
     // Picking one of the trade's offered dates books it straight away, locally —
     // the trade already told us these dates work, so re-emailing them back isn't
     // the common case and must never block the booking from sticking. Telling the
@@ -2955,13 +3669,26 @@ document.addEventListener('click', async e => {
       const q = Store.quote(id); if (!q) return;
       const date = node.getAttribute('data-date') || '';
       const a = Store.asset(q.assetId);
-      const { to } = quoteContact(q, a);
-      q.status = 'booked'; q.bookedDate = date; q.confirmedAt = todayISO(); Store.upsertQuote(q);
+      let { prov, to } = quoteContact(q, a);
       if (a && q.provider && !a.providerId) {
-        const p = Store.upsertProvider({ name: q.provider, trade: q.trade || a.category, email: to || '', notes: 'Auto-booked' });
-        a.providerId = p.id; Store.upsertAsset(a);
+        prov = Store.upsertProvider({ name: q.provider, trade: q.trade || a.category, email: to || '', notes: 'Auto-booked' });
+        a.providerId = prov.id; Store.upsertAsset(a);
       }
-      toast(to && Research._emailAvail === true ? `Booked · ${date}. Tap ✉︎ Send confirmation to let them know` : `Booked · ${date}`);
+      // Same store-level record as 'save-booking' (Store.bookQuote) — this used
+      // to write status/bookedDate directly and no log at all, leaving the job
+      // invisible on 'Coming up' and with nothing for job-done to complete
+      // (DEFECT 4). No time captured on this path.
+      const booked = Store.bookQuote(q.id, { date, cost: q.amount || 0, providerId: prov ? prov.id : '' });
+      if (!booked) {
+        // DEFECT D/E: the offered text didn't resolve to a real date, or the
+        // asset no longer resolves — never invent today's date or a phantom
+        // booking. Hand the raw text through and let the booking form ask.
+        BOOK_HINT = { quoteId: q.id, text: date };
+        toast(a ? `Couldn't read "${date}" as a date — pick one` : 'Pick an asset to book this against');
+        return go('/book/' + q.id);
+      }
+      q.confirmedAt = todayISO(); Store.upsertQuote(q);
+      toast(to && Research._emailAvail === true ? `Booked · ${jobDate(booked.bookedDate)}. Tap ✉︎ Send confirmation to let them know` : `Booked · ${jobDate(booked.bookedDate)}`);
       blinkMark(); return render();
     }
     case 'send-confirmation': {   // explicit, separate tap — never sent automatically by booking a date
@@ -2971,15 +3698,21 @@ document.addEventListener('click', async e => {
       const { to } = quoteContact(q, a);
       if (!to || !await Research.emailAvailable()) return;
       const subject = `Booking confirmation · ${q.trade || (a ? a.name : 'service')}${q.token ? ` [${q.token}]` : ''}`;
-      const body = `Hi${q.provider ? ' ' + q.provider : ''},\n\nThanks for the dates. ${q.bookedDate || 'The date'} works for us and is locked in`
+      // Same legacy-raw-text guard as qCard's meta line above.
+      const bookedDateText = q.bookedDate ? (/^\d{4}-\d{2}-\d{2}$/.test(q.bookedDate) ? jobDate(q.bookedDate) : q.bookedDate) : 'The date';
+      const body = `Hi${q.provider ? ' ' + q.provider : ''},\n\nThanks for the dates. ${bookedDateText} works for us and is locked in`
         + `${home.address ? ` for ${home.address}` : ''}${q.amount ? ` at ${money(q.amount)}` : ''}.`
         + `\n\nSee you then!`;
       return composeEnquiry({ quoteId: q.id, to, subject, body, sendLabel: 'Send confirmation', onSent: () => {
         q.bookingConfirmSent = true; Store.upsertQuote(q); toast('Confirmation sent to ' + (q.provider || to)); render(); } });
     }
     case 'del-quote': if (await kkConfirm('Remove this quote request?', { okLabel: 'Remove', danger: true })) { Store.deleteQuote(id); return render(); } return;
-    case 'setup': SETUP = { step:1, address:'', msg:'', detected:null, selected:new Set(), extras:[], testMode:false, selectedImage:null }; delete IMAGERY.setup; return go('/setup');
-    case 'research-home': SETUP.testMode = !!document.getElementById('wz_test')?.checked; return runResearch(val('wz_addr'));
+    case 'setup': SETUP = { step:1, address:'', msg:'', detected:null, selected:new Set(), extras:[], testMode:false, selectedImage:null, geo:null }; PARCEL = null; delete IMAGERY.setup; return go('/setup');
+    // Address known -> the confirm-house picker runs BEFORE research, not after,
+    // so the very first aerial pass gets the user-confirmed point (see
+    // startConfirmHouse). confirm-house/skip-confirm below are what actually
+    // call runResearch(addr, geo) once the user has picked or opted out.
+    case 'research-home': SETUP.testMode = !!document.getElementById('wz_test')?.checked; return startConfirmHouse('wizard', val('wz_addr'));
     case 'pick-addr': {
       const input = document.getElementById('wz_addr'), box = document.getElementById('wz_suggest');
       if (input) input.value = node.getAttribute('data-label') || '';
@@ -2992,6 +3725,62 @@ document.addEventListener('click', async e => {
       else toast('Type your address instead.');
       return;
     case 'toggle-feat': { const k = node.getAttribute('data-key'); SETUP.selected.has(k) ? SETUP.selected.delete(k) : SETUP.selected.add(k); return render(); }
+    // ---- "which house is mine" confirm-house picker (wizard + Settings retrofit) ----
+    case 'pick-parcel': {
+      if (!PARCEL || !PARCEL.data) return;
+      const i = +node.getAttribute('data-i');
+      if (!PARCEL.data.buildings[i]) return;
+      PARCEL.picked = { type: 'building', i };
+      return render();
+    }
+    case 'pin-house': {
+      if (!PARCEL || !PARCEL.data) return;
+      if (node.hasAttribute('data-tap')) {   // the invisible catch-rect over the image, not the toggle button
+        const svg = node.ownerSVGElement || node.closest('svg'); if (!svg) return;
+        const pt = svg.createSVGPoint(); pt.x = e.clientX; pt.y = e.clientY;
+        const ctm = svg.getScreenCTM(); if (!ctm) return;
+        const loc = pt.matrixTransform(ctm.inverse());
+        const [w, h] = PARCEL.data.size;
+        const px = Math.max(0, Math.min(w, loc.x)), py = Math.max(0, Math.min(h, loc.y));
+        const [lat, lon] = pxToLonLat(px, py, PARCEL.data.frame, PARCEL.data.size);
+        PARCEL.picked = { type: 'pin', lat, lon, px, py };   // pinArmed stays true — tap again anywhere to re-place it
+        return render();
+      }
+      PARCEL.pinArmed = true;
+      return render();
+    }
+    case 'wider-view': {
+      if (!PARCEL || !PARCEL.data) return;
+      const next = PARCEL_SPAN_ORDER[PARCEL_SPAN_ORDER.indexOf(PARCEL.span) + 1];
+      if (!next) return;
+      const run = ++PARCEL_RUN; PARCEL.run = run; PARCEL.loading = true; PARCEL.picked = null; PARCEL.pinArmed = false;
+      render();
+      fetchParcels(run, PARCEL.address, next);
+      return;
+    }
+    case 'confirm-house': {
+      const geo = parcelPickedGeo(PARCEL); if (!geo) return;
+      const p = PARCEL; PARCEL = null;
+      if (p.mode === 'retrofit') {
+        const saved = await Store.setHomeGeo(p.homeId, geo);
+        toast(saved ? 'This home’s location is confirmed' : 'Could not save — try again');
+        return go('/settings');
+      }
+      SETUP.geo = geo;
+      return runResearch(p.address, geo);
+    }
+    case 'skip-confirm': {
+      const p = PARCEL; PARCEL = null;
+      if (!p) return go(SETUP.step === 1.5 ? '/setup' : '/settings');
+      if (p.mode === 'retrofit') return go('/settings');
+      SETUP.geo = null;
+      return runResearch(p.address);   // unconfirmed path — identical to today's behaviour
+    }
+    case 'confirm-house-retrofit': {
+      const h = Store.state.homes.find(x => x.id === id); if (!h) return;
+      PARCEL = null;   // always fetch fresh imagery/footprints on an explicit (re)confirm
+      return go('/confirm-house/' + h.id);
+    }
     case 'create-home': {
       const d = SETUP.detected; if (!d) return;
       SETUP.detected = null;   // claim it NOW — the photo-vault await below opens a double-tap window otherwise
@@ -3031,8 +3820,14 @@ document.addEventListener('click', async e => {
           if (r.ok && j.ok) { home.photo = true; Store.save(); }
         } catch {}
       }
+      // LAST store-mutating step, deliberately: setHomeGeo() runs syncRemote()
+      // internally (rev-guard discipline), which _adopt()s a merged server copy
+      // and replaces Store.state.homes wholesale — the `home` object captured
+      // above would be a detached reference afterwards, so nothing below this
+      // point may read/write it again.
+      if (SETUP.geo) await Store.setHomeGeo(home.id, SETUP.geo);
       toast(`Home created — ${made} asset${made !== 1 ? 's' : ''} added with schedules${quickMade ? ` · ${quickMade} quick-added for research` : ''}`);
-      SETUP = { step:1, address:'', msg:'', detected:null, selected:new Set(), extras:[], testMode:false, selectedImage:null }; delete IMAGERY.setup; return go('/');
+      SETUP = { step:1, address:'', msg:'', detected:null, selected:new Set(), extras:[], testMode:false, selectedImage:null, geo:null }; PARCEL = null; delete IMAGERY.setup; return go('/');
     }
     case 'save-home': {   // inferred home facts are the user's to correct
       const h = Store.state.homes.find(x => x.id === id); if (!h) return render();
@@ -3068,7 +3863,9 @@ document.addEventListener('click', async e => {
       const prov = p.id ? Store.provider(p.id) : null;
       const linked = prov || Store.upsertProvider({ name: p.name, trade: a.category, notes: p.url || '' });
       a.providerId = linked.id; Store.upsertAsset(a);
-      const q = Store.quoteForAsset(a.id); if (q) { q.provider = linked.name; Store.upsertQuote(q); }
+      // Asset-scoped action (it sets a.providerId), so it may only touch the
+      // asset-level quote — never a specific job's.
+      const q = Store.quoteForScope(a.id, ''); if (q) { q.provider = linked.name; Store.upsertQuote(q); }
       return go('/asset/' + a.id);
     }
     case 'book-service': {   // task card → drafted quoting email listing this provider's assets, services and parts
@@ -3076,7 +3873,7 @@ document.addEventListener('click', async e => {
       const a = Store.asset(t.assetId); if (!a) return render();
       const prov = taskProv(t, a); if (!prov || !prov.email) return render();
       const { subject, body } = bookingEmail(prov, a, t);
-      const q = ensureQuote(a.id, 'to_contact'); if (q) { q.provider = prov.name; q.taskId = t.id; Store.upsertQuote(q); }
+      const q = ensureQuote(a.id, 'to_contact', t.id); if (q) { q.provider = prov.name; Store.upsertQuote(q); }   // scoped to THIS job — ensureQuote stamps the taskId, and force-writing it onto an asset-scoped quote was the hijack quoteForScope exists to stop
       if (await Research.emailAvailable()) {
         return composeEnquiry({ quoteId: q.id, to: prov.email, subject, body, sendLabel: 'Send booking request', onSent: ({ to: to2 }) => {
           q.status = 'enquiry_sent'; q.token = 'KK-' + q.id; q.channel = 'email'; q.enquiryTo = to2; q.enquirySentAt = todayISO();
@@ -3092,7 +3889,7 @@ document.addEventListener('click', async e => {
       const prov = taskProv(t, a);
       if (!prov || !prov.email) return go('/find/' + a.id);   // nobody to email yet — find someone first
       const { subject, body } = faultEmail(prov, a, t);
-      const q = ensureQuote(a.id, 'to_contact'); if (q) { q.provider = prov.name; q.taskId = t.id; Store.upsertQuote(q); }
+      const q = ensureQuote(a.id, 'to_contact', t.id); if (q) { q.provider = prov.name; Store.upsertQuote(q); }   // scoped to THIS job — ensureQuote stamps the taskId, and force-writing it onto an asset-scoped quote was the hijack quoteForScope exists to stop
       if (await Research.emailAvailable()) {
         return composeEnquiry({ quoteId: q.id, to: prov.email, subject, body, sendLabel: 'Send enquiry', onSent: ({ to: to2 }) => {
           q.status = 'enquiry_sent'; q.token = 'KK-' + q.id; q.channel = 'email'; q.enquiryTo = to2; q.enquirySentAt = todayISO();
@@ -3201,14 +3998,38 @@ document.addEventListener('click', async e => {
     case 'call': { const p = Store.provider((Store.asset(id)||{}).providerId); if (p?.phone) location.href = 'tel:'+p.phone.replace(/\s/g,''); else if (Store.asset(id)) findService(id); return; }
     case 'done': {
       const t = Store.state.tasks.find(x=>x.id===id); if (!t) return render();
-      const c = await kkPrompt('Log this as done', t.estCost || 0, { okLabel: 'Log it', type: 'number', hint: 'Cost ($) · leave as-is or clear it if there was none.' });
+      // DEFECT 1 (2026-07 verifier round): a re-tap on a task already marked done
+      // today doesn't log a SECOND job — Store.markDone() only ever corrects the
+      // price on the one row it already wrote (REVIEW-4, post-369cb0f). The
+      // dialog used to say "Log this as done" every time, which read as "logging
+      // again" even on a re-tap; now it says so honestly, and Store._doneToday()
+      // (the exact question doneDialogDefaultCost() just asked to build the
+      // prefill) decides which copy shows.
+      const doneToday = Store._doneToday(t.id);
+      // Captured BEFORE Store.markDone() runs below — isFreshCompletion(t) reads
+      // Store._doneToday(t.id) live, so calling it AFTER markDone() has already
+      // written this tap's row would always see it and read as "not fresh",
+      // even on a genuinely first completion.
+      const wasFreshCompletion = isFreshCompletion(t);
+      const c = await kkPrompt(doneToday ? 'Already logged today — update the price?' : 'Log this as done',
+        doneDialogDefaultCost(t),
+        { okLabel: doneToday ? 'Update' : 'Log it', type: 'number',
+          hint: doneToday ? 'Cost ($) · this only corrects today’s logged price — it won’t add a second entry.'
+                           : 'Cost ($) · clear it if there was none.' });
       if (c === null) return;
       Store.markDone(id, c);
       const a = Store.asset(t.assetId);
-      if (a && a.usage) { await Store.resetUsage(a.id); USAGE.t = 0; delete USAGE.map[a.id]; } // servicing resets the usage counter
-      if (Store.pack(a)) {                            // a prepaid visit just got spent
-        Store.usePack(a.id, 1);
-        toast(`${Store.packLeft(a)} prepaid ${(a.pack.unit || 'visit')}${Store.packLeft(a) !== 1 ? 's' : ''} left`);
+      // Self-review finding on this same commit: a price-correction re-tap must
+      // not repeat the "a job just finished" side effects below — see
+      // isFreshCompletion()'s own comment for the verified pack-double-spend
+      // this closes (pack.used 3->4 on a same-day price-only re-tap, with no
+      // second log row to show for it).
+      if (wasFreshCompletion) {
+        if (a && a.usage) { await Store.resetUsage(a.id); USAGE.t = 0; delete USAGE.map[a.id]; } // servicing resets the usage counter
+        if (Store.pack(a)) {                            // a prepaid visit just got spent
+          Store.usePack(a.id, 1);
+          toast(`${Store.packLeft(a)} prepaid ${(a.pack.unit || 'visit')}${Store.packLeft(a) !== 1 ? 's' : ''} left`);
+        }
       }
       render();
       blinkMark(); // brand behavior: the keeper blinks when a task completes
@@ -3217,32 +4038,43 @@ document.addEventListener('click', async e => {
     case 'job-done': Store.completeLog(id); toast('Logged as done'); return render();
     case 'save-booking': {
       const q = Store.quote(id); if (!q) return;
+      if (!Store.asset(q.assetId)) {
+        // DEFECT E: this quote isn't linked to a live asset — attach the one
+        // the user just picked (see the /book asset picker in bookQuote())
+        // before booking; Store.bookQuote refuses outright without one
+        // rather than flipping the quote to 'booked' with nothing to show
+        // for it. Re-resolve the picked id here rather than trusting the
+        // <select> value blindly — another device may have deleted it in the
+        // moment between rendering the picker and this tap, and writing a
+        // dangling assetId would just reopen DEFECT E through this same door.
+        const pickedAsset = Store.asset(val('b_asset'));
+        if (!pickedAsset) { toast('Pick an asset to book this against'); return; }
+        q.assetId = pickedAsset.id; Store.upsertQuote(q);
+      }
       const a = Store.asset(q.assetId);
       const { prov, to } = quoteContact(q, a);
-      const date = val('b_date') || todayISO();
+      // No `|| todayISO()` fallback (DEFECT D): b_date is a native date input,
+      // so an empty value means the user cleared it — Store.bookQuote refuses
+      // that below rather than silently booking today.
+      const date = val('b_date');
       const time = val('b_time');
       const note = val('b_note') || q.trade || 'Booked job';
-      const cost = Number(val('b_cost')) || q.amount || 0;
-      q.status = 'booked'; q.bookedDate = date; q.bookedTime = time; q.amount = cost;
-      Store.upsertQuote(q);
-      if (a) {
-        // Re-opening "📌 Change date" on an already-booked quote must UPDATE the
-        // job history entry it made the first time, not add a second one. Match on
-        // quoteId (set below on every new booking log); a single pending 'booked'
-        // log with no quoteId (written before this field existed) is the one
-        // unambiguous legacy case worth updating too.
-        let existing = Store.state.logs.find(l => l.assetId === a.id && l.quoteId === q.id && l.source === 'booked');
-        if (!existing) {
-          const legacy = Store.state.logs.filter(l => l.assetId === a.id && l.source === 'booked' && l.pending && !l.quoteId);
-          if (legacy.length === 1) existing = legacy[0];
-        }
-        // Always stamp quoteId on write (including a legacy log matched by the
-        // fallback above) so a THIRD re-confirm finds it directly next time,
-        // even if another quote on this same asset gets booked in the meantime.
-        const patch = { date, note: note + (time ? ' · ' + time : ''), cost, providerId: prov ? prov.id : '', ref: q.ref || '', quoteId: q.id };
-        if (existing) Store.updateLog(existing.id, patch);
-        else Store.addLog({ assetId: a.id, ...patch, source: 'booked', pending: true });
-      }
+      // A typed 0 (warranty, no-charge job) is honoured; an untyped/cleared
+      // field falls back to $0 too — same "clear it if there was none"
+      // contract as the ✓ Done prompt (Store.markDone's kkPrompt), not the
+      // old silent fallback to the stale quoted amount (that was the same
+      // shape as DEFECT 5, just via this entry point instead — a cleared
+      // field must never silently resurrect a number the user just erased).
+      // See Store.numOr; leaving the field showing its pre-filled quoted
+      // price and not touching it still submits that price, since val()
+      // reads it as typed input, not as "empty".
+      const cost = Store.numOr(val('b_cost'), 0);
+      // Store.bookQuote is the one place that writes what "booked" means —
+      // it sets the quote's status/bookedDate/bookedTime/amount and upserts
+      // exactly one pending job-history log, matched by quoteId (not
+      // `source`, which completeLog rewrites — see its doc comment).
+      const booked = Store.bookQuote(q.id, { date, time, note, cost, providerId: prov ? prov.id : '', ref: q.ref || '' });
+      if (!booked) { toast('Pick a valid date to book this'); return render(); }
       const home = Store.home() || {};
       const mode = node.getAttribute('data-mode') || 'local';
       const inviteEl = document.getElementById('b_invite');
@@ -3375,7 +4207,7 @@ document.addEventListener('click', async e => {
       // three. Matched on packAsset, not just assetId — a normal quote request you
       // already have open on this asset must not be overwritten by a booking.
       // An already-sent booking keeps its status; this is not a re-send.
-      const open = Store.state.quotes.find(x => x.packAsset === a.id && x.status !== 'booked' && x.status !== 'declined');
+      const open = Store.state.quotes.find(x => x.packAsset === a.id && x.status !== 'booked' && x.status !== 'declined' && x.status !== 'done');
       const q = Store.upsertQuote(Object.assign(open || { status: 'to_contact' }, {
         assetId: a.id, trade: (prov && prov.trade) || a.category,
         provider: (prov && prov.name) || '', channel: 'email',
@@ -3415,8 +4247,8 @@ document.addEventListener('click', async e => {
     }
     case 'archive-provider': {
       const p = Store.setProviderArchived(id, true);
-      const linked = Store.homeAssets().filter(a => a.providerId === id);
-      if (p) toast(`${p.name} moved to past providers${linked.length ? ` — still linked to ${linked.length} asset${linked.length>1?'s':''}` : ''}`);
+      const linked = Store.providerLinkLabel(id);   // tasks too — see providerLinks()
+      if (p) toast(`${p.name} moved to past providers${linked ? ` — still linked to ${linked}` : ''}`);
       return render();
     }
     case 'unarchive-provider': {
@@ -3426,8 +4258,11 @@ document.addEventListener('click', async e => {
     }
     case 'del-provider': {
       const p = Store.provider(id); if (!p) return go('/providers');
-      const linked = Store.homeAssets().filter(a => a.providerId === id).length;
-      const msg = `Delete ${p.name || 'this provider'}?` + (linked ? ` They're linked to ${linked} asset${linked>1?'s':''} · those will be unlinked (assets kept).` : '');
+      // Counts TASKS as well as assets — a trade used for exactly one job read
+      // as "linked to 0 assets", so deleting them looked consequence-free while
+      // it silently unlinked that job.
+      const linked = Store.providerLinkLabel(id);
+      const msg = `Delete ${p.name || 'this provider'}?` + (linked ? ` They're linked to ${linked} · those will be unlinked (nothing else is deleted).` : '');
       if (await kkConfirm(msg, { okLabel: 'Delete', danger: true })) { Store.deleteProvider(id); return go('/providers'); }
       return;
     }
@@ -3534,15 +4369,19 @@ document.addEventListener('click', async e => {
       // Location isn't in this Object.assign: while HA reports an area for a
       // linked device, the field renders disabled and its value is the HA
       // text, not the stored manual one — saving it as-is would silently
-      // overwrite whatever manual value the asset already had. Only write
-      // f_loc when the field was the real editable one (unlinked, or linked
-      // with no HA area — see locFieldHTML).
-      const haGoverned = a.ha && a.ha.deviceId && AREAS.homeId === a.homeId && AREAS.map[a.ha.deviceId];
+      // overwrite whatever manual value the asset already had. Read the
+      // DECISION AS RENDERED (f_loc_state, stamped by locFieldHTML) rather
+      // than re-deriving it from the live AREAS cache here — that cache can
+      // resolve/flip between render and this click, and re-deriving it used
+      // to discard whatever the user had just typed (DEFECT 6). A field that
+      // was editable when rendered keeps the typed value as the manual
+      // override; an HA-governed field is never written.
+      const locEditable = locFieldWasEditable(val('f_loc_state'));
       Object.assign(a, { name:val('f_name'), category:val('f_cat'), trade:val('f_trade'),
         installedOn:val('f_installed'), warrantyUntil:val('f_warranty'), providerId:val('f_prov'),
         make:val('f_make'), model:val('f_model'), serial:val('f_serial'), haEntity:val('f_ha'),
         purchaseUrl:val('f_purchase') });
-      if (!haGoverned) a.location = val('f_loc');
+      if (locEditable) a.location = val('f_loc');
       const saved = Store.upsertAsset(a);
       if (SNAP.pending) {  // snapped asset: keep the photo on the Green + build its schedule
         if (SNAP.image) fetch('api/photo', { method:'POST', headers:{'Content-Type':'application/json'},
@@ -3599,8 +4438,43 @@ document.addEventListener('click', async e => {
       }
     }
     case 'gmail-scan': {
-      GMSCAN = { status:'scanning', result:null, picked:null, msg:'Connecting…' };
+      // Preview first, always — this only counts matches (dryRun:true), it never
+      // fetches a body or writes anything. The real scan is a deliberate second tap.
+      GMSCAN = { status:'scanning', mode:'preview', result:null, picked:null, msg:'Connecting…' };
       go('/gmail-import');
+      (async () => {
+        try {
+          const start = await (await fetch('api/gmail/scan', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ dryRun:true }) })).json();
+          if (!start.job_id) throw new Error(start.error || 'could not start the preview');
+          const msgs = ['Checking the mailbox…', 'Counting matches…'];
+          for (let n = 0; n < 80; n++) {                       // a preview only counts hits — fast even on a big inbox
+            await new Promise(r2 => setTimeout(r2, 3000));
+            GMSCAN.msg = msgs[Math.min(msgs.length - 1, Math.floor(n / 8))];
+            if (route()[0] === 'gmail-import' && GMSCAN.status === 'scanning') render();
+            let job; try { job = await (await fetch('api/gmail/scan/' + start.job_id)).json(); } catch (e2) { continue; }
+            if (job.status === 'done' || job.status === 'error') {
+              if (job.result && job.result.error) throw new Error(job.result.error);
+              // The server only sets dryRun:true when it actually took the dry-run
+              // path (server.py). Anything else — an older/unbuilt server that
+              // ignores the flag, or a mismatched container — means this was a
+              // REAL scan: land it on the existing post-scan picker (status:'done'),
+              // never 'preview', so the real-scan button can't fire a second full read.
+              const honoured = job.result && job.result.dryRun === true;
+              GMSCAN = honoured ? { status:'preview', result: job.result || {}, picked:null }
+                                 : { status:'done', result: job.result || {}, picked:null };
+              if (route()[0] === 'gmail-import') render();
+              return;
+            }
+          }
+          throw new Error('preview timed out');
+        } catch (e3) { GMSCAN = { status:'idle' }; toast('Gmail preview failed · ' + e3.message); go('/settings'); }
+      })();
+      return;
+    }
+    case 'gmail-scan-real': {
+      // The deliberate second action — only this path ever reaches Store.upsertProvider/upsertAsset.
+      GMSCAN = { status:'scanning', mode:'full', result:null, picked:null, msg:'Connecting…' };
+      render();
       (async () => {
         try {
           const start = await (await fetch('api/gmail/scan', { method:'POST', headers:{'Content-Type':'application/json'}, body:'{}' })).json();
@@ -3992,7 +4866,20 @@ function renderAddrSuggest(list) {
   box.innerHTML = list.map(s => `<div class="su-suggest-row" data-action="pick-addr" data-label="${esc(s.label)}">${esc(s.label)}</div>`).join('')
     + `<div class="su-pow">Address suggestions · powered by Google</div>`;
 }
+// Assets/Trades filter: same "patch a node directly" discipline as the address
+// box above — every keystroke updates FILTER and repaints only the filtered
+// body container (see refreshFilterBody), never $app, so the input never
+// loses focus or cursor position, no matter how often render() also fires
+// elsewhere for other reasons.
 document.addEventListener('input', e => {
+  const fkey = e.target.getAttribute && e.target.getAttribute('data-filter-input');
+  if (fkey) {
+    FILTER[fkey] = e.target.value;
+    const btn = document.querySelector(`[data-action="clear-filter"][data-filter="${fkey}"]`);
+    if (btn) btn.hidden = !e.target.value;
+    refreshFilterBody(fkey);
+    return;
+  }
   if (e.target.id !== 'wz_addr') return;
   clearTimeout(ADDR_DEBOUNCE);
   const q = e.target.value.trim();
@@ -4006,6 +4893,10 @@ document.addEventListener('input', e => {
 document.addEventListener('click', e => {   // tap outside the address field dismisses its dropdown
   const box = document.getElementById('wz_suggest');
   if (box && !box.hidden && e.target.id !== 'wz_addr' && !e.target.closest('#wz_suggest')) { box.hidden = true; box.innerHTML = ''; }
+});
+document.addEventListener('keydown', e => {   // Escape clears the Assets/Trades filter — one tap out, same as the ✕
+  const fkey = e.target.getAttribute && e.target.getAttribute('data-filter-input');
+  if (fkey && e.key === 'Escape') clearFilter(fkey);
 });
 window.addEventListener('hashchange', render);
 Store.load();

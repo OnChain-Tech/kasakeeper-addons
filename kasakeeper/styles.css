@@ -285,6 +285,22 @@ select.feat-var{margin-top:7px;width:auto;max-width:240px;padding:6px 9px;font-s
 .asset-photo{width:100%;max-height:220px;object-fit:cover;border-radius:14px;border:1px solid var(--line);margin:4px 0 10px}
 .triage-cta{cursor:pointer}
 
+/* ---- Assets/Trades filter box: one compact row directly under the topbar,
+   out of the way of .section-title — quiet chrome (surface2/faint), never an
+   accent element, so it never reads as a second hero on the screen. ---- */
+.filter-box{display:flex;align-items:center;gap:8px;background:var(--surface2);border:1px solid var(--line);
+  border-radius:10px;padding:0 6px 0 14px;margin:0 0 14px;height:44px}
+.filter-ic{font-size:14px;flex:none;line-height:1;opacity:.8}
+.filter-input{flex:1;min-width:0;width:auto;background:none;border:none;padding:0;height:100%;
+  font-size:14px;color:var(--text)}
+.filter-input:focus{outline:none}
+.filter-input::placeholder{color:var(--faint)}
+.filter-clear{background:none;border:none;color:var(--faint);cursor:pointer;font-size:12px;
+  width:30px;height:30px;border-radius:8px;flex:none;position:relative;display:grid;place-items:center}
+.filter-clear::after{content:'';position:absolute;inset:-7px}   /* halo up to 44px touch target, same trick as .btn::after */
+.filter-clear:hover{color:var(--text)}
+.filter-clear[hidden]{display:none}   /* our own display:grid above is an author rule, so it beats the UA [hidden] default without this */
+
 /* ---- segmented tabs (Assets / Warranties) ---- */
 .tabs{display:flex;gap:6px;margin:2px 0 12px}
 .tab{flex:1;text-align:center;padding:9px 10px;border-radius:10px;border:1px solid var(--line);
@@ -442,3 +458,29 @@ select.feat-var{margin-top:7px;width:auto;max-width:240px;padding:6px 9px;font-s
 .img-thumb{flex:0 0 96px;width:96px;height:64px;object-fit:cover;border-radius:10px;
   border:1px solid var(--line);cursor:pointer;background:var(--surface2)}
 .img-thumb:hover{border-color:var(--accent-d)}
+
+/* "Which one is your house?" confirm-house picker — an aerial crop with an
+   absolutely-positioned SVG hotspot overlay. object-fit:fill on the <img> +
+   the frame's own aspect-ratio (set inline, matching the server's exact
+   imgW/imgH) keeps the pixel grid and the SVG viewBox in exact 1:1
+   correspondence — no letterboxing to account for when tapping. */
+.parcel-frame{position:relative;width:100%;border-radius:var(--radius);overflow:hidden;
+  background:var(--surface2);border:1px solid var(--line);margin-bottom:10px}
+.parcel-img{position:absolute;inset:0;width:100%;height:100%;object-fit:fill;display:block}
+.parcel-svg{position:absolute;inset:0;width:100%;height:100%;touch-action:manipulation}
+.parcel-hot{cursor:pointer}
+.parcel-poly{fill:rgba(var(--green-deep),.18);stroke:var(--accent);stroke-width:2;
+  vector-effect:non-scaling-stroke;transition:fill .15s,stroke .15s}
+.parcel-hot:active .parcel-poly{fill:rgba(var(--green-deep),.32)}
+/* Selected = a border change AND a label, never colour alone (design rule 3). */
+.parcel-hot.picked .parcel-poly{fill:rgba(var(--green-deep),.34);stroke:var(--text);stroke-width:3}
+.parcel-hit{fill:rgba(0,0,0,0)}
+.parcel-label{font:600 12px var(--mono);fill:var(--text);paint-order:stroke;
+  stroke:var(--bg);stroke-width:3px;stroke-linejoin:round}
+.parcel-label.picked{fill:var(--accent)}
+.parcel-pin-dot{fill:var(--accent);stroke:var(--text);stroke-width:2;vector-effect:non-scaling-stroke}
+.parcel-pin-catch{fill:rgba(0,0,0,0);cursor:crosshair}
+/* Pin mode ("None of these · tap your house") means the detected footprints are
+   the thing the user is overriding — a wrong/offset OSM way must not keep eating
+   taps meant for the free-pin catch-rect underneath it. */
+.parcel-svg.pin-armed .parcel-hot{pointer-events:none}

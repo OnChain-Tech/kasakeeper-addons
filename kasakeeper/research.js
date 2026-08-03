@@ -17,15 +17,31 @@ const Research = {
   // Async job flow: POST /api/research returns a job_id instantly (so HA's
   // ingress proxy never times out the ~90s research), then we poll
   // GET /api/research/<job_id> until it's done.
-  async run(address, onStep) {
+  // geo (optional) = the USER-CONFIRMED property fix from the "which house is
+  // mine" hotspot picker — same shape as Store.homeGeo(): {lat, lon, source}.
+  // When it carries numeric lat/lon we send them so the server's aerial pass
+  // centres on the confirmed roofline instead of the raw geocode, and marks
+  // confirmed=true so the model drops the neighbouring-lot hedge. The server
+  // re-validates independently — this is just "send what we have", not the trust boundary.
+  async run(address, onStep, geo) {
     const msgs = ['Locating the property…', 'Reading listings…', 'Inspecting photos…', 'Cross-referencing…', 'Building your plan…'];
     let i = 0; onStep && onStep(msgs[0]);
     const tick = setInterval(() => { i = (i + 1) % msgs.length; onStep && onStep(msgs[i]); }, 1500);
     const done = (v) => { clearInterval(tick); return v; };
     const sleep = (ms) => new Promise(r => setTimeout(r, ms));
     const usable = (d) => d && Array.isArray(d.features) && d.features.length;
+    const body = { address };
+    // Only send lat/lon when the fix is USER-CONFIRMED (geo.source==='user') — a
+    // plain geocode is exactly the street-level point that already risks landing
+    // on a neighbour's house, so it must never outrank the listing's own lat/lon
+    // (server.py prefers coords unconditionally once sent). See the run() doc above.
+    if (geo && geo.source === 'user' && typeof geo.lat === 'number' && typeof geo.lon === 'number' && Number.isFinite(geo.lat) && Number.isFinite(geo.lon)) {
+      body.lat = geo.lat;
+      body.lon = geo.lon;
+      body.confirmed = true;
+    }
     try {
-      const start = await fetch('api/research', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ address }) });
+      const start = await fetch('api/research', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
       if (!start.ok) return done(Research._stub(address));
       const { job_id } = await start.json();
       if (!job_id) return done(Research._stub(address));

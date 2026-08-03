@@ -244,10 +244,20 @@ try:
 except Exception:
     _SSL_CTX = None
 
-def _http_get(url, headers=None, timeout=25):
+def _http_get(url, headers=None, timeout=25, max_bytes=None):
+    """max_bytes is optional and defaults to today's unbounded read — every
+    existing caller keeps behaving exactly as before. Pass it for an
+    untrusted/unbounded upstream (e.g. Overpass): reads at most max_bytes+1
+    bytes off the wire and raises if that's exceeded, so an oversized body is
+    never buffered in full before being rejected."""
     req = urllib.request.Request(url, headers=headers or {"User-Agent": "KasaKeeper/1.0 (home-maintenance app)"})
     with urllib.request.urlopen(req, timeout=timeout, context=_SSL_CTX) as r:
-        return r.read()
+        if max_bytes is None:
+            return r.read()
+        data = r.read(max_bytes + 1)
+        if len(data) > max_bytes:
+            raise ValueError(f"response exceeded {max_bytes} byte cap")
+        return data
 
 # --- Home Assistant proxy (add-on only) ---------------------------------------
 # With homeassistant_api:true the Supervisor injects SUPERVISOR_TOKEN and exposes
@@ -961,6 +971,88 @@ def _purge_ha_secrets_for_removed_homes(old_state, new_state):
     except Exception as e:
         print(f"[ha] secret purge on home delete failed: {e}")
 
+_HOME_GEO_SOURCES = ("user", "geocode")
+
+def _sanitize_home_geo(geo):
+    """Boundary validator for home.geo — the "which house is mine" confirm step
+    (see Store.homeGeo/setHomeGeo in store.js). Coordinates ultimately drive
+    which aerial imagery gets analysed and, once source=='user', DROP the
+    neighbouring-lot hedge in AERIAL_SYSTEM — a bad lat/lon here doesn't just
+    mis-render a pin, it can point the vision model at a stranger's house with
+    full confidence. Returns a clean dict, or None if geo is unusable (the
+    caller drops the whole key rather than 400ing the request — a malformed
+    geo must never brick the shared store for every other field on the row).
+    """
+    if not isinstance(geo, dict):
+        return None
+    lat, lon = geo.get("lat"), geo.get("lon")
+    # bool is a subclass of int in Python — isinstance(True, (int, float)) is
+    # True, so exclude it explicitly or a stray `lat: true` would sail through
+    # as 1.0 and land a pin at the equator/prime-meridian intersection.
+    if isinstance(lat, bool) or isinstance(lon, bool) or not isinstance(lat, (int, float)) or not isinstance(lon, (int, float)):
+        return None
+    try:
+        # float() on a JSON big integer (e.g. a 400-digit lat) raises
+        # OverflowError, not ValueError — an unguarded conversion here escapes
+        # _sanitize_home_geo and do_POST entirely, killing the response with
+        # no HTTP reply at all. Treat it the same as any other unusable fix.
+        lat, lon = float(lat), float(lon)
+    except (OverflowError, ValueError, TypeError):
+        return None
+    if not (math.isfinite(lat) and math.isfinite(lon)):
+        return None
+    if not (-90.0 <= lat <= 90.0 and -180.0 <= lon <= 180.0):
+        return None
+    source = geo.get("source")
+    source = source if source in _HOME_GEO_SOURCES else "geocode"
+    out = {"lat": lat, "lon": lon, "source": source,
+           "confirmedAt": str(geo.get("confirmedAt") or "")[:40]}
+    ring = geo.get("ring")
+    if isinstance(ring, list) and ring:
+        clean_ring = []
+        for pt in ring[:400]:
+            if not (isinstance(pt, list) and len(pt) == 2):
+                continue
+            plat, plon = pt[0], pt[1]
+            if isinstance(plat, bool) or isinstance(plon, bool) or not isinstance(plat, (int, float)) or not isinstance(plon, (int, float)):
+                continue
+            try:
+                plat, plon = float(plat), float(plon)  # see the lat/lon OverflowError note above
+            except (OverflowError, ValueError, TypeError):
+                continue
+            if not (math.isfinite(plat) and math.isfinite(plon)):
+                continue
+            clean_ring.append([max(-90.0, min(90.0, plat)), max(-180.0, min(180.0, plon))])
+        if clean_ring:
+            out["ring"] = clean_ring
+    label = geo.get("label")
+    if isinstance(label, str) and label.strip():
+        out["label"] = label.strip()[:12]
+    return out
+
+def _research_coords_from_payload(payload):
+    """POST /api/research boundary validator for the optional USER-CONFIRMED
+    lat/lon/confirmed (the "which house is mine" hotspot picker). Same rules as
+    _sanitize_home_geo above: bool/NaN/inf/out-of-range/non-numeric all fail
+    closed. Bad input is silently IGNORED — the request still runs, just on the
+    unconfirmed path — rather than 400ing the whole research call. A rejected or
+    missing pair NEVER reaches research()/aerial_scan(), so it can never land in
+    an Esri URL unvalidated. Returns (coords, confirmed): coords is (lat, lon) or
+    None; confirmed is always False when coords is None."""
+    lat, lon = payload.get("lat"), payload.get("lon")
+    coords = None
+    if (not isinstance(lat, bool) and not isinstance(lon, bool)
+            and isinstance(lat, (int, float)) and isinstance(lon, (int, float))):
+        try:
+            flat, flon = float(lat), float(lon)
+        except (OverflowError, ValueError, TypeError):
+            flat = flon = None
+        if (flat is not None and math.isfinite(flat) and math.isfinite(flon)
+                and -90.0 <= flat <= 90.0 and -180.0 <= flon <= 180.0):
+            coords = (flat, flon)
+    confirmed = bool(payload.get("confirmed")) and coords is not None
+    return coords, confirmed
+
 def state_write(base_rev, new_state):
     """Returns (ok, doc). ok=False means the caller was stale — doc is the server copy."""
     with _STATE_LOCK:
@@ -1094,13 +1186,44 @@ def geocode(address):
         print(f"[aerial] geocode failed: {e}")
         return None
 
-def aerial_image_b64(lat, lon):
-    """Fetch a ~70 m satellite crop centred on (lat,lon) from Esri World Imagery (no key)."""
+# _merc_xy (lat/lon -> Web Mercator metres) used just below is defined once,
+# further down near the parcels/hotspot code (_merc_xy/_merc_lonlat, ~line
+# 3650) — Python resolves the name at CALL time, not definition time, so this
+# works fine even though the def appears later in the file. A second, near-
+# identical private copy used to live right here (a merge artefact from two
+# geo tasks each adding their own Web Mercator helper); it silently shadowed
+# this one and was never called, so it was removed rather than kept as dead
+# code with a confusingly duplicate name.
+
+def aerial_image_b64(lat, lon, span_m=None):
+    """Fetch a satellite crop centred on (lat,lon) from Esri World Imagery (no key).
+    span_m (half-width in metres): pass this for the USER-CONFIRMED path — it requests
+    bboxSR/imageSR=3857 (Web Mercator) with an exactly square bbox, so lat/lon -> pixel
+    is a clean linear transform and the crop lines up with the hotspot the user tapped
+    (the plain 4326-degree box below does not: dlon is a fixed guess, not cos(lat)-
+    corrected, and drifts at other latitudes). None (the default, unconfirmed/street-
+    geocode path) keeps the original ~90 m degree box, unchanged."""
     try:
-        dlat, dlon = 0.00080, 0.00096  # ~90 m box (covers the lot even with street-level geocoding)
-        bbox = f"{lon-dlon},{lat-dlat},{lon+dlon},{lat+dlat}"
-        url = ("https://services.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/export"
-               f"?bbox={bbox}&bboxSR=4326&imageSR=4326&size=1000,1000&format=jpg&f=image")
+        if span_m:
+            x, y = _merc_xy(lat, lon)
+            # span_m is a GROUND half-width, but the bbox is in Web Mercator metres,
+            # which over-measures ground distance by 1/cos(lat) — uncorrected, the
+            # confirmed crop is narrower than intended away from the equator (at
+            # lat -33.77 a 45 m half-span covers only ~37 m of ground, vs the ~90 m
+            # unconfirmed degree box), so features near the edge of the block (e.g.
+            # a pool set back from the house) can fall outside the confirmed crop
+            # while still being inside the unconfirmed one.
+            cos_lat = math.cos(math.radians(lat))
+            cos_lat = cos_lat if abs(cos_lat) > 1e-9 else 1e-9  # guard the pole singularity
+            half = float(span_m) / cos_lat
+            bbox = f"{x-half},{y-half},{x+half},{y+half}"
+            url = ("https://services.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/export"
+                   f"?bbox={bbox}&bboxSR=3857&imageSR=3857&size=1000,1000&format=jpg&f=image")
+        else:
+            dlat, dlon = 0.00080, 0.00096  # ~90 m box (covers the lot even with street-level geocoding)
+            bbox = f"{lon-dlon},{lat-dlat},{lon+dlon},{lat+dlat}"
+            url = ("https://services.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/export"
+                   f"?bbox={bbox}&bboxSR=4326&imageSR=4326&size=1000,1000&format=jpg&f=image")
         data = _http_get(url)
         if not data[:2] == b"\xff\xd8":  # not a JPEG (error blob)
             print("[aerial] imagery returned non-JPEG")
@@ -1110,33 +1233,63 @@ def aerial_image_b64(lat, lon):
         print(f"[aerial] imagery failed: {e}")
         return None
 
-AERIAL_SYSTEM = (
-    "You are inspecting a high-resolution satellite/aerial image of a residential block. The property of "
-    "interest is at the CENTRE — but because geocoding is street-level, the target house may sit slightly "
-    "off-centre and its backyard may extend toward the top or bottom edge, so consider the central lot AND "
-    "the lot immediately behind/beside the centre as the target property. Look for, on the target property "
-    "(house roof + its own yard): a swimming pool (blue/teal rectangle of water), a spa or small plunge pool, "
-    "solar panels on the roof (dark uniform rectangular grid), an open lawn/grass area, garden beds / dense "
-    "planted vegetation, large trees overhanging the house, and a tennis court. Backyards sit BEHIND houses, "
-    "so scan the yards immediately above and below the centre for a pool or spa — these are easy to miss. "
-    "Prefer to INCLUDE a feature you are reasonably sure sits on the target lot rather than miss it (the user "
-    "will confirm each) — but do not report a feature that clearly belongs to a distant neighbour. Respond with ONLY a JSON object (no "
-    "markdown) where each key is one of pool, spa, solar, lawn, garden, large_trees, tennis_court and each "
-    "value is {\"present\": true/false, \"confidence\": \"high|medium|low\"}."
+_AERIAL_COMMON = (
+    "Look for, on the target property (house roof + its own yard): a swimming pool (blue/teal rectangle of "
+    "water), a spa or small plunge pool, solar panels on the roof (dark uniform rectangular grid), an open "
+    "lawn/grass area, garden beds / dense planted vegetation, large trees overhanging the house, and a tennis "
+    "court. Imagery can be out of date, so the ABSENCE of a feature in this photo is not proof it doesn't "
+    "exist — it may simply have been installed after this image was taken; only report what you can actually "
+    "see, don't infer from its absence. Respond with ONLY a JSON object (no markdown) where each key is one "
+    "of pool, spa, solar, lawn, garden, large_trees, tennis_court and each value is {\"present\": true/false, "
+    "\"confidence\": \"high|medium|low\"}."
 )
 
-def aerial_scan(address, client, coords=None):
+def aerial_system(confirmed):
+    """The AERIAL_SYSTEM vision prompt, split on whether the property's coordinates
+    were USER-CONFIRMED (via the hotspot picker) or are still just a street-level
+    geocode. confirmed=True drops the neighbouring-lot hedge and its "off-centre"/
+    "behind/beside" language entirely — that hedge is exactly the mis-attribution
+    bug: it tells the model to also credit an ADJACENT lot's pool/spa/solar to this
+    house. Once the user has tapped their own building the image is centred/cropped
+    on that footprint, so anything on a neighbour's lot must be excluded, not hedged
+    toward. confirmed=False is today's behaviour, unchanged, hedge intact."""
+    if confirmed:
+        return (
+            "You are inspecting a high-resolution satellite/aerial image of a residential block. This image "
+            "is centred EXACTLY on the roofline the homeowner CONFIRMED as their own house — that roofline at "
+            "the centre of the frame, and its own yard only, is the target property. Do NOT report a pool, "
+            "spa, solar, or any other feature that belongs to an ADJACENT or nearby lot, even if it is close "
+            "to the centre — a neighbour's feature must never be attributed to this house. " + _AERIAL_COMMON
+        )
+    return (
+        "You are inspecting a high-resolution satellite/aerial image of a residential block. The property of "
+        "interest is at the CENTRE — but because geocoding is street-level, the target house may sit slightly "
+        "off-centre and its backyard may extend toward the top or bottom edge, so consider the central lot AND "
+        "the lot immediately behind/beside the centre as the target property. Backyards sit BEHIND houses, "
+        "so scan the yards immediately above and below the centre for a pool or spa — these are easy to miss. "
+        "Prefer to INCLUDE a feature you are reasonably sure sits on the target lot rather than miss it (the "
+        "user will confirm each) — but do not report a feature that clearly belongs to a distant neighbour. "
+        + _AERIAL_COMMON
+    )
+
+_AERIAL_CONFIRMED_SPAN_M = 45  # ground half-width in metres (aerial_image_b64 cos(lat)-corrects
+                                # this to Web Mercator); matches the ~90 m unconfirmed box's magnitude
+
+def aerial_scan(address, client, coords=None, confirmed=False):
     """Return a list of DetectedHome feature dicts found from the aerial image (may be empty).
-    coords = (lat, lon) if known from the listing (more precise than street-level geocoding)."""
+    coords = (lat, lon) if known — either the listing's lat/lon or the user-confirmed
+    fix (more precise than street-level geocoding either way). confirmed=True means
+    coords came from the "which house is mine" hotspot picker: use the exact 3857
+    parcel crop and drop the neighbouring-lot hedge in the vision prompt."""
     loc = coords or geocode(address)
     if not loc:
         return []
-    b64 = aerial_image_b64(*loc)
+    b64 = aerial_image_b64(*loc, span_m=(_AERIAL_CONFIRMED_SPAN_M if confirmed else None))
     if not b64:
         return []
     try:
         resp = client.messages.create(
-            model=AERIAL_MODEL, max_tokens=1024, system=AERIAL_SYSTEM,
+            model=AERIAL_MODEL, max_tokens=1024, system=aerial_system(confirmed),
             messages=[{"role": "user", "content": [
                 {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": b64}},
                 {"type": "text", "text": "Inspect the central property and return the JSON."},
@@ -1171,7 +1324,15 @@ def _merge_features(features, extra):
     return features
 
 # ---- live research via Claude ------------------------------------------------
-def research(address):
+def research(address, coords=None, confirmed=False):
+    """coords/confirmed = the USER-CONFIRMED property fix from the "which house is
+    mine" hotspot picker (see Store.homeGeo / _sanitize_home_geo — already validated
+    finite/in-range by the caller before it reaches here). When given, it WINS over
+    whatever lat/lon the listing search happens to report: the listing's lat/lon is
+    often the very same street-level geocode that put the pin on a neighbour's house
+    in the first place, so it must never override a fix the owner tapped by hand.
+    coords=None (the default) reproduces today's behaviour unchanged: prefer the
+    listing's own lat/lon if present, else let aerial_scan geocode the address."""
     try:
         import anthropic
     except ImportError:
@@ -1209,9 +1370,13 @@ def research(address):
 
     # --- 2) aerial inspection (satellite vision) — enriches EVERY home, listed or not ---
     try:
-        lat, lon = data.get("lat"), data.get("lon")
-        coords = (lat, lon) if isinstance(lat, (int, float)) and isinstance(lon, (int, float)) else None
-        aerial = aerial_scan(address, client, coords)
+        if coords:
+            aerial_coords, aerial_confirmed = coords, bool(confirmed)
+        else:
+            lat, lon = data.get("lat"), data.get("lon")
+            aerial_coords = (lat, lon) if isinstance(lat, (int, float)) and isinstance(lon, (int, float)) else None
+            aerial_confirmed = False
+        aerial = aerial_scan(address, client, aerial_coords, confirmed=aerial_confirmed)
         if aerial:
             before = len(data["features"])
             _merge_features(data["features"], aerial)
@@ -1844,6 +2009,75 @@ def _money(v):
     except Exception:
         return None
 
+# A single job's cost has no business being seven figures — this bounds a hostile
+# or malformed model-emitted number (`1e400` parses as inf via json.loads; a huge
+# but finite digit string is merely absurd) before it can reach json.dump, where a
+# non-finite float would be written as the bare token `Infinity` and wedge every
+# browser's JSON.parse on the shared state forever (see _chat_cost/D5).
+CHAT_MAX_COST = 1_000_000.0
+
+
+def _quote_money(v):
+    """A money field parsed out of an INBOUND EMAIL, bounded, or None.
+
+    _money() alone deliberately keeps a leading '-' (it is a general number
+    reader), so a hostile or garbled reply could land amount=-50000 or
+    paidAmount=-999999999 straight in the store, where it flows into spend
+    totals and renders as a negative price on the quote card. The chat write
+    path already refuses exactly this via _chat_cost (negative, absurdly
+    large, non-finite); the poller — which takes text from anyone who can
+    email the mailbox, so it deserves the STRICTER treatment of the two —
+    never got the equivalent. Same bounds, one place, so they cannot drift.
+    """
+    f = _money(v)
+    if f is None or f < 0 or f > CHAT_MAX_COST:
+        return None
+    return f
+
+def _chat_cost(v):
+    """Validate a chat tool's `cost` argument at the /api/chat/apply boundary — the
+    model's arguments are otherwise never checked before they reach the mutator.
+    Returns (value, error): value is 0.0 with no error when the field is omitted
+    (None), matching the JS write path (Store.markDone: `Number(cost) || 0`) so a
+    job completed without a price banks $0, never the task's estimate. Anything
+    PRESENT but not sensibly a price — non-numeric ('$450' is fine and coerces;
+    'N/A' isn't), a list/dict (would otherwise let _money() silently pull a
+    number out of a stray '[1]'), a bool, negative, non-finite, or absurdly
+    large — is rejected with a message instead of raising inside the mutator
+    (RemoteDisconnected, no message reaching the client) or being silently
+    persisted as-is."""
+    if v is None:
+        return 0.0, None
+    if isinstance(v, bool) or not isinstance(v, (int, float, str)):
+        return None, f"cost must be a number, not {type(v).__name__}"
+    f = _money(v)
+    if f is None:
+        return None, f"{v!r} isn't a number I can use as a cost"
+    if f < 0:
+        return None, "cost can't be negative"
+    if f > CHAT_MAX_COST:
+        return None, f"cost can't be more than {CHAT_MAX_COST:,.0f}"
+    return f, None
+
+def _valid_done_date(s, today):
+    """True if s is a real ISO calendar date (YYYY-MM-DD) that isn't in the
+    future. A completion date goes straight into t['lastDone'] with no
+    validation today: 'tomorrow'/'not-a-date'/'9999-99-99' are stored verbatim
+    and then render as 'in NaNd' with Store.status() returning 'ok' — the task
+    silently drops off the overdue list forever. A valid-but-wrong-year date
+    (e.g. next Christmas) needs no malformed string at all and dormants a task
+    for years; on a smoke-alarm or gas task that's the failure that matters, so
+    a future date is rejected outright rather than merely a malformed one.
+    Backdating into the past stays allowed on purpose — this tool (unlike the
+    UI) can log a job done last week."""
+    if not isinstance(s, str) or not _re.fullmatch(r"\d{4}-\d{2}-\d{2}", s):
+        return False
+    try:
+        time.strptime(s, "%Y-%m-%d")
+    except ValueError:
+        return False
+    return s <= today
+
 def _short(v, n):
     """Email-derived text, bounded and single-line. The body is third-party content:
     an injected reply could otherwise stuff kilobytes of prose (or newlines that read
@@ -1943,21 +2177,77 @@ def poll_quote_replies():
     if not watched:
         return
     replies = _imap_replies_for_tokens(list(watched))
-    # newest reply per watched quote
+    by_qid = {q["id"]: q for q in st["quotes"]}
+    own_addrs = {(_gmail_creds() or ("", ""))[0].lower(),
+                 str(((st.get("settings") or {}).get("emailCc") or "")).lower()} - {""}
+
+    # Newest reply per watched quote, from the [KK-] token in the subject.
+    #
+    # SECURITY — the token ROUTES a message, it does not AUTHENTICATE it. It is a
+    # bearer string in cleartext in the subject line of every enquiry we send: it
+    # reaches the trade, everyone they CC, everyone they forward to, and it
+    # survives every reply in the thread. Treating a token hit as proof of
+    # identity (which this did) meant anyone who ever saw one could set that
+    # quote's price and — because quoteContact() prefers q.replyFrom (app.js) —
+    # put their own address behind the Reply button, so the booking confirmation
+    # and every later email went to them, laundered under the real trade's name
+    # in the push notification. Every defence the project built lived in
+    # pick_reply(), which this path never called.
+    #
+    # A token hit is now held to the SAME sender verification as the fallback
+    # ladder: the envelope From (parseaddr, never the regex — see pick_reply)
+    # must be an address we already trust for this quote — the one we wrote to,
+    # the one we last heard from, another mailbox on that same non-free-mail
+    # domain — or one of our own addresses, for mail the owner forwards in.
+    # Anything else is ignored, and the ladder below still gets its turn.
+    #
+    # What this deliberately gives up: a trade answering from a genuinely
+    # unrelated domain no longer auto-applies. The ladder could never have
+    # matched that either, so nothing regresses — we only stop trusting a
+    # secret that too many people hold.
+    #
+    # The job-relevance gate is NOT applied here: the token already proves
+    # thread membership, and a verified trade's "Yes, Tuesday works" carries
+    # none of the gate words.
     newest = {}
-    for tok, qid in watched.items():
-        msgs = replies.get(tok) or []
-        if msgs:
-            uid, msgid, frm, ts, body = msgs[-1]
+    token_claimed = set()
+    # Deterministic order (by quote id): if one message somehow carries two
+    # watched tokens, the SAME quote wins every cycle instead of dict order
+    # deciding — and token_claimed stops the second quote taking it at all.
+    # One asset can legitimately hold several quotes now (a trade per task), so
+    # one trade holding two of our tokens is an ordinary shape, not an attack.
+    for tok, qid in sorted(watched.items(), key=lambda kv: str(kv[1])):
+        q = by_qid.get(qid) or {}
+        verifiers = [v for _term, v in reply_search_tiers(q, own_addrs)]
+        if not verifiers:
+            continue        # nothing trusted to check against — the ladder can't run either
+        for r in reversed(replies.get(tok) or []):          # newest first
+            if not isinstance(r, (list, tuple)) or len(r) < 5:
+                continue    # malformed row must not wedge the poller
+            msgid, frm, ts, body = r[1], r[2], r[3], (r[4] or "")
+            if not msgid or msgid == q.get("lastReplyId") or msgid in token_claimed:
+                continue
+            sender = (emaillib.utils.parseaddr(frm)[1] or "").strip().lower()
+            if not sender or not any(v(sender) for v in verifiers):
+                print(f"[quote] token hit for {qid} from an unverified sender — ignoring")
+                continue
             newest[qid] = {"msgid": msgid, "from": frm, "body": body, "ts": ts}
+            token_claimed.add(msgid)
+            break
+    all_tokens = {str(q.get("token") or "") for q in st["quotes"] if q.get("token")}
+    claimed = {info["msgid"] for info in newest.values() if info.get("msgid")}
+
     # Sender fallback: trades drop the [KK-] token constantly (fresh emails, edited
     # subjects, a different mailbox on the same domain), and the owner forwards mail
     # that reached their personal inbox. A TRUE LADDER, most-specific first: the exact
     # address we last heard from → the address we wrote to → anyone @ that domain.
     # The first tier that yields a message wins; later tiers never run for that quote.
+    # The ladder and ALL its security rules live in reply_search_tiers()/pick_reply()
+    # above, so tools/test-quote-matching.py exercises the shipped decision rather
+    # than a copy of it — and the token tier above now shares its verifiers.
     #
-    # SECURITY (a stranger who learns this mailbox address must not be able to write a
-    # quote card or put their address behind the Reply button):
+    # SECURITY (a stranger who learns this mailbox address, or a quote's token, must
+    # not be able to write a quote card or put their address behind the Reply button):
     #  · IMAP SEARCH is a substring match on the raw header, so every hit is re-checked
     #    against the parsed envelope From — display names cannot supply the address.
     #  · Free-mail domains never become a domain term (this mailbox IS gmail.com, so
@@ -1965,17 +2255,8 @@ def poll_quote_replies():
     #  · Every fallback tier must clear the job-mail relevance gate, not just tier 3.
     #  · A message carrying a DIFFERENT quote's [KK-] token belongs to that quote, and
     #    one message can never be claimed by two quotes in the same cycle.
-    by_qid = {q["id"]: q for q in st["quotes"]}
-    all_tokens = {str(q.get("token") or "") for q in st["quotes"] if q.get("token")}
-    claimed = {info["msgid"] for info in newest.values() if info.get("msgid")}
-    own_addrs = {(_gmail_creds() or ("", ""))[0].lower(),
-                 str(((st.get("settings") or {}).get("emailCc") or "")).lower()} - {""}
-
-    # Sender fallback: trades drop the [KK-] token constantly (fresh emails, edited
-    # subjects, a different mailbox on the same domain), and the owner forwards mail
-    # that reached their personal inbox. The ladder and ALL its security rules live in
-    # reply_search_tiers()/pick_reply() above, so tools/test-quote-matching.py exercises
-    # the shipped decision rather than a copy of it.
+    #  · A [KK-] token ROUTES a message, it never AUTHENTICATES one — the token tier
+    #    holds its hits to these same verifiers.
     pending = {}
     for tok, qid in watched.items():
         q = by_qid.get(qid) or {}
@@ -2029,12 +2310,17 @@ def poll_quote_replies():
                     str(((state.get("settings") or {}).get("emailCc") or "")).lower()}
             if _sender and _sender.lower() not in _own:
                 q["replyFrom"] = _sender
-            dates = [str(d).strip() for d in ((res or {}).get("offered_dates") or [])
-                     if str(d).strip()][:5]
+            # _short each entry, not just cap the list: every sibling field is
+            # bounded (replyNote 200, availability 60, paidReceipt 40) but these
+            # were only .strip()'d, so a 20KB "date" reached the store, became a
+            # button label AND its data-date, and was what confirm-date booked
+            # as the job's date.
+            dates = [_short(d, 40) for d in ((res or {}).get("offered_dates") or [])]
+            dates = [d for d in dates if d][:5]
             if dates:
                 q["offeredDates"] = dates
-            if res and res.get("is_quote") and _money(res.get("amount")) is not None:
-                q["amount"] = _money(res["amount"])
+            if res and res.get("is_quote") and _quote_money(res.get("amount")) is not None:
+                q["amount"] = _quote_money(res["amount"])
                 q["currency"] = "AUD"
                 q["availability"] = _short(res.get("availability"), 60)
                 q["status"] = "quoted"
@@ -2051,12 +2337,12 @@ def poll_quote_replies():
             # Payments already made (deposits) are facts, not decisions — record the
             # typed fields so the card can show them; nothing books or sends off them.
             # Coerced: the model can emit "$250"/"250 AUD", which would render as $0.
-            if res and _money(res.get("paid_amount")) is not None:
-                q["paidAmount"] = _money(res["paid_amount"])
+            if res and _quote_money(res.get("paid_amount")) is not None:
+                q["paidAmount"] = _quote_money(res["paid_amount"])
                 if res.get("paid_receipt"):
                     q["paidReceipt"] = _short(res["paid_receipt"], 40)
-            if res and _money(res.get("balance_due")) is not None:
-                q["balanceDue"] = _money(res["balance_due"])
+            if res and _quote_money(res.get("balance_due")) is not None:
+                q["balanceDue"] = _quote_money(res["balance_due"])
             if dates and q.get("status") in ("enquiry_sent", "replied", "quoted"):
                 q["status"] = "dates_offered"  # dates in hand — user picks one to confirm
             who = q.get("provider") or "A trade"
@@ -2162,8 +2448,20 @@ def autobook_scan():
     assets = {a.get("id"): a for a in st.get("assets", [])}
     provs = {p.get("id"): p for p in st.get("providers", [])}
     homes = {h.get("id"): h for h in st.get("homes", [])}
-    open_tasks = {q.get("taskId") for q in st.get("quotes", []) if q.get("status") not in ("booked", "declined")}
-    open_assets = {q.get("assetId") for q in st.get("quotes", []) if q.get("status") not in ("booked", "declined")}
+    # What already has an enquiry in flight, at the two grains a quote can have.
+    # A quote that NAMES a task blocks only that job. A quote with NO taskId is
+    # asset-level — it predates per-task providers, or was raised from the asset —
+    # so it still blocks the whole asset: nothing records which of the asset's jobs
+    # it covers, and guessing would fire an unattended email about work a trade is
+    # already quoting.
+    #
+    # Before this split, ANY open quote blocked EVERY job on its asset. With a
+    # trade per task that is wrong by design: one quote on the garden silently
+    # stopped auto-book for the mowing AND the lopping AND the irrigation, so
+    # ticking 🤖 auto did nothing at all and gave no hint why.
+    _open = [q for q in st.get("quotes", []) if q.get("status") not in ("booked", "declined", "done")]
+    open_tasks = {q.get("taskId") for q in _open if q.get("taskId")}
+    open_assets = {q.get("assetId") for q in _open if not q.get("taskId")}
     for t in st.get("tasks", []):
         if not t.get("autoBook") or t.get("snoozed") or t.get("diy"):
             continue  # diy: belt-and-braces — the UI already clears autoBook on DIY jobs
@@ -2507,6 +2805,19 @@ def fault_scan():
         if gone:
             gone_set = set(gone)
             s["tasks"] = [t for t in tasks if t.get("id") not in gone_set]
+            # Unscope any quote raised for a task we're retiring — the same rule
+            # as the client's Store.deleteTask (store.js), which this path
+            # bypasses entirely. Fault tasks are the likeliest to have one:
+            # 'fault-enquiry' (app.js) stamps q.taskId when it emails a trade
+            # about the fault. Left pointing at a retired task the quote is
+            # unreachable — quoteForTask can never surface it and bookingSettles
+            # can never match it — while it still renders on the asset page
+            # forever. Cleared, it becomes an asset-level quote again, keeping
+            # its amount and its live email thread. NOT deleted, for exactly
+            # that reason.
+            for q in _rows(s, "quotes"):
+                if q.get("taskId") in gone_set:
+                    q.pop("taskId", None)
             at = stamp[:10]
             tomb = s.setdefault("tombstones", [])
             tomb.extend({"id": tid, "at": at} for tid in gone_set if tid)
@@ -3187,6 +3498,98 @@ def purge_asset_files(asset_ids):
 # ---- home imagery (test-home picker: Street View + aerial, user chooses) ------
 ESRI_EXPORT_BASE = "https://services.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/export"
 
+# ---- Web-Mercator projection helpers ("which house is mine" hotspot overlay) --
+# esri_export_url() below requests bboxSR=4326&imageSR=4326 with dlon = span*1.2
+# against a 640x400 image (degree-box aspect 1.2 vs pixel aspect 1.6) — ArcGIS
+# silently pads/crops a mismatched box to fit, so a lat/lon -> pixel mapping
+# built on top of it is NOT reliable. These helpers instead work entirely in
+# Web Mercator (EPSG:3857) metres with a SQUARE bbox against a SQUARE image, so
+# the bbox aspect exactly equals the pixel aspect and ArcGIS cannot adjust the
+# box — lat/lon -> pixel becomes a clean linear transform. Used by the property
+# hotspot overlay (footprint polygons projected onto the aerial crop) and by
+# esri_export_url_3857(); the legacy esri_export_url()/save_home_photo() path
+# is untouched.
+_MERC_R = 6378137.0            # WGS84 semi-major axis — Web Mercator's own radius
+_MERC_LAT_LIMIT = 85.05112878   # Web Mercator's own latitude cutoff (where y -> +/-inf)
+
+def mercator_xy(lat, lon):
+    """WGS84 lat/lon (degrees) -> Web Mercator (EPSG:3857) x/y in metres."""
+    lat = max(-_MERC_LAT_LIMIT, min(_MERC_LAT_LIMIT, lat))
+    x = math.radians(lon) * _MERC_R
+    y = math.log(math.tan(math.pi / 4 + math.radians(lat) / 2)) * _MERC_R
+    return x, y
+
+def mercator_lonlat(x, y):
+    """Inverse of mercator_xy: Web Mercator x/y in metres -> WGS84 lat/lon degrees."""
+    lon = math.degrees(x / _MERC_R)
+    lat = math.degrees(2 * math.atan(math.exp(y / _MERC_R)) - math.pi / 2)
+    return lat, lon
+
+def parcel_frame(lat, lon, span_m, size_px):
+    """A SQUARE Web-Mercator crop window centred on (lat,lon). `span_m` is the
+    GROUND half-span in real-world metres (e.g. 60 -> a 120x120 m box on the
+    ground); `size_px` is the square image's pixel width/height (e.g. 640).
+
+    Web Mercator's local scale factor is sec(lat) — it inflates BOTH axes
+    equally, so a ground half-span of span_m metres is span_m / cos(lat) in
+    mercator metres. Skipping that (as a naive "just use span_m as the mercator
+    half-span" would) leaves the crop ~19% too wide/tall at Sydney latitudes
+    (cos(-33.77 deg) ~= 0.831 -> 1/0.831 ~= 1.20).
+
+    Returns {x0,y0,x1,y1,w,h,bbox}: (x0,y0)-(x1,y1) is the mercator bbox
+    (south-west corner to north-east corner, in metres — ArcGIS's own bbox
+    order); w,h are the pixel dimensions (both == size_px); bbox is the
+    "x0,y0,x1,y1" string the export API's `bbox` param wants, formatted with
+    fixed decimals so it can never emit scientific notation.
+    """
+    if not (math.isfinite(lat) and math.isfinite(lon)):
+        raise ValueError("parcel_frame: lat/lon must be finite")
+    span_m = float(span_m)
+    if not math.isfinite(span_m):
+        raise ValueError("parcel_frame: span_m must be finite")
+    span_m = abs(span_m)
+    if not math.isfinite(float(size_px)):
+        raise ValueError("parcel_frame: size_px must be finite")
+    size_px = int(size_px)
+    if span_m <= 0 or size_px <= 0:
+        raise ValueError("parcel_frame: span_m and size_px must be positive")
+    lat_c = max(-_MERC_LAT_LIMIT, min(_MERC_LAT_LIMIT, lat))
+    cx, cy = mercator_xy(lat_c, lon)
+    cos_lat = math.cos(math.radians(lat_c))
+    cos_lat = cos_lat if abs(cos_lat) > 1e-9 else 1e-9  # guard the pole singularity
+    half = span_m / cos_lat
+    x0, y0, x1, y1 = cx - half, cy - half, cx + half, cy + half
+    return {
+        "x0": x0, "y0": y0, "x1": x1, "y1": y1, "w": size_px, "h": size_px,
+        "bbox": f"{x0:.3f},{y0:.3f},{x1:.3f},{y1:.3f}",
+    }
+
+def lonlat_to_px(frame, lat, lon):
+    """WGS84 lat/lon -> pixel coordinates within a parcel_frame() window (image
+    convention: origin top-left, +x right, +y down)."""
+    x, y = mercator_xy(lat, lon)
+    px = (x - frame["x0"]) / (frame["x1"] - frame["x0"]) * frame["w"]
+    py = (frame["y1"] - y) / (frame["y1"] - frame["y0"]) * frame["h"]
+    return px, py
+
+def px_to_lonlat(frame, px, py):
+    """Inverse of lonlat_to_px: a pixel coordinate within a parcel_frame() window
+    -> WGS84 lat/lon degrees."""
+    x = frame["x0"] + (px / frame["w"]) * (frame["x1"] - frame["x0"])
+    y = frame["y1"] - (py / frame["h"]) * (frame["y1"] - frame["y0"])
+    return mercator_lonlat(x, y)
+
+def esri_export_url_3857(frame):
+    """Esri World Imagery static crop for a parcel_frame() window, projected in
+    Web Mercator (EPSG:3857) — bboxSR/imageSR both 3857 with a SQUARE bbox
+    matching the SQUARE pixel size, so ArcGIS can't silently adjust the box the
+    way it does for the legacy esri_export_url()'s mismatched aspect. Every bbox
+    component comes straight from the frame's own floats (parcel_frame already
+    formats them fixed-decimal, never scientific notation) — nothing here
+    interpolates a caller-supplied string."""
+    w, h = int(frame["w"]), int(frame["h"])
+    return f"{ESRI_EXPORT_BASE}?bbox={frame['bbox']}&bboxSR=3857&imageSR=3857&size={w},{h}&format=jpg&f=image"
+
 def esri_export_url(lat, lon, span):
     """Esri World Imagery static crop centred on (lat,lon), keyless. `span` is the
     half-height in degrees — smaller = more zoomed in (mirrors aerial_image_b64's box)."""
@@ -3246,6 +3649,294 @@ def save_home_photo(home_id, url):
     tmp = fp + ".tmp"
     open(tmp, "wb").write(data)
     os.replace(tmp, fp)   # atomic — a crash never leaves a truncated photo
+
+# ---- parcels: OSM building-footprint hotspots for "confirm which house is
+# yours" (GET /api/parcels; consumed by home.geo, see Store.setHomeGeo /
+# _sanitize_home_geo). Nominatim geocoding is street-level, so the aerial pin
+# can land on a neighbour — this gives the UI real building outlines to tap
+# instead of trusting the pin blind. Overpass is a free, keyless, UNTRUSTED
+# external API: every response is size-capped, timed out, defensively parsed,
+# and never echoed to the client raw.
+#
+# Projection: esri_export_url() above requests bboxSR=4326 (plain lat/lon)
+# with a hand-tuned aspect fudge (dlon = span*1.2 against a 640x400 image) —
+# fine for a picture, but lat/lon degrees aren't equal-area, so a pixel
+# computed from that box drifts off the true building outline. Parcels
+# instead work entirely in Web Mercator metres (bboxSR/imageSR=3857): the
+# bbox is built with EXACTLY the image's pixel aspect (640:400), so
+# metres->pixels is one clean linear transform with no post-hoc ArcGIS
+# aspect correction to reverse-engineer.
+_MERC_R = 6378137.0                 # WGS84 major axis == the sphere radius Web Mercator (EPSG:3857) uses
+_MERC_LAT_LIMIT = 85.05112878        # Web Mercator's own latitude cutoff (tan() blows up at the poles)
+
+def _merc_xy(lat, lon):
+    """lat/lon (degrees) -> Web Mercator x/y (metres)."""
+    x = _MERC_R * math.radians(lon)
+    lat = max(-_MERC_LAT_LIMIT, min(_MERC_LAT_LIMIT, lat))
+    y = _MERC_R * math.log(math.tan(math.pi / 4 + math.radians(lat) / 2))
+    return x, y
+
+def _merc_lonlat(x, y):
+    """Web Mercator x/y (metres) -> lat/lon (degrees) — inverse of _merc_xy."""
+    lon = math.degrees(x / _MERC_R)
+    lat = math.degrees(2 * math.atan(math.exp(y / _MERC_R)) - math.pi / 2)
+    return lat, lon
+
+_PARCEL_IMG_W, _PARCEL_IMG_H = 640, 400
+_PARCEL_SPAN_MODES = {"close": 50.0, "medium": 90.0, "wide": 160.0}   # metres, total width
+_PARCEL_SPAN_MIN, _PARCEL_SPAN_MAX = 40.0, 160.0
+
+def _finite_coord(raw, lo, hi):
+    """Coerce any raw value (query param, JSON scalar, Overpass field) to a
+    finite float within [lo, hi], or None. Shared boundary for /api/parcels'
+    lat/lon query params AND every Overpass-supplied vertex — bool is
+    excluded explicitly (bool is an int subclass in Python: `lat=true` would
+    otherwise sail through as 1.0), and float() on a huge digit string
+    raises OverflowError rather than ValueError, so both are caught."""
+    if raw is None or isinstance(raw, bool):
+        return None
+    try:
+        f = float(raw)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not math.isfinite(f) or not (lo <= f <= hi):
+        return None
+    return f
+
+def _clean_housenumber(raw):
+    """Whitelist-strip addr:housenumber from Overpass (untrusted OSM tag data)
+    down to the DOM/store-safe charset. NOT a char filter — a string that
+    contains so much as one disallowed character (e.g. an HTML injection
+    attempt) is dropped to "" whole, same as an unlabelled house. That's the
+    common case anyway (see the owner's own house, which has no
+    addr:housenumber at all) and unlabelled hotspots are first-class."""
+    if not isinstance(raw, str):
+        return ""
+    raw = raw.strip()
+    return raw if re.fullmatch(r"[A-Za-z0-9 /-]{1,12}", raw) else ""
+
+def _point_in_ring(lat, lon, ring_latlon):
+    """Ray-casting point-in-polygon over a lat/lon ring. Good enough at
+    building-footprint scale (tens of metres) without a projection."""
+    n = len(ring_latlon)
+    if n < 3:
+        return False
+    inside = False
+    x, y = lon, lat
+    x1, y1 = ring_latlon[-1][1], ring_latlon[-1][0]
+    for plat, plon in ring_latlon:
+        x2, y2 = plon, plat
+        if (y1 > y) != (y2 > y):
+            x_at_y = (x2 - x1) * (y - y1) / ((y2 - y1) or 1e-12) + x1
+            if x < x_at_y:
+                inside = not inside
+        x1, y1 = x2, y2
+    return inside
+
+def _build_parcel_frame(lat, lon, span_m):
+    """The Web Mercator bbox + pixel transform for a parcels image centred on
+    (lat, lon): span_m is the total ground WIDTH in metres; height is derived
+    from the image aspect so the bbox and the 640x400 crop always agree
+    exactly — no ArcGIS aspect fudge to invert."""
+    x0, y0 = _merc_xy(lat, lon)
+    half_w = span_m / 2.0
+    half_h = half_w * _PARCEL_IMG_H / _PARCEL_IMG_W
+    xmin, xmax = x0 - half_w, x0 + half_w
+    ymin, ymax = y0 - half_h, y0 + half_h
+    s, w = _merc_lonlat(xmin, ymin)
+    n, e = _merc_lonlat(xmax, ymax)
+    return {"xmin": xmin, "xmax": xmax, "ymin": ymin, "ymax": ymax,
+            "imgW": _PARCEL_IMG_W, "imgH": _PARCEL_IMG_H,
+            "s": s, "w": w, "n": n, "e": e,
+            "centerLat": lat, "centerLon": lon}
+
+def _project_px(lat, lon, frame):
+    """lat/lon -> pixel [x, y] within frame's 640x400 crop, clamped to the
+    image bounds (an OSM way can extend past the query bbox even though its
+    footprint intersects it)."""
+    x, y = _merc_xy(lat, lon)
+    xmin, xmax, ymin, ymax = frame["xmin"], frame["xmax"], frame["ymin"], frame["ymax"]
+    px = (x - xmin) / (xmax - xmin) * frame["imgW"] if xmax != xmin else frame["imgW"] / 2.0
+    py = (ymax - y) / (ymax - ymin) * frame["imgH"] if ymax != ymin else frame["imgH"] / 2.0
+    px = max(0.0, min(float(frame["imgW"]), px))
+    py = max(0.0, min(float(frame["imgH"]), py))
+    return [round(px, 1), round(py, 1)]
+
+def _frame_px_to_lonlat(px, py, frame):
+    """Inverse of _project_px, expressed using ONLY the frame's lat/lon corners
+    (s/w/n/e) and its pixel size — the same inputs GET /api/parcels actually
+    hands the client (the raw Web Mercator metres xmin/xmax/ymin/ymax never
+    leave the server). This is the reference implementation for the "which
+    house is mine" free-tap fallback ('none of these — tap your house'): the
+    client-side pxToLonLat() in app.js is a literal port of the same four
+    lines, and test_pin_roundtrip in tools/test-geo.py proves this function
+    round-trips against _project_px (the function that actually produced the
+    buildings' pixel coordinates the user is tapping near) — so a change to
+    either side that breaks the pairing fails loudly instead of silently
+    drifting the pin a few metres off target."""
+    def merc_y(lat):
+        return math.log(math.tan(math.pi / 4 + math.radians(lat) / 2))
+    def merc_y_inv(y):
+        return math.degrees(2 * math.atan(math.exp(y)) - math.pi / 2)
+    lon = frame["w"] + (px / frame["imgW"]) * (frame["e"] - frame["w"])
+    y = merc_y(frame["n"]) + (py / frame["imgH"]) * (merc_y(frame["s"]) - merc_y(frame["n"]))
+    return merc_y_inv(y), lon
+
+def _parse_overpass_ways(elements):
+    """Defensive parser: raw Overpass 'elements' JSON (UNTRUSTED — a public,
+    unauthenticated API) -> raw lat/lon ring dicts, unsorted and unprojected.
+    Deliberately centre/frame-independent so the result is safe to TTL-cache
+    and reuse across requests whose query centre has since moved a few
+    metres (see overpass_buildings) — the centre-dependent sort/truncate/
+    geocodedHere/projection step lives in _project_overpass_buildings below,
+    and must run fresh per request. Never raises: a single bad way, vertex,
+    or tag degrades gracefully rather than taking the whole response down
+    with it."""
+    parsed = []
+    for el in (elements or []):
+        if not isinstance(el, dict) or el.get("type") != "way":
+            continue
+        geom = el.get("geometry")
+        if not isinstance(geom, list) or len(geom) < 3:
+            continue
+        ring_latlon = []
+        for pt in geom[:400]:   # cap BEFORE coercion — a 10k-point ring must never be walked in full
+            if not isinstance(pt, dict):
+                continue
+            plat = _finite_coord(pt.get("lat"), -90.0, 90.0)
+            plon = _finite_coord(pt.get("lon"), -180.0, 180.0)
+            if plat is None or plon is None:
+                continue
+            ring_latlon.append((plat, plon))
+        if len(ring_latlon) < 3:   # every vertex was garbage (or too few survived) — drop the way, don't crash
+            continue
+        tags = el.get("tags") if isinstance(el.get("tags"), dict) else {}
+        clat = sum(p[0] for p in ring_latlon) / len(ring_latlon)
+        clon = sum(p[1] for p in ring_latlon) / len(ring_latlon)
+        parsed.append({"ring_latlon": ring_latlon, "lat": clat, "lon": clon,
+                        "label": _clean_housenumber(tags.get("addr:housenumber"))})
+    return parsed
+
+def _project_overpass_buildings(parsed, center_lat, center_lon, frame):
+    """Raw lat/lon ring dicts (from _parse_overpass_ways, possibly cached from
+    an earlier, nearby query) -> up to 40 building dicts, nearest-centroid-
+    first to THIS request's actual (center_lat, center_lon), each projected
+    into THIS request's actual frame. Run fresh every request — never cached
+    itself — so a cache hit on stale/nearby raw geometry still yields correct
+    ordering, centroids, and geocodedHere for the real query centre."""
+    parsed = sorted(parsed, key=lambda b: (b["lat"] - center_lat) ** 2 + (b["lon"] - center_lon) ** 2)
+    parsed = parsed[:40]
+
+    # geocodedHere: the one building the ORIGINAL geocode point actually falls
+    # inside (or, if it falls in none of them, the nearest — already index 0
+    # post-sort) — the "likely" match a confirm-step UI can pre-highlight
+    # while still letting the user tap a different footprint.
+    contains_idx = next((j for j, b in enumerate(parsed) if _point_in_ring(center_lat, center_lon, b["ring_latlon"])), None)
+    if contains_idx is None and parsed:
+        contains_idx = 0
+
+    buildings = []
+    for j, b in enumerate(parsed):
+        ring_px = [_project_px(plat, plon, frame) for plat, plon in b["ring_latlon"]]
+        buildings.append({
+            "i": j, "label": b["label"], "ring": ring_px,
+            "centroid": [round(sum(p[0] for p in ring_px) / len(ring_px), 1),
+                         round(sum(p[1] for p in ring_px) / len(ring_px), 1)],
+            "lat": b["lat"], "lon": b["lon"], "geocodedHere": (j == contains_idx),
+        })
+    return buildings
+
+def _parse_overpass_buildings(elements, center_lat, center_lon, frame):
+    """Convenience wrapper (also exercised directly by tools/test-geo.py) —
+    parse then project in one call. overpass_buildings() below calls the two
+    halves separately so it can cache only the centre-independent half."""
+    return _project_overpass_buildings(_parse_overpass_ways(elements), center_lat, center_lon, frame)
+
+# Overridable via KASA_OVERPASS_URL (a self-hosted Overpass mirror, or a local
+# fixture server in tests) — never anything a request can influence.
+_OVERPASS_URL = os.environ.get("KASA_OVERPASS_URL") or "https://overpass-api.de/api/interpreter"
+_OVERPASS_CACHE = {}          # (rounded s,w,n,e) -> {t, parsed}  — RAW lat/lon ways, not projected pixels
+_OVERPASS_CACHE_TTL = 600     # 10 min — footprints don't change; stops a re-render or a second device hammering Overpass
+_OVERPASS_MAX_BYTES = 2_000_000   # hard cap on an untrusted, otherwise-unbounded response
+
+def overpass_buildings(frame):
+    """Building footprints (OSM, via the free keyless Overpass API) within
+    frame's lat/lon bbox, projected to this frame's pixel rings. Never
+    raises: any timeout/HTTP-error/malformed body degrades to [] so
+    parcels_for() can fall back to source:'none' (a tap-a-pin UI) rather
+    than a dead end.
+
+    TTL-cached per rounded bbox so a re-render or a second device (phone +
+    wall tablet on the same home) can't hammer a public, rate-limited API —
+    but the cache holds only the RAW parsed lat/lon ways. The centre used for
+    sorting/truncating/geocodedHere and the frame used for projecting to
+    pixels are always this call's real ones, never a stale cache entry's:
+    two query centres a few metres apart round to the same cache bucket
+    (~11m lat / ~9m lon), and replaying a previous centre's already-projected
+    pixels for a new centre silently mis-highlights the footprint."""
+    cache_key = (round(frame["s"], 4), round(frame["w"], 4), round(frame["n"], 4), round(frame["e"], 4))
+    now = time.time()
+    cached = _OVERPASS_CACHE.get(cache_key)
+    if cached and now - cached["t"] < _OVERPASS_CACHE_TTL:
+        parsed = cached["parsed"]
+    else:
+        query = (f'[out:json][timeout:15];way["building"]({frame["s"]:.6f},{frame["w"]:.6f},'
+                 f'{frame["n"]:.6f},{frame["e"]:.6f});out geom;')
+        try:
+            url = _OVERPASS_URL + "?" + urllib.parse.urlencode({"data": query})
+            raw = _http_get(url, timeout=15, max_bytes=_OVERPASS_MAX_BYTES)
+            doc = json.loads(raw)
+            elements = doc.get("elements") if isinstance(doc, dict) else None
+            parsed = _parse_overpass_ways(elements)
+        except Exception as e:
+            print(f"[parcels] overpass failed: {e}")   # never the raw body — may be arbitrary upstream text
+            parsed = []
+        if len(_OVERPASS_CACHE) > 200:   # tiny bound, same idea as _BRAND_CACHE
+            _OVERPASS_CACHE.clear()
+        _OVERPASS_CACHE[cache_key] = {"t": now, "parsed": parsed}
+    return _project_overpass_buildings(parsed, frame["centerLat"], frame["centerLon"], frame)
+
+# Esri World Imagery's export refuses to rasterise finer than ~0.15 m/px (verified
+# live: at the fixed 640x400 image size, a 90m-wide bbox — 0.14 m/px, our old
+# 'medium'/default span — 500s with "Error: bytes"; 96m/0.15 m/px is the first span
+# that succeeds). Stay safely clear of that boundary rather than hug it.
+_PARCEL_MIN_MPP = 0.16   # metres per pixel floor for the RASTER we fetch from Esri
+
+def _parcel_fetch_size(span_m):
+    """The pixel size to actually request from Esri for a given span_m: capped so
+    metres/pixel never dips below Esri's real minimum. The bbox (and therefore every
+    ring/centroid pixel a frontend overlays) stays fixed at the 640x400 coordinate
+    space _build_parcel_frame always computes — only the fetched raster shrinks, so a
+    close-in crop reads as a softer, upscaled image rather than a 500. Width is kept a
+    multiple of 8 so it divides the 640:400 (8:5) aspect ratio exactly."""
+    max_w = int(span_m / _PARCEL_MIN_MPP)
+    w = min(_PARCEL_IMG_W, max(8, (max_w // 8) * 8))
+    h = w * _PARCEL_IMG_H // _PARCEL_IMG_W
+    return w, h
+
+def _parcel_image_url(frame, span_m):
+    bbox = f'{frame["xmin"]:.2f},{frame["ymin"]:.2f},{frame["xmax"]:.2f},{frame["ymax"]:.2f}'
+    w, h = _parcel_fetch_size(span_m)
+    return (f"{ESRI_EXPORT_BASE}?bbox={bbox}&bboxSR=3857&imageSR=3857"
+            f"&size={w},{h}&format=jpg&f=image")
+
+def parcels_for(lat, lon, span_m):
+    """Core of GET /api/parcels. lat/lon/span_m are assumed already validated
+    by the caller — span_m is still clamped here too so a direct caller
+    (a test, a future job) can't skip the bound. Always 200-shaped: an
+    Overpass failure surfaces as buildings:[] source:'none', never a 500."""
+    span_m = max(_PARCEL_SPAN_MIN, min(_PARCEL_SPAN_MAX, float(span_m)))
+    frame = _build_parcel_frame(lat, lon, span_m)
+    buildings = overpass_buildings(frame)
+    return {
+        "center": {"lat": lat, "lon": lon},
+        "frame": {"s": frame["s"], "w": frame["w"], "n": frame["n"], "e": frame["e"]},
+        "size": [frame["imgW"], frame["imgH"]],
+        "imageUrl": _parcel_image_url(frame, span_m),
+        "spanM": span_m,
+        "buildings": buildings,
+        "source": "osm" if buildings else "none",
+    }
 
 # ---- home logbook export: a branded PDF (assets + service history + spend) ----
 # Pure-stdlib via pdfkit.py — same brand-tokens-and-hand-built-drawing-helpers idea
@@ -3346,6 +4037,85 @@ def build_logbook_pdf(state, home_id):
 # it with a (None, None) return — which is truthy — making gmail_available() report
 # email as configured when it wasn't. Keep a single definition.
 
+# Gmail's INBOX is only a label — archiving a message removes it, so a scan that
+# only ever SELECTs INBOX never sees archived receipts/quotes/invoices (this is
+# exactly what made a real scan return "scanned": 0 against a 51-message mailbox
+# that had only 4 messages still labelled Inbox). All Mail carries everything.
+_IMAP_LIST_LINE = _re.compile(r'^\((?P<flags>[^)]*)\)\s+"(?P<delim>(?:[^"\\]|\\.)*)"\s+(?P<name>.+)$')
+# The mailbox name comes off the wire from the IMAP server — conservative charset
+# so a hostile/misbehaving server can never smuggle a quote, backslash or CR/LF
+# into a later `SELECT "<name>"` (that would be raw IMAP command injection).
+# \Z (not $) — Python's $ also matches just before a trailing \n, which would let
+# a name like "Junk\n" pass and put a bare LF straight into `m.select(...)`.
+_IMAP_MAILBOX_SAFE = _re.compile(r'^[^"\\\r\n]+\Z')
+
+def _imap_quote_mailbox(name):
+    """Wrap an IMAP mailbox name for SELECT, or None if it isn't safe to quote."""
+    if not name or not _IMAP_MAILBOX_SAFE.match(name):
+        return None
+    return '"%s"' % name
+
+def _gmail_normalize_addr(addr):
+    """Gmail treats dots and +tags in the local part of a gmail.com/googlemail.com
+    address as the same mailbox — normalize both sides before comparing so a
+    dotted variant or a 'send mail as' +tag of our own address still matches the
+    own-mail filter instead of leaking through as a "supplier"."""
+    addr = (addr or "").strip().lower()
+    if "@" not in addr:
+        return addr
+    local, _, domain = addr.partition("@")
+    if domain in ("gmail.com", "googlemail.com"):
+        local = local.split("+", 1)[0].replace(".", "")
+    return f"{local}@{domain}"
+
+def _imap_quote(s):
+    """Wrap our own constant search text as an IMAP quoted string (backslash/quote
+    escaped). Unlike _imap_quote_mailbox this never rejects — it's for literals we
+    wrote ourselves (e.g. an X-GM-RAW query), not untrusted server-supplied names."""
+    return '"%s"' % s.replace('\\', '\\\\').replace('"', '\\"')
+
+def _gmail_all_mail(m):
+    """Discover the (possibly localised) name of Gmail's All Mail folder from the
+    already-open connection's LIST response, quoted ready for SELECT. Prefers the
+    RFC 6154 \\All special-use flag — Gmail advertises it on every locale, so this
+    works for "[Gmail]/All Mail", a German "[Gmail]/Alle Nachrichten" account, or a
+    "[Google Mail]/All Mail" account alike. Falls back to a literal name match, then
+    to "INBOX" if no all-mail folder is found or its name doesn't pass the safety
+    check above — never dies, never guesses a hardcoded folder name."""
+    try:
+        typ, data = m.list()
+    except Exception:
+        return "INBOX"
+    if typ != "OK" or not data:
+        return "INBOX"
+    flagged, named = None, None
+    for line in data:
+        if not line:
+            continue
+        if not isinstance(line, (bytes, str)):
+            continue  # imaplib returns a tuple for a LIST line sent as a literal
+        if isinstance(line, bytes):
+            try:
+                line = line.decode("utf-8", "replace")
+            except Exception:
+                continue
+        lm = _IMAP_LIST_LINE.match(line.strip())
+        if not lm:
+            continue
+        raw_name = lm.group("name").strip()
+        if raw_name.startswith('"') and raw_name.endswith('"') and len(raw_name) >= 2:
+            raw_name = raw_name[1:-1].replace('\\"', '"').replace('\\\\', '\\')
+        flags = (lm.group("flags") or "").split()
+        if r"\All" in flags:
+            flagged = raw_name
+            break  # authoritative — RFC 6154 special-use, stop looking
+        if named is None and raw_name in ("[Gmail]/All Mail", "[Google Mail]/All Mail"):
+            named = raw_name
+    chosen = flagged or named
+    if not chosen:
+        return "INBOX"
+    return _imap_quote_mailbox(chosen) or "INBOX"
+
 def gmail_status():
     creds = _gmail_creds()
     if not creds:
@@ -3355,9 +4125,10 @@ def gmail_status():
         import imaplib
         m = imaplib.IMAP4_SSL("imap.gmail.com", 993, ssl_context=_tls_ctx(), timeout=30)
         m.login(a, p)
-        m.select("INBOX", readonly=True)
+        mailbox = _gmail_all_mail(m)
+        m.select(mailbox, readonly=True)
         m.logout()
-        return {"configured": True, "address": a, "ok": True}
+        return {"configured": True, "address": a, "ok": True, "mailbox": mailbox.strip('"')}
     except Exception as e:
         return {"configured": True, "address": a, "ok": False, "error": str(e)[:200]}
 
@@ -3376,57 +4147,305 @@ GMAIL_EXTRACT_SYSTEM = (
     "Only real businesses actually present in the emails; merge duplicates; never invent."
 )
 
-def gmail_scan():
-    """Read-only sweep -> {suppliers, inferredAssets, scanned}. Runs as an async job."""
-    import imaplib, email
+# Every search term is a fixed, code-owned constant — never user/model text — since
+# imaplib validates nothing an interpolated term would be raw IMAP command injection.
+# Gmail search-operator syntax (from:/subject:), not IMAP FROM/SUBJECT — each term
+# is folded into an X-GM-RAW query in gmail_collect_rows so the corpus can be scoped
+# to "in:anywhere -in:sent -in:chats -in:spam -in:trash -in:drafts" (All Mail includes
+# Sent/Drafts/Chats, which the Settings consent copy promises stays out of the scan).
+#
+# TWO FAMILIES, and the second is why this list grew. The trade terms below find
+# a tradesperson's PAPERWORK — the vocabulary of someone who invoices for a living.
+# They cannot find a thing the household simply BOUGHT. Measured against the real
+# mailbox: the six trade terms match 15 messages between them and the owner's spa
+# is in none of them, because its thread is subject "Spa Whitehaven" and its
+# receipts are "Your Splashes Spa World receipt [#1660-6268]" — no invoice, no
+# quote, no booking anywhere in them. Fixing the folder (INBOX -> All Mail) took
+# the scan from 0 messages examined to 15 and still missed it. The retail and
+# asset terms are what actually reach it: 'spa' 4 hits, 'receipt' 15, 'order' 19,
+# 'purchase' 14, 'delivery' 6 — each of which contains the spa thread.
+GMAIL_SCAN_QUERIES = [
+    # Trade paperwork — a business that invoices.
+    ("servicem8", "from:servicem8.com"),
+    ("tradify", "from:tradify"),
+    ("tax invoice", 'subject:"tax invoice"'),
+    ("quote", "subject:quote"),
+    ("invoice", "subject:invoice"),
+    ("booking", "subject:booking"),
+    # Asset words — the durable things a home maintains, named directly. These are
+    # what let the scan answer "what does this house HAVE", not merely "who has
+    # billed it", and they are what reaches a thing the household simply BOUGHT:
+    # 'spa' finds the owner's spa thread that all six trade terms miss.
+    #
+    # DELIBERATELY NOT HERE (owner's call, 2026-08-03): the generic retail
+    # vocabulary — order, order confirmation, receipt, purchase, delivery,
+    # warranty, installation, service report. Each has better recall (receipt 15
+    # hits, order 19, purchase 14 on the real mailbox, all containing the spa),
+    # but every matched message is UPLOADED to Claude for extraction, and against
+    # a real personal inbox those terms sweep up a large amount of unrelated
+    # shopping. Asset words keep the scan pointed at the house. If recall ever
+    # needs to improve, widen here — and say so in the import screen first.
+    #
+    # Multi-word terms ride _imap_quote, which is what makes them legal IMAP at
+    # all: the pre-fix single-quote wrap made a phrase a hard BAD Could not parse
+    # command, so a multi-word term failed silently at runtime.
+    ("spa", "spa"),
+    ("sauna", "sauna"),
+    ("pool", "pool"),
+    ("heat pump", '"heat pump"'),
+    ("solar", "solar"),
+    ("irrigation", "irrigation"),
+    ("alarm", "alarm"),
+    ("camera", "camera"),
+]
+GMAIL_SCAN_SINCE_DAYS = 3 * 365         # a receipt is worth finding years later
+GMAIL_SCAN_PER_QUERY = 300              # newest uids considered from any one query
+GMAIL_SCAN_MAX_MESSAGES = 300           # global ceiling on messages fetched in one scan
+
+# A receipt routinely arrives as a forwarded bundle — a message/rfc822 attachment,
+# sometimes nested inside another one (a forward of a forward). The whole owner's
+# spa-supplier history (Splashes Spa World, a 2022 cover replacement, chemical
+# orders 2023-2025) sat invisible for exactly this reason: part.get_payload(decode=
+# True) is empty for a message/rfc822 part itself — it isn't text, the content is
+# one level down at get_payload()[0], a Message. Both constants below bound EVERY
+# recursive step in _gmail_first_text/_gmail_unwrap_nested (not just the ones that
+# find a hit) so a pathological or hostile deeply-/broadly-nested message can never
+# blow Python's recursion limit or balloon the scan's cost.
+GMAIL_SCAN_NESTED_MAX_DEPTH = 12        # total MIME-tree recursion depth, every step counted
+GMAIL_SCAN_NESTED_MAX_PARTS = 20        # total nested message/rfc822 sub-messages unwrapped, per email
+
+def _gmail_decode_header(msg, name):
+    """Decode one RFC 2047-encoded header (From/Date/Subject) to plain text — shared
+    by the top-level message and any nested message/rfc822 sub-message."""
     from email.header import decode_header
-    creds = _gmail_creds()
-    if not creds:
-        return {"error": "Gmail isn't configured — add the address and app password in the add-on options.", "suppliers": [], "inferredAssets": []}
-    a, p = creds
-    m = imaplib.IMAP4_SSL("imap.gmail.com", 993, ssl_context=_tls_ctx(), timeout=30)
-    m.login(a, p)
-    m.select("INBOX", readonly=True)               # READ-ONLY — we never modify the mailbox
-    since = (__import__("datetime").date.today() - __import__("datetime").timedelta(days=3 * 365)).strftime("%d-%b-%Y")
-    queries = ['FROM "servicem8.com"', 'FROM "tradify"', 'SUBJECT "tax invoice"',
-               'SUBJECT "quote"', 'SUBJECT "invoice"', 'SUBJECT "booking"']
-    uids = []
-    for q in queries:
+    raw = msg.get(name, "")
+    try:
+        return " ".join(t.decode(enc or "utf-8", "replace") if isinstance(t, bytes) else t
+                        for t, enc in decode_header(raw))
+    except Exception:
+        return str(raw)
+
+def _gmail_first_text(msg, depth=0):
+    """First text/plain body directly within `msg`'s own MIME tree (multipart/*
+    containers only) — does NOT descend into a nested message/rfc822 attachment,
+    that's unwrapped separately by _gmail_unwrap_nested with its own explicit
+    bound. Bounded to GMAIL_SCAN_NESTED_MAX_DEPTH levels itself (msg.walk() — the
+    prior implementation — recurses with no limit at all, so a pathological or
+    hostile multipart structure must never blow the recursion limit). A part whose
+    get_payload(decode=True) comes back None — true of every message/rfc822
+    container part, since it isn't text, and of some malformed parts — is treated
+    as empty, never raised."""
+    if msg.get_content_type() == "text/plain":
         try:
-            ok, data = m.uid("search", None, f'(SINCE {since} {q})')
-            if ok == "OK" and data and data[0]:
-                uids += data[0].split()
+            raw = msg.get_payload(decode=True)
+            return raw.decode(msg.get_content_charset() or "utf-8", "replace") if raw is not None else ""
         except Exception:
+            return ""
+    if depth >= GMAIL_SCAN_NESTED_MAX_DEPTH or not msg.is_multipart():
+        return ""
+    for sub in msg.get_payload():
+        if not isinstance(sub, emaillib.message.Message) or sub.get_content_type() == "message/rfc822":
             continue
-    uids = sorted(set(uids), key=lambda u: int(u))[-300:]   # newest 300, deduped
-    def hdr(msg, name):
-        raw = msg.get(name, "")
+        text = _gmail_first_text(sub, depth + 1)
+        if text:
+            return text
+    return ""
+
+def _gmail_unwrap_nested(msg, depth=0, counter=None):
+    """Find message/rfc822 attachments in `msg` — a forwarded bundle, possibly
+    nested inside another one — and return [(from, date, subject, body), ...],
+    innermost included, for every nested sub-message actually unwrapped. The
+    nested From/Date matter as much as the nested body: a bare forward's own
+    headers only ever name the forwarder and the forward date, so without these
+    a job the extractor pulls from a decade-old forwarded receipt gets dated and
+    attributed to whoever forwarded it, not the original supplier/date.
+
+    Bounded by GMAIL_SCAN_NESTED_MAX_DEPTH (every recursive step, whether it's a
+    plain multipart wrapper or an rfc822 unwrap, counts toward this) and
+    GMAIL_SCAN_NESTED_MAX_PARTS (total sub-messages unwrapped, shared tree-wide via
+    `counter`) so a pathological or hostile deeply-/broadly-nested message can
+    never blow the recursion limit or balloon the scan's cost. Both bounds are
+    applied silently — a part past either limit is just skipped, matching this
+    extractor's best-effort, never-raise style."""
+    if counter is None:
+        counter = {"n": 0}
+    out = []
+    if depth >= GMAIL_SCAN_NESTED_MAX_DEPTH or counter["n"] >= GMAIL_SCAN_NESTED_MAX_PARTS or not msg.is_multipart():
+        return out
+    for sub in msg.get_payload():
+        if not isinstance(sub, emaillib.message.Message):
+            continue
+        if sub.get_content_type() == "message/rfc822":
+            if counter["n"] >= GMAIL_SCAN_NESTED_MAX_PARTS:
+                break
+            nested_list = sub.get_payload()
+            if not (isinstance(nested_list, list) and nested_list
+                    and isinstance(nested_list[0], emaillib.message.Message)):
+                continue
+            nested = nested_list[0]
+            counter["n"] += 1
+            out.append((_gmail_decode_header(nested, "From"), _gmail_decode_header(nested, "Date"),
+                        _gmail_decode_header(nested, "Subject"), _gmail_first_text(nested)))
+            out.extend(_gmail_unwrap_nested(nested, depth + 1, counter))
+        else:
+            out.extend(_gmail_unwrap_nested(sub, depth + 1, counter))
+    return out
+
+def gmail_collect_rows(m, mailbox):
+    """IMAP-facing half of a scan: run every GMAIL_SCAN_QUERIES search against an
+    already-connected, already-selected (readonly) mailbox `m`/`mailbox`, and return
+    {rows, mailbox, queries, capped, dropped}. Never mutates the mailbox — SEARCH and
+    BODY.PEEK FETCH only. This is the seam tests drive: `m` just needs .uid("search",
+    ...) / .uid("fetch", ...) like imaplib.IMAP4_SSL.
+
+    Each query is capped to its newest GMAIL_SCAN_PER_QUERY uids, deduped against
+    queries already seen, then the results are filled into the GMAIL_SCAN_MAX_MESSAGES
+    global ceiling round-robin across queries — so one high-volume term (e.g. every
+    "invoice" subject) cannot crowd out a single hit from a quiet one."""
+    import email
+    from email.utils import parseaddr
+    since = (__import__("datetime").date.today()
+             - __import__("datetime").timedelta(days=GMAIL_SCAN_SINCE_DAYS)).strftime("%d-%b-%Y")
+    own_addr = _gmail_normalize_addr((_gmail_creds() or ("", ""))[0])
+
+    report = []
+    per_query = {}   # label -> newest-first uid list, capped to GMAIL_SCAN_PER_QUERY
+    per_query_truncated = {}   # label -> hits already lost to that per-query cap
+    for label, q in GMAIL_SCAN_QUERIES:
+        entry = {"label": label, "hits": 0, "used": 0}
         try:
-            return " ".join(t.decode(enc or "utf-8", "replace") if isinstance(t, bytes) else t
-                            for t, enc in decode_header(raw))
-        except Exception:
-            return str(raw)
-    rows = []
-    for u in uids:
+            raw = f'in:anywhere -in:sent -in:chats -in:spam -in:trash -in:drafts {q}'
+            ok, data = m.uid("search", None, f'(SINCE {since} X-GM-RAW {_imap_quote(raw)})')
+            if ok != "OK":
+                entry["error"] = "search failed"
+                report.append(entry)
+                continue
+            uids = data[0].split() if data and data[0] else []
+            entry["hits"] = len(uids)
+            uniq = sorted(set(uids), key=lambda u: int(u), reverse=True)
+            newest_first = uniq[:GMAIL_SCAN_PER_QUERY]
+            per_query[label] = newest_first
+            truncated = max(len(uniq) - GMAIL_SCAN_PER_QUERY, 0)
+            per_query_truncated[label] = truncated
+            entry["truncated"] = truncated
+        except Exception as e:
+            entry["error"] = type(e).__name__
+        report.append(entry)
+
+    # Dedupe across queries (a message can match more than one term), then round-robin
+    # fill the global ceiling so a quiet query's single hit is claimed before a noisy
+    # query gets to spend its whole budget.
+    seen, dedup = set(), {}
+    for label, uids in per_query.items():
+        fresh = [u for u in uids if u not in seen]
+        seen.update(fresh)
+        dedup[label] = fresh
+    cursors = {label: list(uids) for label, uids in dedup.items()}  # newest-first already
+    selected = []
+    while len(selected) < GMAIL_SCAN_MAX_MESSAGES and any(cursors.values()):
+        for label in cursors:
+            if len(selected) >= GMAIL_SCAN_MAX_MESSAGES:
+                break
+            if cursors[label]:
+                selected.append(cursors[label].pop(0))
+    selected_set = set(selected)
+    for entry in report:
+        entry["used"] = sum(1 for u in dedup.get(entry["label"], ()) if u in selected_set)
+
+    total_dedup = sum(len(v) for v in dedup.values())
+    total_truncated = sum(per_query_truncated.values())
+    dropped = max(total_dedup - len(selected), 0) + total_truncated
+    capped = dropped > 0
+
+    def hdr(msg, name):
+        return _gmail_decode_header(msg, name)
+
+    rows, own_skipped = [], 0
+    for u in sorted(selected, key=lambda u: int(u)):
         try:
             ok, data = m.uid("fetch", u, "(BODY.PEEK[])")
             if ok != "OK" or not data or not data[0]:
                 continue
             msg = email.message_from_bytes(data[0][1])
-            body = ""
-            for part in msg.walk():
-                if part.get_content_type() == "text/plain":
-                    try:
-                        body = part.get_payload(decode=True).decode(part.get_content_charset() or "utf-8", "replace")
-                        break
-                    except Exception:
-                        pass
-            rows.append(f"FROM: {hdr(msg,'From')}\nDATE: {hdr(msg,'Date')}\nSUBJECT: {hdr(msg,'Subject')}\nBODY: {' '.join(body.split())[:700]}")
+            frm = hdr(msg, "From")
+            frm_addr = (parseaddr(frm)[1] or "").strip()
+            # All Mail includes Sent/Drafts — our own outbound enquiries must not
+            # read back as a "supplier". A blank/missing From can't be a real
+            # supplier lead either way, so treat it the same as our own mail rather
+            # than let it through unfiltered. Compare normalized addresses since
+            # Gmail folds dots/+tags in the local part into the same mailbox.
+            if not frm_addr or (own_addr and _gmail_normalize_addr(frm_addr) == own_addr):
+                own_skipped += 1
+                continue
+            body = _gmail_first_text(msg)
+            # A receipt routinely arrives as a forwarded message/rfc822 attachment
+            # (possibly nested) — unwrap it, bounded, and fold its From/Date/Subject/
+            # body in too, so a spa bought once a decade ("Fwd: your order") isn't
+            # invisible or misattributed just because the wrapper mail itself carries
+            # no body text of its own and its own headers only ever name the forwarder
+            # and the forward date. Nested content goes at the FRONT of body, ahead of
+            # the wrapper's own text: a forwarded bundle's covering note + quoted chain
+            # routinely blows the 700-char cap below on its own, and it's the nested
+            # content this exists to recover — not the wrapper's boilerplate.
+            nested_fold = ""
+            for nfrom, ndate, nsubject, nbody in _gmail_unwrap_nested(msg):
+                nested_fold += f" FWD FROM: {nfrom} FWD DATE: {ndate} FWD SUBJECT: {nsubject} FWD BODY: {nbody}"
+            body = nested_fold + " " + body
+            rows.append(f"FROM: {frm}\nDATE: {hdr(msg,'Date')}\nSUBJECT: {hdr(msg,'Subject')}\nBODY: {' '.join(body.split())[:700]}")
         except Exception:
             continue
-    m.logout()
+
+    print(f"[gmail] scan: {mailbox} -> {len(selected)} uids, {len(rows)} rows, "
+          f"{own_skipped} own-mail skipped, capped={capped} dropped={dropped}")
+    return {"rows": rows, "mailbox": mailbox, "queries": report, "capped": capped, "dropped": dropped}
+
+def _bound_bool(v, default):
+    """Coerce an arbitrary JSON payload value to a real bool, never raising and never
+    passing the raw value through unchanged. Used for /api/gmail/scan's dryRun flag —
+    whatever a client sends (missing, a JSON bool, a string, a number, a list...) must
+    collapse to True/False before it reaches gmail_scan."""
+    if isinstance(v, bool):
+        return v
+    if v is None:
+        return default
+    if isinstance(v, str):
+        return v.strip().lower() not in ("false", "0", "no", "")
+    try:
+        return bool(v)
+    except Exception:
+        return default
+
+def gmail_scan(dry_run=False):
+    """Read-only sweep -> {suppliers, inferredAssets, scanned, mailbox, windowDays, queries,
+    capped, dropped, dryRun}. Runs as an async job.
+
+    dry_run is purely a label carried through onto the result (dryRun) — the sweep itself
+    is IDENTICAL either way: IMAP is opened readonly and only ever SEARCH/BODY.PEEK
+    FETCH'd (never STORE/EXPUNGE), and this function never calls state_mutate/state_write
+    in either mode. The real import is a deliberate, separate client-side write the owner
+    triggers after reviewing a dry-run's candidate suppliers/assets."""
+    import imaplib
+    dry_run = bool(dry_run)
+    creds = _gmail_creds()
+    if not creds:
+        return {"error": "Gmail isn't configured — add the address and app password in the add-on options.",
+                "suppliers": [], "inferredAssets": [], "dryRun": dry_run}
+    a, p = creds
+    m = imaplib.IMAP4_SSL("imap.gmail.com", 993, ssl_context=_tls_ctx(), timeout=30)
+    m.login(a, p)
+    mailbox_quoted = _gmail_all_mail(m)               # discovered All Mail, or INBOX if absent
+    m.select(mailbox_quoted, readonly=True)           # READ-ONLY — we never modify the mailbox
+    mailbox = mailbox_quoted.strip('"')               # unquoted, for the returned report only
+    try:
+        collected = gmail_collect_rows(m, mailbox)
+    finally:
+        m.logout()
+    rows = collected["rows"]
+    meta = {"mailbox": collected["mailbox"], "windowDays": GMAIL_SCAN_SINCE_DAYS,
+            "queries": collected["queries"], "capped": collected["capped"],
+            "dropped": collected["dropped"], "dryRun": dry_run}
     if not rows:
-        return {"suppliers": [], "inferredAssets": [], "scanned": 0}
+        return {"suppliers": [], "inferredAssets": [], "scanned": 0, **meta}
     # batch through Claude (~40 emails per call), merge by supplier name
     suppliers, assets = {}, {}
     for i in range(0, len(rows), 40):
@@ -3445,7 +4464,7 @@ def gmail_scan():
                 if k: assets.setdefault(k, x)
         except Exception as e:
             print(f"[gmail] extract batch failed: {e}")
-    return {"suppliers": list(suppliers.values()), "inferredAssets": list(assets.values()), "scanned": len(rows)}
+    return {"suppliers": list(suppliers.values()), "inferredAssets": list(assets.values()), "scanned": len(rows), **meta}
 
 
 # =============================================================================
@@ -3482,6 +4501,65 @@ def _match(items, name, field="name"):
         return exact[0]
     part = [x for x in items if n in (x.get(field) or "").lower()]
     return part[0] if len(part) == 1 else None
+
+# =============================================================================
+# "Completing a job" — the shared spec both this file's complete_task chat
+# tool and store.js's Store.markDone() implement (see docs/ARCHITECTURE.md
+# "Completing a job" for the prose version). DEFECT 2 (2026-07 verifier
+# round): complete_task used to be a SECOND, independent "mark done" writer
+# that got none of markDone()'s hardening — a bare log with no source/
+# settledOn, cost defaulting to the task's rough estimate even with a real
+# priced booking sitting pending, and no booking/quote settle at all. A
+# second completion (a retried chat call, or the UI's ✓ Done landing
+# afterward) couldn't find its own prior record and minted a sibling, double-
+# banking the cost while the booking and quote stayed open forever.
+#
+# JS and Python can't share code, so this file re-derives the SAME record
+# shape and settle rule by hand instead — the three functions below are a
+# byte-for-byte port of store.js's Store._doneLogId / Store.bookingSettles /
+# Store._doneToday. Keep them in sync if the JS side changes; both suites
+# (tools/test-store-js.py for the JS, tools/test-complete-task.py for this
+# file) assert on the record shape, not just "some log got written", so a
+# future drift fails loudly on whichever side moved.
+def _done_log_id(task_id, iso):
+    """Mirrors Store._doneLogId (store.js). Deterministic id for a "done" log:
+    the SAME (taskId, local-calendar date) always yields the SAME id, so a
+    second completion for the same task+day converges onto one row instead of
+    minting a sibling — whichever entry point (UI or this chat tool) writes it."""
+    return "ld_" + str(task_id) + "_" + str(iso)
+
+def _booking_settles(log, task, quotes):
+    """Mirrors Store.bookingSettles (store.js) EXACTLY — the HIGH-confidence-only
+    linkage a DESTRUCTIVE settle is allowed to act on: an explicit taskId on the
+    booking log, or (failing that) its quote's taskId. Deliberately does NOT
+    fall back to the heuristic note/title-overlap or sole-taskless-booking rules
+    Store.bookingCovers() offers for read-only dashboard suppression — handed to
+    a write path, those heuristics could settle an unrelated priced booking onto
+    whatever task's completion happened to run next, silently destroying its
+    real price with no undo. See bookingSettles()'s own comment in store.js."""
+    if not log or not task or log.get("assetId") != task.get("assetId"):
+        return False
+    if log.get("taskId"):
+        return log.get("taskId") == task.get("id")
+    qid = log.get("quoteId")
+    if qid:
+        q = next((x for x in quotes if x.get("id") == qid), None)
+        if q and q.get("taskId"):
+            return q.get("taskId") == task.get("id")
+    return False
+
+def _done_today(logs, task_id, iso):
+    """Mirrors Store._doneToday (store.js) — THE single answer to "has this
+    task already been marked done today, and with what record?", used by
+    complete_task below to decide "correct the price on the existing row" vs
+    "write a new one", exactly like markDone()'s own re-tap guard. Checks the
+    deterministic fresh-log id first, then the taskId+source:'done'+settledOn
+    match a settled BOOKING uses instead (a settled booking keeps its own
+    original id, not the deterministic one)."""
+    det_id = _done_log_id(task_id, iso)
+    return (next((l for l in logs if l.get("id") == det_id), None)
+            or next((l for l in logs
+                      if l.get("taskId") == task_id and l.get("source") == "done" and l.get("settledOn") == iso), None))
 
 def _usage_grounding_block(a, home_id=None):
     """Compact grounding block for one usage-tracked asset: config + (if reachable) the
@@ -3951,10 +5029,24 @@ def _apply_tool(tool: str, args: dict, confirm: bool = False) -> dict:
             if not t:
                 out = {"ok": False, "detail": f"no task matching {args.get('title')!r} on {a['name']}"}
                 return False
+            if tool == "complete_task":
+                # Validate the model's date/cost ONCE, before either previewing or
+                # executing — /api/chat/apply (confirm=True) calls straight into this
+                # branch with no preview step at all, so this is the only gate a
+                # hostile call against that endpoint ever passes through.
+                when = str(args.get("date") or today)   # the JOB's own date — this tool (unlike the UI) can backdate
+                if not _valid_done_date(when, today):
+                    out = {"ok": False, "detail": f"'{when}' isn't a valid completion date — use YYYY-MM-DD, and it can't be in the future"}
+                    return False
+                has_cost = args.get("cost") is not None
+                cost, cost_err = _chat_cost(args.get("cost"))
+                if cost_err:
+                    out = {"ok": False, "detail": cost_err}
+                    return False
             if tool in ("complete_task", "snooze_task") and not confirm:
                 if tool == "complete_task":
-                    when = str(args.get("date") or today)
-                    detail = f"log '{t['title']}' done {when}"
+                    money = f"${cost:,.0f}" if has_cost else "no cost recorded (tap ✓ Done again anytime to add the price)"
+                    detail = f"log '{t['title']}' done {when} · {money}"
                 else:
                     detail = f"snooze '{t['title']}'"
                 out = {"ok": True, "pending": {"tool": tool, "args": dict(args), "detail": detail}}
@@ -3969,17 +5061,76 @@ def _apply_tool(tool: str, args: dict, confirm: bool = False) -> dict:
                 out = {"ok": True, "detail": f"updated {t['title']} ({', '.join(bits) or 'nothing'})"}
                 return bool(bits)
             if tool == "complete_task":
-                when = str(args.get("date") or today)
+                # See the "Completing a job" spec above _uid() — this is the Python
+                # half of the shared contract, mirroring Store.markDone() (store.js)
+                # field for field so a completion recorded here and one recorded by
+                # the UI's ✓ Done converge on the same row instead of drifting.
+                # `when`, `cost` and `has_cost` were validated above (before the
+                # preview branch) — not recomputed here.
                 t["lastDone"] = when
                 # Parity with the client's markDone: a chat-completed fault task
                 # must not stay red — 'done' holds until the device reads normal.
                 if isinstance(t.get("fault"), dict) and t["fault"].get("state") != "done":
                     t["fault"]["state"], t["fault"]["doneAt"] = "done", when
-                cost = args.get("cost")
-                state.setdefault("logs", []).append(
-                    {"id": _uid("l"), "assetId": a["id"], "taskId": t.get("id"), "date": when,
-                     "cost": float(cost) if cost is not None else float(t.get("estCost") or 0),
-                     "note": t.get("title")})
+                logs = state.setdefault("logs", [])
+                quotes = _rows(state, "quotes")
+                # settledOn is the CALENDAR DAY THIS CALL HAPPENED — `today`, not the
+                # (possibly backdated) `when` — exactly like store.js's `iso`. It's
+                # what a SECOND completion (this call retried, or the UI's own ✓ Done
+                # landing afterward) matches against to find its own prior row rather
+                # than minting a sibling.
+                iso = today
+                pending = [l for l in logs if l.get("assetId") == a["id"] and l.get("pending")]
+                # REVIEW-5 parity (store.js): more than one pending booking can cover
+                # the same task — settle the OLDEST (longest-outstanding), same tie-
+                # break as markDone().
+                covering = sorted((l for l in pending if _booking_settles(l, t, quotes)),
+                                   key=lambda l: str(l.get("date") or ""))
+                booking = covering[0] if covering else None
+                if booking is not None:
+                    booking["pending"] = False
+                    booking["source"] = "done"
+                    booking["taskId"] = t["id"]   # stamp even when linkage was only via the quote
+                    booking["settledOn"] = iso
+                    if has_cost:
+                        booking["cost"] = cost   # explicit cost overrides the quoted/booked one
+                    # DEFECT 3 parity: bound "keep the booking's own date" to the
+                    # CURRENT calendar year — a future date is pulled forward (hasn't
+                    # happened yet), and so is a date from a year that's already
+                    # closed (a long-slipped booking settled today must not file its
+                    # cost under a year that's already over). A same-year past date
+                    # (the common "confirmed, done a bit late" case) is left alone.
+                    booking_year = str(booking.get("date") or "")[:4]
+                    if str(booking.get("date") or "") > iso or booking_year != iso[:4]:
+                        booking["date"] = iso
+                    if booking.get("quoteId"):
+                        q = next((x for x in quotes if x.get("id") == booking["quoteId"]), None)
+                        if q:
+                            q["status"] = "done"
+                    out = {"ok": True, "detail": f"logged '{t['title']}' done {when}"}
+                    return True
+                # No covering booking — dedupe against a completion this SAME tool
+                # (or the UI) already recorded today, mirroring Store._doneToday():
+                # a re-tap/retry only ever corrects the price on the existing row.
+                existing = _done_today(logs, t["id"], iso)
+                if existing is not None:
+                    if has_cost:
+                        existing["cost"] = cost
+                    out = {"ok": True, "detail": f"logged '{t['title']}' done {when}"}
+                    return True
+                det_id = _done_log_id(t["id"], iso)
+                tomb = state.get("tombstones")
+                if tomb:
+                    state["tombstones"] = [x for x in tomb if not (isinstance(x, dict) and x.get("id") == det_id)]
+                # D1 fix: an OMITTED cost banks $0, matching store.js's Store.markDone()
+                # (`Number(cost) || 0`) — not the task's estCost. Completing a job in
+                # chat without a price used to silently bank the estimate as real spend,
+                # feeding the "$X this year" dashboard stat with a number nobody typed.
+                logs.append({"id": det_id, "taskId": t["id"], "assetId": a["id"], "date": when,
+                             "cost": cost,
+                             "note": t.get("title") or "",
+                             "providerId": t.get("providerId") or a.get("providerId") or "",
+                             "ref": "", "source": "done", "settledOn": iso})
                 out = {"ok": True, "detail": f"logged '{t['title']}' done {when}"}
                 return True
             if tool == "set_autopilot":
@@ -4364,12 +5515,15 @@ class Handler(SimpleHTTPRequestHandler):
             if n > cap:
                 return self._send_json({"error": "body too large"}, 413)
             payload = json.loads(self.rfile.read(n) or b"{}") if n else {}
+            if not isinstance(payload, dict):
+                payload = {}
         except Exception:
             payload = {}
         if route == "/api/research":
             address = (payload.get("address") or "").strip()
-            job_id = _start_job(research, (address,), baseline_home(address, "Research failed."))
-            print(f"[research] start job={job_id} {address!r}")
+            coords, confirmed = _research_coords_from_payload(payload)
+            job_id = _start_job(research, (address, coords, confirmed), baseline_home(address, "Research failed."))
+            print(f"[research] start job={job_id} {address!r} coords={coords} confirmed={confirmed}")
             return self._send_json({"job_id": job_id, "status": "running"})
         if route == "/api/find-services":
             trade = (payload.get("trade") or "").strip()
@@ -4446,8 +5600,13 @@ class Handler(SimpleHTTPRequestHandler):
             print(f"[inspect] start job={job_id} name={name!r} bytes={len(raw)}")
             return self._send_json({"job_id": job_id, "status": "running"})
         if route == "/api/gmail/scan":   # supplier import — read-only IMAP sweep (async)
-            job_id = _start_job(gmail_scan, (), {"suppliers": [], "inferredAssets": [], "error": "scan failed"})
-            print(f"[gmail] scan job={job_id}")
+            # dryRun defaults TRUE (the owner's requested first step — see what a scan
+            # would find before anything is imported). _bound_bool coerces whatever the
+            # client sent to an actual bool before it reaches gmail_scan.
+            dry_run = _bound_bool(payload.get("dryRun"), True)
+            job_id = _start_job(gmail_scan, (dry_run,),
+                                 {"suppliers": [], "inferredAssets": [], "error": "scan failed", "dryRun": dry_run})
+            print(f"[gmail] scan job={job_id} dryRun={dry_run}")
             return self._send_json({"job_id": job_id, "status": "running"})
         if route == "/api/identify":   # snap-to-add: photo -> asset fields
             if not os.getenv("ANTHROPIC_API_KEY"):   # same friendly fallback as chat — never a raw SDK error
@@ -4535,6 +5694,20 @@ class Handler(SimpleHTTPRequestHandler):
             if isinstance(state.get("settings"), dict):
                 state["settings"].pop("haToken", None)
                 state["settings"].pop("haUrl", None)
+            # home.geo (the confirmed-property fix, see Store.setHomeGeo) drives
+            # which aerial imagery gets analysed and — once user-confirmed — DROPS
+            # the neighbouring-lot hedge in AERIAL_SYSTEM, so a malformed value here
+            # is worse than a missing one. Sanitise in place; drop the whole key
+            # rather than 400 the request, so a bad geo can never brick every other
+            # field on the row (the doc-level shape check above already covers the
+            # row itself being a non-dict).
+            for _h in state.get("homes", []):
+                if isinstance(_h, dict) and "geo" in _h:
+                    clean_geo = _sanitize_home_geo(_h["geo"])
+                    if clean_geo is None:
+                        _h.pop("geo", None)
+                    else:
+                        _h["geo"] = clean_geo
             # A quote token is interpolated into an IMAP SEARCH atom by the poller.
             # Reject malformed ones at the boundary too, so a bad token can never be
             # persisted (the poller skips them, but stored junk would silently stop
@@ -4828,6 +6001,28 @@ class Handler(SimpleHTTPRequestHandler):
         if p == "/api/home-imagery":      # candidate photos for the test-home picker
             address = (params.get("address") or [""])[0]
             return self._send_json(home_imagery(address))
+        if p == "/api/parcels":           # building-footprint hotspots for "confirm which house is yours"
+            lat_q, lon_q = params.get("lat"), params.get("lon")
+            if lat_q is not None or lon_q is not None:
+                lat = _finite_coord((lat_q or [""])[0], -90.0, 90.0)
+                lon = _finite_coord((lon_q or [""])[0], -180.0, 180.0)
+                if lat is None or lon is None:
+                    return self._send_json({"error": "invalid lat/lon"}, 400)
+            else:
+                address = (params.get("address") or [""])[0].strip()[:200]
+                if not address:
+                    return self._send_json({"error": "lat/lon or address required"}, 400)
+                loc = geocode(address)
+                if not loc:
+                    return self._send_json({"error": "could not geocode that address"}, 400)
+                lat, lon = loc
+            mode = (params.get("span") or ["medium"])[0]   # bounded enum only — never a raw client number
+            span_m = _PARCEL_SPAN_MODES.get(mode, _PARCEL_SPAN_MODES["medium"])
+            try:
+                return self._send_json(parcels_for(lat, lon, span_m))
+            except Exception as e:
+                print(f"[parcels] route failed: {e}")
+                return self._send_json({"center": {"lat": lat, "lon": lon}, "buildings": [], "source": "none"})
         # ---- business logo proxy (keyless; same-origin so no CSP/key exposure) ----
         if p == "/api/logo":
             domain = (params.get("domain") or [""])[0].strip()
