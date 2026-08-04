@@ -143,7 +143,7 @@ MODEL = os.getenv("KASA_MODEL", "claude-opus-4-8")
 # Categories the app knows how to schedule (must match data.js CATEGORIES).
 CATEGORIES = ["Water", "Garden", "HVAC", "Heating", "Cleaning", "Pool/Spa", "Sauna",
               "Energy", "Safety", "Roof/Exterior", "Vehicle", "Lighting", "Pump",
-              "Camera", "Appliance"]
+              "Camera", "Appliance", "Electrical"]
 
 PROPERTY_SITES = ["domain.com.au", "realestate.com.au", "allhomes.com.au",
                   "onthehouse.com.au", "getsoldprice.com.au", "propertyvalue.com.au"]
@@ -201,6 +201,10 @@ SYSTEM = (
 # ---- baseline fallback (no key / SDK / error) --------------------------------
 def baseline_home(address, note="Baseline profile — live research unavailable."):
     base = [
+        # Every dwelling has a switchboard, so this is a baseline fact about a
+        # house rather than something research has to spot — the electrician is
+        # usually the first trade a household needs and the last one they record.
+        ("electrical", "Electrical & switchboard", "Electrical"),
         ("gutters", "Gutters", "Roof/Exterior"),
         ("smoke_alarms", "Smoke alarms", "Safety"),
         ("hot_water", "Hot-water service", "Water"),
@@ -821,6 +825,12 @@ def _ha_problem_entities(dev):
     return out
 
 _DEV_CACHE = {}   # home_id (or "" for the legacy bare call) -> {t, data}
+# Message-ids we've already told the owner we couldn't attribute. An ambiguous
+# reply is deliberately never written to a quote, so nothing sets lastReplyId and
+# the poller re-detects it every cycle — without this it would push the same
+# "which job is this about?" every 120s forever. In-memory on purpose: after a
+# restart one more push is the right cost for not persisting mailbox ids.
+_AMBIGUOUS_NOTIFIED = set()
 
 def ha_devices(force=False, home_id=None):
     """Maintenance-relevant HA devices, synchronous + cached 300s per home (mirrors
@@ -2162,6 +2172,51 @@ def pick_reply(q, found, all_tokens=(), claimed=(), own_addrs=()):
             break  # a more specific tier answered — never fall further down
     return best
 
+def _reply_words(q):
+    """The words that distinguish THIS quote's job from a sibling's. A task-scoped
+    quote's `trade` is built as "<asset> · <task>" (ensureQuote in app.js), so the
+    task's own wording lives here — "Clean solar panels" vs "Inverter service"."""
+    text = " ".join(str(q.get(k) or "") for k in ("trade", "assetName"))
+    return {w for w in _re.findall(r"[a-z]{4,}", text.lower())}
+
+
+def disambiguate_reply(cands, body):
+    """Which of several quotes an untokened reply belongs to — or None if it can't
+    be told, which is the important half.
+
+    A trade emailed about TWO jobs on one asset replies from ONE address, so every
+    tier in reply_search_tiers() matches BOTH quotes identically and the ladder has
+    nothing left to separate them. Before this, the winner was whichever quote sat
+    first in state["quotes"] — array position deciding which job gets a price and a
+    date. That is not a display bug: confirming the offered date books it, and
+    completing the booking settles the task the QUOTE names, so the wrong job gets
+    marked done at the wrong price while the real one stays due.
+
+    So: only the body can break the tie, and only when it is DECISIVE — the reply
+    names words unique to exactly one candidate. "Re the inverter job, $1800" picks
+    the inverter quote; a bare "Tuesday works" picks nothing, and picking nothing is
+    the correct answer. Same discipline as bookingSettles() vs bookingCovers(): a
+    heuristic may suppress a row, but it must never drive a destructive write.
+    """
+    if not cands:
+        return None
+    if len(cands) == 1:
+        return cands[0]
+    low = (body or "").lower()
+    # A word only counts if it belongs to ONE candidate — shared words ("garden",
+    # the trade's own name) are exactly what makes these quotes look alike.
+    seen = {}
+    for q in cands:
+        for w in _reply_words(q):
+            seen[w] = seen.get(w, 0) + 1
+    hits = []
+    for q in cands:
+        uniq = {w for w in _reply_words(q) if seen.get(w) == 1}
+        if uniq and any(w in low for w in uniq):
+            hits.append(q)
+    return hits[0] if len(hits) == 1 else None
+
+
 def poll_quote_replies():
     """One poll cycle: match INBOX replies to enquiry_sent quotes, parse, update the store."""
     if not gmail_available():
@@ -2236,6 +2291,7 @@ def poll_quote_replies():
             break
     all_tokens = {str(q.get("token") or "") for q in st["quotes"] if q.get("token")}
     claimed = {info["msgid"] for info in newest.values() if info.get("msgid")}
+    ambiguous = []   # (candidate count, job names) for replies we refused to guess at
 
     # Sender fallback: trades drop the [KK-] token constantly (fresh emails, edited
     # subjects, a different mailbox on the same domain), and the owner forwards mail
@@ -2268,15 +2324,40 @@ def poll_quote_replies():
             pending[qid] = tiers
     if pending:
         found = _imap_replies_from(sorted({t for tiers in pending.values() for t, _ in tiers}))
-        for qid, tiers in pending.items():
+        # Ask every pending quote INDEPENDENTLY (no shared `claimed` while asking),
+        # then let the evidence decide. Claiming as we went meant the first quote in
+        # state["quotes"] took the message and the rest were locked out — array
+        # position picking which job gets priced and dated. See disambiguate_reply().
+        bids = {}   # msgid -> [(qid, row), ...] every quote that could own it
+        for qid in pending:
             q = by_qid.get(qid) or {}
             best = pick_reply(q, found, all_tokens, claimed, own_addrs)
             if best:
-                uid, msgid, frm, ts, body = best
-                prev = newest.get(qid)
-                if not prev or ts >= (prev.get("ts") or 0):
-                    newest[qid] = {"msgid": msgid, "from": frm, "body": body, "ts": ts}
-                    claimed.add(msgid)
+                bids.setdefault(best[1], []).append((qid, best))
+        for msgid, entries in bids.items():
+            if len(entries) == 1:
+                qid, row = entries[0]
+            else:
+                body = entries[0][1][4] or ""
+                winner = disambiguate_reply([by_qid.get(e[0]) or {} for e in entries], body)
+                if not winner:
+                    # Genuinely ambiguous: apply it to NOTHING. A wrong guess here
+                    # books and settles the wrong job. The owner is told instead.
+                    jobs = ", ".join(str((by_qid.get(e[0]) or {}).get("trade") or "?") for e in entries)
+                    print(f"[quote] reply {msgid} could be about {len(entries)} jobs ({jobs}) — left for the owner")
+                    if msgid not in _AMBIGUOUS_NOTIFIED:
+                        _AMBIGUOUS_NOTIFIED.add(msgid)
+                        if len(_AMBIGUOUS_NOTIFIED) > 500:      # bounded: mailbox ids are unbounded input
+                            _AMBIGUOUS_NOTIFIED.clear()
+                        ambiguous.append((len(entries), jobs))
+                    continue
+                qid = winner.get("id")
+                row = next(r for qq, r in entries if qq == qid)
+            uid, m_id, frm, ts, body = row
+            prev = newest.get(qid)
+            if not prev or ts >= (prev.get("ts") or 0):
+                newest[qid] = {"msgid": m_id, "from": frm, "body": body, "ts": ts}
+                claimed.add(m_id)
     # drop entries that are just the already-processed message again
     newest = {qid: info for qid, info in newest.items()
               if info["msgid"] != (by_qid.get(qid) or {}).get("lastReplyId")}
@@ -2378,6 +2459,13 @@ def poll_quote_replies():
         print(f"[quote] processed {len(parsed)} repl(y/ies); rev now {res.get('rev')}")
         for title, msg, home_id in notify:
             ha_notify(title, msg[:250], home_id)
+    # A reply we deliberately refused to attribute is worth MORE noise than a normal
+    # one, not less: nothing was written, so the only way the owner learns a trade
+    # answered is this push. Silence here is how a quote sits "waiting" for weeks.
+    for count, jobs in ambiguous:
+        ha_notify("KasaKeeper — which job is this about?",
+                  f"A trade replied about one of {count} jobs ({jobs}) and didn't say which. "
+                  f"Nothing was changed — open the quote to apply it yourself."[:250])
 
 def money_str(v):
     try:

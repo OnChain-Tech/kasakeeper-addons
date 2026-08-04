@@ -47,6 +47,9 @@ const SERVICES = [
       { name: '9V battery',            tasks: [{ t: 'Test all alarms', d: 30, c: 0 }, { t: 'Replace 9V batteries', d: 365, c: 20 }] },
       { name: 'Hardwired',             tasks: [{ t: 'Test all alarms', d: 30, c: 0 }, { t: 'Replace backup batteries', d: 365, c: 20 }] },
   ]},
+  { cat: 'Electrical', name: 'Electrical & switchboard', tasks: [
+      { t: 'Test RCDs (push-button)', d: 182, c: 0 },
+      { t: 'Switchboard safety inspection', d: 730, c: 150 }] },
   { cat: 'Safety', name: 'Security alarm', tasks: [{ t: 'Service & backup battery', d: 365, c: 80 }] },
   { cat: 'Safety', name: 'Fire extinguisher / blanket', tasks: [{ t: 'Check & tag', d: 365, c: 0 }] },
 

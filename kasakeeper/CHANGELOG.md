@@ -1,3 +1,24 @@
+# 0.3.24
+
+Smaller than the last one, but one of these could have marked the wrong job done and paid for it.
+
+## A trade's reply lands on the job it's actually about
+
+If you'd emailed one tradesperson about **two** jobs on the same asset — a mower and a tree lopper on the garden, a panel cleaner and an inverter tech on the solar — their reply came from one address, so nothing could tell the two conversations apart. Whichever job happened to be stored first simply took the reply.
+
+That wasn't only a mislabelled card. Confirming the date books it, and marking the booking done completes the job the *quote* names — so the wrong job got marked done at the wrong price, while the one you were really waiting on stayed overdue.
+
+Now the reply's own words decide: "re the inverter job" goes to the inverter. When the words don't settle it — a bare "Tuesday works" — **nothing is changed at all** and you get a message asking which job it was about. Guessing here is worse than asking, so it asks. You'll hear about it once, not every couple of minutes.
+
+## Electrical is a standard part of a house
+
+Every home has a switchboard, so new homes now start with an **Electrical & switchboard** asset: an RCD push-button test every six months (yours to do, no cost) and a switchboard safety inspection every two years, which is the interval an electrician actually works to. Adding it to an existing home is a couple of taps under Assets.
+
+## Fixes
+
+- **A new home's cleaning schedule no longer assumes twice a week.** It defaulted to a clean every 3 days — the app's own "twice weekly" cadence — so a fresh home nagged constantly. It's weekly now, matching the House cleaning option the app offers first. Anyone who really does clean twice a week can still pick that.
+- Removed a duplicate Vehicle category that silently overrode the first one.
+
 # 0.3.23
 
 The release for real user testing. Two things the app was quietly getting wrong about *your* house, and one that made a feature look broken.
