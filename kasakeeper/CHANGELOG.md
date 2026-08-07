@@ -1,3 +1,10 @@
+# 0.3.25
+
+A quieter asset page.
+
+- **Prepaid packs, usage tracking and device watch only appear once they're set up.** Every asset page used to carry all three — an "add a service pack?" nag, a "track usage?" banner, a "watch for problems?" prompt — on assets that will never need any of them. They now appear only when they have something to show, and their set-up lives under the asset's **✎ Edit → Extras**. A device reporting an **active fault still surfaces it regardless** — a fault is never hidden behind a tidy-up.
+- **Clearer words when Home Assistant disagrees with your records** — the drift banner and morning brief now say "devices don't match your records" in plain language, and count devices rather than changed fields.
+
 # 0.3.24
 
 Smaller than the last one, but one of these could have marked the wrong job done and paid for it.

@@ -3384,11 +3384,12 @@ def _digest_push_parts(d, state=None, home_id=None):
     if ha_available(hid):   # one-sentence registry-drift nudge — findings only, never a write
         try:
             drift = ha_drift(hid)
-            nc = len(drift.get("drift") or []) + len(drift.get("vanished") or [])
+            # drift rows are per-FIELD; the sentence claims devices, so count unique assets
+            nc = len({x.get("assetId") for x in (drift.get("drift") or []) + (drift.get("vanished") or [])})
             nn = len(drift.get("newDevices") or [])
             if nc or nn:
                 bits = []
-                if nc: bits.append(f"{nc} correction{'s' if nc != 1 else ''}")
+                if nc: bits.append(f"{nc} device{'s that don' if nc != 1 else ' that doesn'}'t match your records")
                 if nn: bits.append(f"{nn} new device{'s' if nn != 1 else ''}")
                 parts.append("Home Assistant sees " + " · ".join(bits))
         except Exception as e:

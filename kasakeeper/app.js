@@ -1430,8 +1430,10 @@ function viewAssetsBody(sub) {
 // Prepaid maintenance: what you bought, what you've used, what's left.
 function packCard(a) {
   const p = Store.pack(a);
-  if (!p) return `<div class="section-title">Prepaid maintenance</div>
-    <div class="banner">Bought a block of services up front? <b data-action="edit-pack" data-id="${a.id}" style="color:var(--accent);cursor:pointer">＋ Add a service pack →</b></div>`;
+  // No pack -> no section (owner: "a waste of space when most items don't need
+  // it"). The ＋ entry point lives on the EDIT screen instead, so the feature
+  // stays reachable without occupying every asset page.
+  if (!p) return '';
   const left = Store.packLeft(a), pct = Math.round((p.used || 0) / p.bought * 100);
   const per = Store.packPerVisit(a);
   const unit = p.unit || 'visit';
@@ -1534,24 +1536,26 @@ function viewAsset(id) {
       return `<div class="section-title">Type</div><div class="btn-row">${m.s.variants.map(v =>
         `<button class="btn small ${a.variant===v.name?'primary':''}" data-action="set-variant" data-id="${a.id}" data-svc="${m.idx}" data-var="${esc(v.name)}">${esc(v.name)}</button>`).join('')}</div>`; })()}
     ${packCard(a)}
-    <div class="section-title">Usage tracking</div>
-    ${a.usage ? `${usageBar(a)}
+    ${a.usage ? `<div class="section-title">Usage tracking</div>${usageBar(a)}
       <div class="btn-row">
         <button class="btn small" data-action="reset-usage" data-id="${a.id}">↺ Serviced (reset)</button>
         <button class="btn small" data-action="track-usage" data-id="${a.id}">✎ Edit</button>
         <button class="btn small" data-action="stop-usage" data-id="${a.id}" style="color:var(--red)">Stop</button>
-      </div>`
-    : `<div class="banner">Remind me by real usage, not just the calendar — pull run-hours or energy from Home Assistant. <b class="klink" data-action="track-usage" data-id="${a.id}">📊 Track usage →</b></div>`}
+      </div>` : ''}
     ${(a.ha && a.ha.deviceId && !Store.isTestHome()) ? (() => {
       const w = a.ha.watch || [];
       const ft = ts.find(t => t.fault && t.fault.state === 'active' && !t.snoozed);
+      // Nothing watched and nothing wrong -> nothing to say. The set-up entry
+      // point lives on the edit screen; an ACTIVE fault always still surfaces,
+      // whatever the owner has or hasn't configured.
+      if (!w.length && !ft) return '';
       const kindIcon = { problem: '⚠', fault: '⛔', consumable: '◔' };
       return `<div class="section-title">Device watch${w.length ? ` <span class="pill">${w.length}</span>` : ''}</div>
         ${ft ? (() => { const ord = faultOrder(ft, 'klink', 'Order the part →');
           return `<div class="banner urgent">↯ ${esc(ft.fault.label)} — ${esc(Store.dueLabel(ft))} by the device itself. <b class="klink" data-action="fault-enquiry" data-id="${ft.id}">✉︎ Get it looked at →</b>${ord ? ' · ' + ord : ''}</div>`; })() : ''}
         ${w.length ? `<div class="card">${w.map(x => `<div class="t-sub">${kindIcon[x.kind] || '⚠'} ${esc(x.label)}${x.kind === 'consumable' ? ` · alerts ${x.compare === 'gte' ? 'above' : 'below'} ${esc(String(x.threshold))}%` : ''}</div>`).join('')}
           <div class="btn-row" style="margin-top:8px"><button class="btn small" data-action="watch-open" data-id="${a.id}">✎ Edit sensors</button></div></div>`
-        : `<div class="banner">Let the device tell you when it needs attention — watch its own problem sensors and a task lands here the moment one trips. <b class="klink" data-action="watch-open" data-id="${a.id}">↯ Watch for problems →</b></div>`}`;
+        : ''}`;   // fault visible above; set-up lives on the edit screen
     })() : ''}
     ${(() => { const act = ts.filter(t => !t.snoozed), snz = ts.filter(t => t.snoozed);
       return `<div class="section-title">Maintenance <span class="pill">${act.length}</span></div>
@@ -2168,7 +2172,14 @@ function editAsset(id) {
       ${field('f_serial','Serial no. (optional)',a.serial,'text','from the nameplate')}
       ${field('f_ha','Home Assistant entity (optional)',a.haEntity,'text','e.g. climate.aircon')}
       <div class="btn-row"><button class="btn primary" data-action="save-asset" data-id="${id}">Save asset</button></div>
-    </div>`;
+    </div>
+    ${id !== 'new' ? `<div class="section-title">Extras</div>
+    <div class="card"><div class="t-sub" style="margin-bottom:8px">These only appear on the asset page once they're set up — most assets never need them.</div>
+      <div class="btn-row">
+        <button class="btn small" data-action="edit-pack" data-id="${id}">🎟️ ${Store.pack(a) ? 'Edit the service pack' : 'Add a prepaid service pack'}</button>
+        <button class="btn small" data-action="track-usage" data-id="${id}">📊 ${a.usage ? 'Edit usage tracking' : 'Track usage from Home Assistant'}</button>
+        ${(a.ha && a.ha.deviceId && !Store.isTestHome()) ? `<button class="btn small" data-action="watch-open" data-id="${id}">↯ ${(a.ha.watch || []).length ? 'Edit watched sensors' : "Watch the device's own sensors"}</button>` : ''}
+      </div></div>` : ''}`;
 }
 function editUsage(id) {
   const a = Store.asset(id); if (!a) return viewDashboard();
@@ -3092,12 +3103,13 @@ async function hydrateHaDrift() {
     catch { HADRIFT = { t: Date.now(), data: null }; }
   }
   const d = HADRIFT.data;
-  const nCorr = d ? d.drift.length + d.vanished.length : 0, nNew = d ? d.newDevices.length : 0;
+  // drift rows are per-FIELD; the banner claims devices, so count unique assets
+  const nCorr = d ? new Set([...d.drift, ...d.vanished].map(x => x.assetId)).size : 0, nNew = d ? d.newDevices.length : 0;
   if (!d || !d.available || (!nCorr && !nNew)) { host.innerHTML = ''; return; }
   const bits = [];
-  if (nCorr) bits.push(`${nCorr} correction${nCorr !== 1 ? 's' : ''}`);
+  if (nCorr) bits.push(`${nCorr} device${nCorr !== 1 ? "s don't" : " doesn't"} match your records`);
   if (nNew) bits.push(`${nNew} new device${nNew !== 1 ? 's' : ''}`);
-  host.innerHTML = `<div class="banner ok" data-action="ha-import-scan">Registry drift: ${bits.join(' · ')} — review <b style="color:var(--accent)">→</b></div>`;
+  host.innerHTML = `<div class="banner ok" data-action="ha-import-scan">${bits.join(' · ')} — review <b style="color:var(--accent)">→</b></div>`;
 }
 /* ---------- seasonal / weather nudges (the eye glances at what needs you) ---------- */
 let NUDGES = { t: 0, list: null, weather: null };
