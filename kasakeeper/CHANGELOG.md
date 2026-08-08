@@ -1,3 +1,9 @@
+# 0.3.28
+
+One line, and the import button finally does what it says.
+
+- **"Import for real" imported nothing.** The scan screen's second tap — the deliberate one, after you've seen the preview — was quietly running a *second* preview instead of the real import, so the results screen said "No suppliers found" on a mailbox full of tradespeople even after 0.3.27 fixed the reading itself. It now imports. Driving the actual button on a real mailbox: preview 15 emails, then import → 11 trades and 8 things your mail proves the house has.
+
 # 0.3.27
 
 The email import actually imports now.

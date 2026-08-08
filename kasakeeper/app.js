@@ -4507,7 +4507,11 @@ document.addEventListener('click', async e => {
       render();
       (async () => {
         try {
-          const start = await (await fetch('api/gmail/scan', { method:'POST', headers:{'Content-Type':'application/json'}, body:'{}' })).json();
+          // dryRun MUST be explicit here. /api/gmail/scan defaults it to TRUE (a preview
+          // is the safe answer to a bare call), so posting '{}' made the deliberate
+          // second tap run a SECOND free preview: "Import for real" imported nothing and
+          // the results screen read "No suppliers found" on a mailbox full of trades.
+          const start = await (await fetch('api/gmail/scan', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ dryRun: false }) })).json();
           if (!start.job_id) throw new Error(start.error || 'could not start the scan');
           const msgs = ['Searching for quotes & invoices…', 'Reading the tradie mail…', 'Extracting suppliers & history…'];
           for (let n = 0; n < 120; n++) {                       // up to ~6 min for big inboxes
