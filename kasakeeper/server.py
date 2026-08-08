@@ -4504,6 +4504,50 @@ def _bound_bool(v, default):
     except Exception:
         return default
 
+def _gmail_open_readonly(creds):
+    """Open Gmail's IMAP, discover All Mail and SELECT it READ-ONLY -> (m, mailbox).
+
+    THE CONNECTION SEAM. gmail_scan calls this as a bare module-level global — the same
+    shape _imap_replies_for_tokens gives the quote poller — so a suite can rebind
+    kk._gmail_open_readonly and serve fixture mail with no network, no mailbox and no
+    key (tools/test-gmail-scan.py's scan_with, mirroring poll_with). This live path is
+    the default and is unchanged; nothing about the shipped behaviour moves.
+
+    Only the socket-level bits sit above the seam (TLS context, host/port, the 30s
+    timeout, login). Everything a fixture run needs to keep exercising for real stays
+    below it, inside gmail_collect_rows: the X-GM-RAW quoting, the SINCE window, the
+    per-query and global caps, the dropped counter, the own-mail filter and the nested
+    -MIME bounds. readonly=True is the guarantee the whole scan rests on — we only ever
+    SEARCH and BODY.PEEK, never STORE/EXPUNGE — so it lives here, not at the call site.
+    """
+    import imaplib
+    a, p = creds
+    m = imaplib.IMAP4_SSL("imap.gmail.com", 993, ssl_context=_tls_ctx(), timeout=30)
+    m.login(a, p)
+    mailbox_quoted = _gmail_all_mail(m)               # discovered All Mail, or INBOX if absent
+    m.select(mailbox_quoted, readonly=True)           # READ-ONLY — we never modify the mailbox
+    return m, mailbox_quoted.strip('"')               # unquoted name, for the returned report only
+
+def _gmail_sample_row(row):
+    """One collected row -> {"from", "subject"} for the preview's sample list.
+
+    FIRST-wins, and only across the header block. A row is built as
+    FROM/DATE/SUBJECT/BODY in that fixed order, but _gmail_decode_header does not
+    strip newlines, so an RFC 2047 encoded Subject can decode to several lines —
+    one of which can be a second "FROM: Trusted Bank <...>". Walking every line and
+    letting the LAST match win would let anyone who can email this mailbox choose
+    the sender displayed on the screen the owner uses to decide what to trust.
+    A bare module-level function so the suite drives THIS, not a copy of it.
+    """
+    head = str(row or "").split("\nBODY: ", 1)[0]
+    frm = subj = ""
+    for line in head.split("\n"):
+        if not frm and line.startswith("FROM: "):
+            frm = line[6:]
+        elif not subj and line.startswith("SUBJECT: "):
+            subj = line[9:]
+    return {"from": _short(frm, 80) or "", "subject": _short(subj, 90) or ""}
+
 def gmail_scan(dry_run=False):
     """Read-only sweep -> {suppliers, inferredAssets, scanned, mailbox, windowDays, queries,
     capped, dropped, dryRun}. Runs as an async job.
@@ -4513,28 +4557,38 @@ def gmail_scan(dry_run=False):
     FETCH'd (never STORE/EXPUNGE), and this function never calls state_mutate/state_write
     in either mode. The real import is a deliberate, separate client-side write the owner
     triggers after reviewing a dry-run's candidate suppliers/assets."""
-    import imaplib
     dry_run = bool(dry_run)
     creds = _gmail_creds()
     if not creds:
         return {"error": "Gmail isn't configured — add the address and app password in the add-on options.",
                 "suppliers": [], "inferredAssets": [], "dryRun": dry_run}
-    a, p = creds
-    m = imaplib.IMAP4_SSL("imap.gmail.com", 993, ssl_context=_tls_ctx(), timeout=30)
-    m.login(a, p)
-    mailbox_quoted = _gmail_all_mail(m)               # discovered All Mail, or INBOX if absent
-    m.select(mailbox_quoted, readonly=True)           # READ-ONLY — we never modify the mailbox
-    mailbox = mailbox_quoted.strip('"')               # unquoted, for the returned report only
+    m, mailbox = _gmail_open_readonly(creds)
     try:
         collected = gmail_collect_rows(m, mailbox)
     finally:
         m.logout()
     rows = collected["rows"]
+    since = (__import__("datetime").date.today()
+             - __import__("datetime").timedelta(days=GMAIL_SCAN_SINCE_DAYS)).strftime("%d %b %Y")
     meta = {"mailbox": collected["mailbox"], "windowDays": GMAIL_SCAN_SINCE_DAYS,
-            "queries": collected["queries"], "capped": collected["capped"],
-            "dropped": collected["dropped"], "dryRun": dry_run}
+            "since": since, "queries": collected["queries"], "capped": collected["capped"],
+            "dropped": collected["dropped"], "wouldScan": len(rows),
+            "dedupedTotal": len(rows) + collected["dropped"], "dryRun": dry_run}
     if not rows:
-        return {"suppliers": [], "inferredAssets": [], "scanned": 0, **meta}
+        return {"suppliers": [], "inferredAssets": [], "scanned": 0, "candidates": [], **meta}
+    if dry_run:
+        # A DRY RUN SENDS NOTHING TO CLAUDE. dry_run used to be a label only: the
+        # preview ran the identical sweep, uploading every fetched body to the model
+        # and billing for it, while the UI promised "never reads a body or writes
+        # anything" and the design called for a Claude-free preview. Three layers
+        # disagreed; this is the one that was wrong. The preview now answers what it
+        # can answer for free — which mailbox, what each search matched, what would
+        # be read, and a bounded sample of senders/subjects taken from mail ALREADY
+        # fetched over read-only IMAP. Naming suppliers is the paid step, and it
+        # belongs to the deliberate second tap.
+        cands = [_gmail_sample_row(r) for r in rows[:12]]
+        return {"suppliers": [], "inferredAssets": [], "scanned": len(rows),
+                "candidates": cands, **meta}
     # batch through Claude (~40 emails per call), merge by supplier name
     suppliers, assets = {}, {}
     for i in range(0, len(rows), 40):

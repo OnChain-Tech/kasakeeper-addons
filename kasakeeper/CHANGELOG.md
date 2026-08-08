@@ -1,3 +1,12 @@
+# 0.3.26
+
+The email preview is now genuinely a preview.
+
+- **A preview no longer costs what the import costs.** "See what it would find" opened your mailbox, read every matching message and sent all of them away for analysis — exactly what the real import does — and only declined to save the result. It now answers what it can answer for free: which mail folder it read, what each search matched, how many messages it would read, and a sample of their senders and subjects. Identifying your suppliers is the paid step, and it stays behind the second tap.
+- **The preview screen shows real numbers again.** It had been asking the server for five things the server never sent, so search names came out blank, the sample was always empty, and the cap notice read "the oldest 0 fall outside this scan's cap".
+- **Adding an asset, a job or a trade twice by double-tapping Save now adds it once.** On a phone a quick second tap landed before the screen changed and created a second, empty copy — reported live from the owner's phone.
+- **A stranger can't fake the sender shown in the preview.** A crafted subject line could smuggle in a second "From:" and choose the name displayed on the screen you use to decide what to trust.
+
 # 0.3.25
 
 A quieter asset page.
@@ -37,7 +46,7 @@ The release for real user testing. Two things the app was quietly getting wrong 
 - **It reads All Mail.** Discovered from the server rather than assumed, so it still works on a Gmail account in another language, and falls back to the inbox rather than failing if it can't find it. Still strictly read-only: nothing is ever marked, moved or deleted.
 - **It looks for the things a house *has*, not just the people who invoice it.** The old terms — quote, invoice, booking, tax invoice — are the vocabulary of a tradesperson's paperwork. They can't see something you simply bought. A spa bought once a decade arrives as "Your order has shipped", and no amount of searching for "invoice" will ever find it. The scan now also looks for spa, sauna, pool, heat pump, solar, irrigation, alarm and camera. Deliberately *not* included: generic shopping words like order, receipt and purchase — they'd find more, but every match is sent away for reading, and against a real inbox they'd sweep up your whole shopping history.
 - **Receipts forwarded as attachments are read properly.** A receipt often arrives as a forwarded bundle rather than a plain message, and the old code saw those as empty. One household's entire spa history — supplier, model, a cover replacement and three years of chemical orders — was invisible for this reason alone.
-- **A preview first, always.** The import screen now shows you what it *would* bring in before anything is written: which folder it read, how many messages each search matched, and what it found. Importing is a separate, deliberate second tap.
+- **A preview first, always.** The import screen shows you what it *would* bring in before anything is written, and importing is a separate, deliberate second tap. (Corrected in 0.3.26: as shipped here the preview still read and analysed every matching message — it only withheld the write. It's genuinely free from 0.3.26 on.)
 - **A loud search can't drown out a quiet one.** Results are gathered per search and interleaved, so a mailbox full of invoices can no longer crowd out the single message from the one tradesperson you actually use. If anything is dropped for size, it says so instead of silently truncating.
 
 ## Auto-book works again on a house with more than one trade

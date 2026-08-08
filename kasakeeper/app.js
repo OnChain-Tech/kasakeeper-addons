@@ -449,9 +449,14 @@ function viewGmailImport() {
     ${aRows || '<div class="empty">Nothing new inferred.</div>'}
     <div class="btn-row"><button class="btn primary wide" data-action="gmail-import">Import ${g.picked.s.size + g.picked.a.size} selected →</button></div>`;
 }
-// Default first step for a scan — a dry run that only counts matches, never reads a
-// body or writes anything. Tolerant of an older/partial result shape (no mailbox,
-// queries, candidates, dedupedTotal or capped) so it renders rather than throwing.
+// Default first step for a scan. The preview reads your mailbox over READ-ONLY IMAP
+// (nothing is marked, moved or deleted) but sends NOTHING to Claude and writes
+// nothing to the store — naming suppliers is the paid step behind the second tap.
+// Field names here must match gmail_scan()'s meta exactly: they silently drifted
+// once (since/candidates/dedupedTotal/wouldScan/q.query were never sent), which
+// rendered blank search labels, an always-empty sample, and a nonsense
+// "the oldest 0 fall outside" banner. Tolerant of a partial shape so an older
+// add-on renders rather than throwing.
 function viewGmailPreview(r) {
   const mailbox = r.mailbox || 'your mailbox';
   const since = r.since || '';
@@ -459,14 +464,14 @@ function viewGmailPreview(r) {
   const candidates = Array.isArray(r.candidates) ? r.candidates : [];
   const dedupedTotal = r.dedupedTotal != null ? r.dedupedTotal : (r.scanned || 0);
   const wouldScan = r.wouldScan != null ? r.wouldScan : (r.scanned || 0);
-  const qRows = queries.map(q => `<div class="meta"><div class="k">${esc(q.query || '')}</div><div class="v">${q.hits || 0}</div></div>`).join('');
-  const cRows = candidates.map(c => `<div class="t-sub" style="white-space:normal">${esc(c.subject || '(no subject)')} · ${esc(c.from || '')}</div>`).join('');
+  const qRows = queries.map(q => `<div class="meta"><div class="k">${esc(q.label || q.query || '—')}</div><div class="v">${q.error ? '—' : (q.hits || 0)}${(q.used != null && q.used !== q.hits) ? ` · ${q.used} kept` : ''}</div></div>`).join('');
+  const cRows = candidates.map(c => `<div class="t-sub" style="white-space:normal">${esc(c.subject || '(no subject)')}${c.from ? ' · ' + esc(c.from) : ''}</div>`).join('');
   return `<button class="back" data-action="back">‹ Back</button>
     <div class="hero"><div class="emoji">📬</div><div><h1>Preview · nothing imported yet</h1><div class="t-sub">${esc(mailbox)}${since ? ' · mail since ' + esc(since) : ''}</div></div></div>
     ${r.capped ? `<div class="banner">Only the newest ${esc(String(wouldScan))} of ${esc(String(dedupedTotal))} matches will be read · the oldest ${esc(String(dedupedTotal - wouldScan))} fall outside this scan's cap.</div>` : ''}
     <div class="section-title">Matches per search <span class="pill">${dedupedTotal}</span></div>
     ${qRows ? `<div class="meta-grid">${qRows}</div>` : '<div class="empty">No matches in this mailbox yet.</div>'}
-    <div class="section-title">Sample of what it found <span class="pill">${candidates.length}</span></div>
+    <div class="section-title">A sample of what it would read <span class="pill">${candidates.length}</span></div>
     ${cRows || '<div class="empty">Nothing to sample.</div>'}
     <div class="btn-row"><button class="btn primary wide" data-action="gmail-scan-real">📥 Import for real (reads ${wouldScan} email${wouldScan !== 1 ? 's' : ''}) →</button></div>`;
 }
@@ -4377,6 +4382,14 @@ document.addEventListener('click', async e => {
     case 'snooze-task': Store.snoozeTask(id); return render();     // disable/ignore — stops counting toward due/overdue/nudges
     case 'unsnooze-task': Store.unsnoozeTask(id); return render(); // bring it back
     case 'save-asset': {
+      // Dead the button on first tap. go() below navigates via a hashchange
+      // that lands AFTER this handler returns, so on a phone a quick second
+      // tap re-enters with id still 'new' and mints a SECOND asset — the
+      // first tap consumed SNAP, so the twin arrives bare (no photo, no
+      // schedule). Live repro on the owner's phone, 2026-08-07. A disabled
+      // button dispatches no click, closing the whole window synchronously.
+      if (node.disabled) return;
+      node.disabled = true;
       const a = id==='new' ? {} : Store.asset(id);
       // Location isn't in this Object.assign: while HA reports an area for a
       // linked device, the field renders disabled and its value is the HA
@@ -4450,8 +4463,12 @@ document.addEventListener('click', async e => {
       }
     }
     case 'gmail-scan': {
-      // Preview first, always — this only counts matches (dryRun:true), it never
-      // fetches a body or writes anything. The real scan is a deliberate second tap.
+      // Preview first, always (dryRun:true). It reads the mailbox over read-only
+      // IMAP, but sends nothing to Claude and writes nothing to the store — so it
+      // costs no API credits. Naming the suppliers is the paid step, and it belongs
+      // to the deliberate second tap. This comment claimed "never fetches a body"
+      // while dry_run was a label the server ignored: the preview ran the full sweep
+      // and billed for it. Keep the claim and the server branch honest together.
       GMSCAN = { status:'scanning', mode:'preview', result:null, picked:null, msg:'Connecting…' };
       go('/gmail-import');
       (async () => {
@@ -4684,6 +4701,7 @@ document.addEventListener('click', async e => {
       return;
     }
     case 'save-task': {
+      if (node.disabled) return; node.disabled = true;   // same double-tap window as save-asset (c33eb51): go() lands after the handler, a second tap mints a second row
       const tid = id, assetId = node.getAttribute('data-asset');
       const t = tid ? Store.state.tasks.find(x=>x.id===tid) : { assetId };
       const diy = !!(document.getElementById('f_diy') || {}).checked;
@@ -4703,6 +4721,7 @@ document.addEventListener('click', async e => {
       return go('/asset/' + assetId);
     }
     case 'save-provider': {
+      if (node.disabled) return; node.disabled = true;   // same double-tap window as save-asset (c33eb51): go() lands after the handler, a second tap mints a second row
       const p = id==='new' ? {} : Store.provider(id);
       Object.assign(p, { name:val('f_pname'), trade:val('f_trade'), contact:val('f_contact'), phone:val('f_phone'), email:val('f_email'), website:val('f_website'), notes:val('f_notes') });
       Store.upsertProvider(p); return go('/providers');
