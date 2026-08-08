@@ -3469,17 +3469,27 @@ def inspect_report(pdf_b64, filename):
         return {"error": "couldn't read that report — try again"}
 
 
-def _vision_json(system, text, image_b64=None, media_type="image/jpeg"):
-    """One fast Claude call (optionally with an image) that must return JSON."""
+def _vision_json(system, text, image_b64=None, media_type="image/jpeg", max_tokens=800):
+    """One fast Claude call (optionally with an image) that must return JSON.
+
+    max_tokens sizes the OUTPUT budget. 800 suits the small single-subject
+    answers (snap, triage, recall); a caller that asks for many records must
+    raise it, because an overrun is not a short answer — the reply is cut off
+    mid-object and json.loads raises. That is exactly how the Gmail import came
+    to report "No suppliers found" on a mailbox full of tradespeople.
+    """
     import anthropic
     client = anthropic.Anthropic(max_retries=1, timeout=90.0)
     content = []
     if image_b64:
         content.append({"type": "image", "source": {"type": "base64", "media_type": media_type, "data": image_b64}})
     content.append({"type": "text", "text": text})
-    resp = client.messages.create(model=MODEL, max_tokens=800, system=system,
+    resp = client.messages.create(model=MODEL, max_tokens=max_tokens, system=system,
                                   messages=[{"role": "user", "content": content}])
     out = "".join(b.text for b in resp.content if getattr(b, "type", "") == "text")
+    if getattr(resp, "stop_reason", None) == "max_tokens":
+        raise ValueError(f"the model's answer was cut off at the {max_tokens}-token limit "
+                         f"({len(out)} chars) — ask for fewer records per call")
     i, j = out.find("{"), out.rfind("}")
     return json.loads(out[i:j + 1])
 
@@ -4289,7 +4299,11 @@ GMAIL_SCAN_QUERIES = [
 ]
 GMAIL_SCAN_SINCE_DAYS = 3 * 365         # a receipt is worth finding years later
 GMAIL_SCAN_PER_QUERY = 300              # newest uids considered from any one query
-GMAIL_SCAN_MAX_MESSAGES = 300           # global ceiling on messages fetched in one scan
+GMAIL_SCAN_MAX_MESSAGES = 300
+# Emails per extraction call, and the output budget for that call. These two are a
+# pair: raise the batch without raising the budget and the reply truncates.
+GMAIL_EXTRACT_BATCH = 12
+GMAIL_EXTRACT_MAX_TOKENS = 4096           # global ceiling on messages fetched in one scan
 
 # A receipt routinely arrives as a forwarded bundle — a message/rfc822 attachment,
 # sometimes nested inside another one (a forward of a forward). The whole owner's
@@ -4528,6 +4542,34 @@ def _gmail_open_readonly(creds):
     m.select(mailbox_quoted, readonly=True)           # READ-ONLY — we never modify the mailbox
     return m, mailbox_quoted.strip('"')               # unquoted name, for the returned report only
 
+def _gmail_latest_job_date(sup):
+    """The most recent well-formed YYYY-MM-DD across a supplier's lastJob and its
+    own job rows, or "". Contact fields merge first-wins, which is fine — one
+    email address is as good as another. A DATE is not like that: `lastJob` means
+    the LAST job, so first-wins let a supplier seen in two batches report a date
+    OLDER than a job it is carrying. Anything unparseable is ignored rather than
+    string-compared, so "soon" can't sort above a real date."""
+    seen = [sup.get("lastJob")] + [j.get("date") for j in (sup.get("jobs") or [])
+                                   if isinstance(j, dict)]
+    good = [d for d in seen
+            if isinstance(d, str) and _re.fullmatch(r"\d{4}-\d{2}-\d{2}", d.strip())]
+    return max(good).strip() if good else ""
+
+
+def _gmail_merge_supplier(cur, s):
+    """Fold a later batch's sighting of the same supplier into the first one."""
+    cur["jobs"] = (cur.get("jobs") or []) + (s.get("jobs") or [])
+    for f in ("email", "phone", "website"):
+        cur[f] = cur.get(f) or s.get(f)
+    latest = _gmail_latest_job_date({"lastJob": cur.get("lastJob") or s.get("lastJob"),
+                                     "jobs": cur.get("jobs")})
+    if latest:
+        cur["lastJob"] = latest
+    else:
+        cur["lastJob"] = cur.get("lastJob") or s.get("lastJob")
+    return cur
+
+
 def _gmail_sample_row(row):
     """One collected row -> {"from", "subject"} for the preview's sample list.
 
@@ -4589,25 +4631,36 @@ def gmail_scan(dry_run=False):
         cands = [_gmail_sample_row(r) for r in rows[:12]]
         return {"suppliers": [], "inferredAssets": [], "scanned": len(rows),
                 "candidates": cands, **meta}
-    # batch through Claude (~40 emails per call), merge by supplier name
+    # Batch through Claude, merging by supplier name. 40 emails per call against
+    # _vision_json's 800-token default is what broke this: a dozen suppliers, each
+    # with contact fields and a jobs[] list, overruns 800 tokens easily, the reply
+    # is truncated mid-object, json.loads raises — and the bare except below turned
+    # that crash into a cheerful "No suppliers found" on a mailbox full of trades.
+    # Smaller batches AND a budget sized to the ask, so neither alone has to hold.
     suppliers, assets = {}, {}
-    for i in range(0, len(rows), 40):
+    extract_errors = []
+    for i in range(0, len(rows), GMAIL_EXTRACT_BATCH):
         try:
-            out = _vision_json(GMAIL_EXTRACT_SYSTEM, "EMAILS:\n\n" + "\n\n---\n\n".join(rows[i:i + 40]))
+            out = _vision_json(GMAIL_EXTRACT_SYSTEM,
+                               "EMAILS:\n\n" + "\n\n---\n\n".join(rows[i:i + GMAIL_EXTRACT_BATCH]),
+                               max_tokens=GMAIL_EXTRACT_MAX_TOKENS)
             for s in out.get("suppliers") or []:
                 k = (s.get("name") or "").strip().lower()
                 if not k: continue
                 cur = suppliers.setdefault(k, s)
                 if s is not cur:  # merge later batches into the first sighting
-                    cur["jobs"] = (cur.get("jobs") or []) + (s.get("jobs") or [])
-                    for f in ("email", "phone", "website", "lastJob"):
-                        cur[f] = cur.get(f) or s.get(f)
+                    _gmail_merge_supplier(cur, s)
             for x in out.get("inferredAssets") or []:
                 k = (x.get("name") or "").strip().lower()
                 if k: assets.setdefault(k, x)
         except Exception as e:
-            print(f"[gmail] extract batch failed: {e}")
-    return {"suppliers": list(suppliers.values()), "inferredAssets": list(assets.values()), "scanned": len(rows), **meta}
+            # NEVER let this read as "found nothing". An empty result the owner
+            # can act on and a crash they can't are different answers.
+            print(f"[gmail] extract batch failed: {type(e).__name__}: {e}")
+            extract_errors.append(f"{type(e).__name__}: {str(e)[:160]}")
+    return {"suppliers": list(suppliers.values()), "inferredAssets": list(assets.values()),
+            "scanned": len(rows), "extractErrors": extract_errors,
+            "batches": (len(rows) + GMAIL_EXTRACT_BATCH - 1) // GMAIL_EXTRACT_BATCH, **meta}
 
 
 # =============================================================================

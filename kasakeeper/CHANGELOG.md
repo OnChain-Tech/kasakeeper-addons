@@ -1,3 +1,11 @@
+# 0.3.27
+
+The email import actually imports now.
+
+- **"Scan my email for trades" found nothing on a mailbox full of tradespeople.** Not because it couldn't see them — it was reading them fine — but because the step that turns those emails into supplier records was **crashing**, and the crash was being swallowed and shown to you as "No suppliers found". On the same real mailbox that returned nothing, it now finds **eleven** trades with their job dates, plus eight things it can tell your home has. The cause was mundane: it asked for far more information back than it had allowed room for, so the answer arrived cut in half and unreadable.
+- **A failure now says it failed.** If any part of the read can't be completed, the import screen says so plainly and imports nothing, instead of showing you an empty list. An empty mailbox and a broken scan are different answers and you should never have to guess which one you're looking at.
+- **`Last job` on an imported supplier is the latest one**, not the first one seen. A business that turned up twice in your mail could report a date older than a job listed underneath it.
+
 # 0.3.26
 
 The email preview is now genuinely a preview.

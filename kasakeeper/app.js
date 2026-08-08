@@ -443,8 +443,9 @@ function viewGmailImport() {
       <div class="t-sub">${esc(x.reason || '')}${dup ? ' · already tracked' : ''}</div></div></div>`; }).join('');
   return `<button class="back" data-action="back">‹ Back</button>
     <div class="hero"><div class="emoji">📬</div><div><h1>Found in your mail</h1><div class="t-sub">${r.scanned || 0} emails read · tap to include or exclude</div></div></div>
+    ${(r.extractErrors && r.extractErrors.length) ? `<div class="banner urgent">The scan read ${r.scanned || 0} emails but ${r.extractErrors.length} of ${r.batches || '?'} batches couldn't be read back: ${esc(r.extractErrors[0])}. That's a failure, not an empty mailbox — nothing was imported. Try again, and if it persists it's worth reporting.</div>` : ''}
     <div class="section-title">Suppliers <span class="pill">${(r.suppliers || []).length}</span></div>
-    ${sRows || '<div class="empty">No suppliers found.</div>'}
+    ${sRows || `<div class="empty">${(r.extractErrors && r.extractErrors.length) ? 'None read back — see above.' : 'No suppliers found.'}</div>`}
     <div class="section-title">The mail proves you have <span class="pill">${(r.inferredAssets || []).length}</span></div>
     ${aRows || '<div class="empty">Nothing new inferred.</div>'}
     <div class="btn-row"><button class="btn primary wide" data-action="gmail-import">Import ${g.picked.s.size + g.picked.a.size} selected →</button></div>`;
